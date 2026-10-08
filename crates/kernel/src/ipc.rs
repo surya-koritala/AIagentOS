@@ -7,6 +7,20 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::{AgentId, IpcError};
 
+pub const MAX_IPC_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_DEAD_LETTERS: usize = 256;
+
+fn check_payload_bound(payload: &serde_json::Value) -> Result<(), IpcError> {
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|_| IpcError::DeliveryFailed("invalid IPC payload".into()))?;
+    if bytes.len() > MAX_IPC_PAYLOAD_BYTES {
+        return Err(IpcError::DeliveryFailed(
+            "IPC payload exceeds 64 KiB bound".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// A message sent between agents.
 #[derive(Debug, Clone)]
 pub struct IpcMessage {
@@ -164,6 +178,18 @@ impl IpcManager {
         self.mailboxes.contains_key(&agent_id)
     }
 
+    pub fn mailbox_len(&self, agent_id: AgentId) -> Result<usize, IpcError> {
+        let receiver = self
+            .receivers
+            .get(&agent_id)
+            .ok_or(IpcError::AgentNotFound(agent_id))?;
+        let depth = receiver
+            .lock()
+            .map_err(|_| IpcError::DeliveryFailed("mailbox unavailable".into()))?
+            .len();
+        Ok(depth)
+    }
+
     /// Enable permission enforcement for IPC.
     pub fn enable_permissions(&mut self) {
         self.allowed_pairs = Some(DashMap::new());
@@ -209,6 +235,7 @@ impl AgentIpc for IpcManager {
             return Err(IpcError::AgentNotFound(to));
         }
         self.check_permission(from, to)?;
+        check_payload_bound(&payload)?;
 
         let msg = IpcMessage {
             from,
@@ -222,7 +249,11 @@ impl AgentIpc for IpcManager {
         match sender.try_send(msg.clone()) {
             Ok(()) => Ok(()),
             Err(_) => {
-                self.dead_letters.lock().unwrap().push(msg);
+                let mut letters = self.dead_letters.lock().unwrap();
+                if letters.len() == MAX_DEAD_LETTERS {
+                    letters.remove(0);
+                }
+                letters.push(msg);
                 Err(IpcError::DeliveryFailed("Mailbox full".into()))
             }
         }
@@ -264,6 +295,7 @@ impl AgentIpc for IpcManager {
         topic: &str,
         payload: serde_json::Value,
     ) -> Result<usize, IpcError> {
+        check_payload_bound(&payload)?;
         let sender = self
             .topics
             .get(topic)

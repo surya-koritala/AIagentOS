@@ -423,6 +423,35 @@ pub enum Syscall {
         agent_id: String,
         handle: String,
     },
+    VfsOpenData {
+        agent_id: String,
+        path: String,
+        rights: Vec<crate::vfs::workspace::WorkspaceRight>,
+    },
+    VfsDupData {
+        agent_id: String,
+        handle: String,
+        rights: Vec<crate::vfs::workspace::WorkspaceRight>,
+    },
+    VfsReadData {
+        agent_id: String,
+        handle: String,
+        #[serde(default = "empty_data_args")]
+        args: serde_json::Value,
+    },
+    VfsWriteData {
+        agent_id: String,
+        handle: String,
+        args: serde_json::Value,
+    },
+    VfsListData {
+        agent_id: String,
+        handle: String,
+    },
+    VfsStatData {
+        agent_id: String,
+        handle: String,
+    },
     /// Snapshot of the syscall gate's enforcement counters.
     GateStats,
     /// Read-only introspection of one agent's enforcement state: the
@@ -1258,6 +1287,9 @@ pub enum SyscallReply {
         handle: crate::vfs::VfsHandle,
     },
     VfsClosed,
+    VfsDataOpened {
+        handle: crate::vfs::data::DataHandle,
+    },
     VfsNamespaceMounts {
         view: crate::vfs::mounts::NamespaceMountView,
     },
@@ -1563,7 +1595,10 @@ impl std::fmt::Debug for Syscall {
         let fields: &[&str] = match self {
             Self::Authenticate { .. } => &["token"],
             Self::SendMessage { .. } | Self::SendMessageStream { .. } => &["message"],
-            Self::CallTool { .. } | Self::VfsInvoke { .. } => &["args"],
+            Self::CallTool { .. }
+            | Self::VfsInvoke { .. }
+            | Self::VfsReadData { .. }
+            | Self::VfsWriteData { .. } => &["args"],
             Self::VfsWriteWorkspace { .. } => &["data_base64"],
             Self::MemoryStore { .. } | Self::MemoryUpdate { .. } => &["content"],
             Self::StoragePut { .. } => &["value"],
@@ -1678,6 +1713,16 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
             (AccessLevel::User, "agent.call_tool", Some(agent_id))
         }
         Syscall::VfsClose { agent_id, .. } => (AccessLevel::User, "vfs.close", Some(agent_id)),
+        Syscall::VfsOpenData { agent_id, .. } => {
+            (AccessLevel::User, "vfs.data.open", Some(agent_id))
+        }
+        Syscall::VfsDupData { agent_id, .. } => (AccessLevel::User, "vfs.data.dup", Some(agent_id)),
+        Syscall::VfsReadData { agent_id, .. }
+        | Syscall::VfsWriteData { agent_id, .. }
+        | Syscall::VfsListData { agent_id, .. }
+        | Syscall::VfsStatData { agent_id, .. } => {
+            (AccessLevel::User, "agent.call_tool", Some(agent_id))
+        }
         Syscall::VfsNamespaceMounts { agent_id } => (
             AccessLevel::ReadOnly,
             "vfs.namespace.mounts",
@@ -2066,6 +2111,12 @@ fn starts_new_work(call: &Syscall) -> bool {
             | Syscall::VfsListWorkspace { .. }
             | Syscall::VfsStatWorkspace { .. }
             | Syscall::VfsMount { .. }
+            | Syscall::VfsOpenData { .. }
+            | Syscall::VfsDupData { .. }
+            | Syscall::VfsReadData { .. }
+            | Syscall::VfsWriteData { .. }
+            | Syscall::VfsListData { .. }
+            | Syscall::VfsStatData { .. }
             | Syscall::RunInstalledPackage { .. }
     )
 }
@@ -2094,6 +2145,12 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
         | Syscall::VfsStatWorkspace { agent_id, .. }
         | Syscall::VfsMount { agent_id, .. }
         | Syscall::VfsUnmount { agent_id, .. }
+        | Syscall::VfsOpenData { agent_id, .. }
+        | Syscall::VfsDupData { agent_id, .. }
+        | Syscall::VfsReadData { agent_id, .. }
+        | Syscall::VfsWriteData { agent_id, .. }
+        | Syscall::VfsListData { agent_id, .. }
+        | Syscall::VfsStatData { agent_id, .. }
         | Syscall::MemoryStore { agent_id, .. }
         | Syscall::MemoryUpdate { agent_id, .. }
         | Syscall::MemoryDelete { agent_id, .. }
@@ -2220,6 +2277,51 @@ fn workspace_error(error: crate::vfs::workspace::WorkspaceError) -> SyscallReply
             }
         }
         WorkspaceError::Backing(message) => SyscallReply::Error { message },
+    }
+}
+
+fn empty_data_args() -> serde_json::Value {
+    serde_json::json!({})
+}
+fn data_error(error: crate::vfs::data::DataError) -> SyscallReply {
+    use crate::vfs::data::DataError;
+    match error {
+        DataError::Vfs(error) => vfs_error(error),
+        DataError::Invalid(message) => SyscallReply::TypedError {
+            code: WireErrorCode::InvalidArgument,
+            message,
+            retryable: false,
+        },
+        DataError::PermissionDenied => SyscallReply::TypedError {
+            code: WireErrorCode::PermissionDenied,
+            message: "data VFS rights denied".into(),
+            retryable: false,
+        },
+        DataError::Backing(message) if message.contains("context storage pressure") => {
+            SyscallReply::TypedError {
+                code: WireErrorCode::QuotaExceeded,
+                message,
+                retryable: false,
+            }
+        }
+        error => SyscallReply::Error {
+            message: error.to_string(),
+        },
+    }
+}
+async fn dispatch_data_call(
+    kernel: &AgentKernelImpl,
+    agent: &str,
+    handle: &str,
+    right: crate::vfs::workspace::WorkspaceRight,
+    args: serde_json::Value,
+) -> SyscallReply {
+    match uuid::Uuid::parse_str(agent) {
+        Ok(agent) => match kernel.vfs_data_call(agent, handle, right, args).await {
+            Ok(data) => SyscallReply::ToolResult { data },
+            Err(error) => data_error(error),
+        },
+        Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
     }
 }
 
@@ -3061,7 +3163,9 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(_) => Err(crate::vfs::VfsError::NotFound),
             };
             match lease {
-                Ok(lease) if lease.is_workspace => vfs_error(crate::vfs::VfsError::NotFound),
+                Ok(lease) if lease.is_workspace || lease.is_data => {
+                    vfs_error(crate::vfs::VfsError::NotFound)
+                }
                 Ok(lease) => {
                     dispatch_tool_call(kernel, &agent_id, &lease.name.clone(), &args, Some(lease))
                         .await
@@ -3152,6 +3256,76 @@ async fn dispatch_scoped_inner_with_fence(
             },
             Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
         },
+        Syscall::VfsOpenData {
+            agent_id,
+            path,
+            rights,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_open_data(id, &path, rights).await {
+                Ok(handle) => SyscallReply::VfsDataOpened { handle },
+                Err(error) => data_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsDupData {
+            agent_id,
+            handle,
+            rights,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_dup_data(id, &handle, rights).await {
+                Ok(handle) => SyscallReply::VfsDataOpened { handle },
+                Err(error) => data_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsReadData {
+            agent_id,
+            handle,
+            args,
+        } => {
+            dispatch_data_call(
+                kernel,
+                &agent_id,
+                &handle,
+                crate::vfs::workspace::WorkspaceRight::Read,
+                args,
+            )
+            .await
+        }
+        Syscall::VfsWriteData {
+            agent_id,
+            handle,
+            args,
+        } => {
+            dispatch_data_call(
+                kernel,
+                &agent_id,
+                &handle,
+                crate::vfs::workspace::WorkspaceRight::Write,
+                args,
+            )
+            .await
+        }
+        Syscall::VfsListData { agent_id, handle } => {
+            dispatch_data_call(
+                kernel,
+                &agent_id,
+                &handle,
+                crate::vfs::workspace::WorkspaceRight::List,
+                empty_data_args(),
+            )
+            .await
+        }
+        Syscall::VfsStatData { agent_id, handle } => {
+            dispatch_data_call(
+                kernel,
+                &agent_id,
+                &handle,
+                crate::vfs::workspace::WorkspaceRight::Stat,
+                empty_data_args(),
+            )
+            .await
+        }
         Syscall::GateStats => {
             let s = kernel.syscall_gate.stats();
             SyscallReply::GateStats {
@@ -9592,6 +9766,34 @@ memory = ["remember this"]
             Syscall::VfsNamespaceMounts {
                 agent_id: id.clone(),
             },
+            Syscall::VfsOpenData {
+                agent_id: id.clone(),
+                path: "/memory".into(),
+                rights: vec![crate::vfs::workspace::WorkspaceRight::Read],
+            },
+            Syscall::VfsDupData {
+                agent_id: id.clone(),
+                handle: "handle".into(),
+                rights: vec![crate::vfs::workspace::WorkspaceRight::Read],
+            },
+            Syscall::VfsReadData {
+                agent_id: id.clone(),
+                handle: "handle".into(),
+                args: empty_data_args(),
+            },
+            Syscall::VfsWriteData {
+                agent_id: id.clone(),
+                handle: "handle".into(),
+                args: empty_data_args(),
+            },
+            Syscall::VfsListData {
+                agent_id: id.clone(),
+                handle: "handle".into(),
+            },
+            Syscall::VfsStatData {
+                agent_id: id.clone(),
+                handle: "handle".into(),
+            },
             Syscall::VfsMountEntries {
                 agent_id: id.clone(),
                 path: "/tools".into(),
@@ -10198,7 +10400,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 108);
+        assert_eq!(calls.len(), 114);
         assert_eq!(fixture_tags, schema_tags);
     }
 

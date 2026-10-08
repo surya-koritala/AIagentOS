@@ -3,6 +3,7 @@
 //! Handles identify one registration, never grant authorization, and are not
 //! inherited, persisted, or reopened after a kernel restart.
 
+pub mod data;
 pub mod mounts;
 pub mod workspace;
 
@@ -53,6 +54,8 @@ pub(crate) struct ToolHandleLease {
     pub binding_id: Uuid,
     closed: AtomicBool,
     pub is_workspace: bool,
+    pub is_data: bool,
+    data: Mutex<Option<data::DataCapability>>,
     workspace: Mutex<Option<workspace::WorkspaceCapability>>,
     workspace_bindings: Mutex<HashMap<String, Uuid>>,
     mount: mounts::MountBinding,
@@ -185,6 +188,8 @@ impl ToolVfs {
                 binding_id,
                 closed: AtomicBool::new(false),
                 is_workspace: false,
+                is_data: false,
+                data: Mutex::new(None),
                 workspace: Mutex::new(None),
                 workspace_bindings: Mutex::new(HashMap::new()),
                 mount,
@@ -218,6 +223,8 @@ impl ToolVfs {
             binding_id: Uuid::nil(),
             closed: AtomicBool::new(false),
             is_workspace: true,
+            is_data: false,
+            data: Mutex::new(None),
             workspace: Mutex::new(None),
             workspace_bindings: Mutex::new(HashMap::new()),
             mount,
@@ -789,6 +796,9 @@ impl AgentKernelImpl {
                 if self.sandbox_manager.get_sandbox_for_agent(agent).is_none() {
                     return Err(VfsError::NotFound);
                 }
+                vec![path.into()]
+            }
+            mounts::MountKind::Memory | mounts::MountKind::Kv | mounts::MountKind::Ipc => {
                 vec![path.into()]
             }
         };

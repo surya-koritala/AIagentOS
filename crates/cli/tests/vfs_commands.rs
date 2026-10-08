@@ -120,7 +120,7 @@ async fn agentctl_vfs_open_invoke_and_close_use_the_public_server() {
         ],
     )
     .await;
-    assert_eq!(removed["mounts"].as_array().unwrap().len(), 2);
+    assert_eq!(removed["mounts"].as_array().unwrap().len(), 5);
     task.abort();
     let _ = task.await;
     std::fs::remove_dir_all(root).unwrap();
@@ -226,4 +226,97 @@ async fn agentctl_workspace_handles_drive_real_binary_io_and_rights() {
     task.abort();
     let _ = task.await;
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn agentctl_data_handles_store_read_stat_duplicate_and_close_through_wire() {
+    let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+    let actor = kernel
+        .create_agent_full(AgentConfig {
+            name: "cli-data".into(),
+            task: "data CLI proof".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        })
+        .await
+        .unwrap()
+        .id
+        .to_string();
+    let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = tokio::spawn(server.serve());
+    let handle = command(
+        addr,
+        vec![
+            "vfs-kv-open".into(),
+            actor.clone(),
+            "/kv".into(),
+            "notes".into(),
+            "read,write,stat".into(),
+        ],
+    )
+    .await;
+    let handle = handle["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        command(
+            addr,
+            vec![
+                "vfs-data-write".into(),
+                actor.clone(),
+                handle.clone(),
+                json!({"value":"CLI data"}).to_string()
+            ]
+        )
+        .await["stored"],
+        true
+    );
+    assert_eq!(
+        command(
+            addr,
+            vec!["vfs-data-read".into(), actor.clone(), handle.clone()]
+        )
+        .await["value"],
+        "CLI data"
+    );
+    assert_eq!(
+        command(
+            addr,
+            vec!["vfs-data-stat".into(), actor.clone(), handle.clone()]
+        )
+        .await["bytes"],
+        8
+    );
+    let duplicate = command(
+        addr,
+        vec![
+            "vfs-data-dup".into(),
+            actor.clone(),
+            handle.clone(),
+            "read".into(),
+        ],
+    )
+    .await;
+    command(addr, vec!["vfs-close".into(), actor.clone(), handle]).await;
+    assert_eq!(
+        command(
+            addr,
+            vec![
+                "vfs-data-read".into(),
+                actor.clone(),
+                duplicate["id"].as_str().unwrap().into()
+            ]
+        )
+        .await["value"],
+        "CLI data"
+    );
+    kernel
+        .stop_agent(uuid::Uuid::parse_str(&actor).unwrap())
+        .await
+        .unwrap();
+    task.abort();
+    let _ = task.await;
 }

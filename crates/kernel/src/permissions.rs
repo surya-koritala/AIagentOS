@@ -198,6 +198,7 @@ impl PermissionManager {
                         operations: vec![
                             "send".to_string(),
                             "receive".to_string(),
+                            "stat".to_string(),
                             "delegate".to_string(),
                             "delegation_status".to_string(),
                             "complete_delegation".to_string(),
@@ -264,6 +265,7 @@ impl PermissionManager {
                         operations: vec![
                             "send".to_string(),
                             "receive".to_string(),
+                            "stat".to_string(),
                             "delegate".to_string(),
                             "delegation_status".to_string(),
                             "complete_delegation".to_string(),
@@ -275,6 +277,57 @@ impl PermissionManager {
                 ],
             },
         );
+
+        for (profile, operations) in [
+            (
+                "read-only",
+                vec![
+                    "query",
+                    "stat",
+                    "kv_get",
+                    "kv_list",
+                    "kv_dir_stat",
+                    "kv_stat",
+                ],
+            ),
+            (
+                "standard",
+                vec![
+                    "store",
+                    "query",
+                    "stat",
+                    "kv_get",
+                    "kv_put",
+                    "kv_list",
+                    "kv_dir_stat",
+                    "kv_stat",
+                ],
+            ),
+            (
+                "elevated",
+                vec![
+                    "store",
+                    "query",
+                    "stat",
+                    "kv_get",
+                    "kv_put",
+                    "kv_list",
+                    "kv_dir_stat",
+                    "kv_stat",
+                ],
+            ),
+        ] {
+            self.profiles
+                .get_mut(profile)
+                .expect("predefined profile")
+                .rules
+                .push(PermissionRule {
+                    resource_type: ResourceType::Memory,
+                    operations: operations.into_iter().map(str::to_string).collect(),
+                    targets: None,
+                    decision: AccessDecision::Allowed,
+                });
+        }
 
         // Full-access: everything allowed, no approval needed
         self.profiles.insert(

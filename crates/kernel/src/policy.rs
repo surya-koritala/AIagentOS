@@ -421,6 +421,7 @@ fn canonical_resource_label(resource_type: &crate::resources::ResourceType) -> &
         ResourceType::Browser => "browser",
         ResourceType::Peripheral => "peripheral",
         ResourceType::Ipc => "ipc",
+        ResourceType::Memory => "memory",
     }
 }
 
@@ -439,6 +440,7 @@ fn representative_resource(binding: &crate::tools::ToolBinding) -> String {
         ResourceType::Application => "__agentos_policy_probe_command__".to_string(),
         ResourceType::Peripheral => "__agentos_policy_probe_device__".to_string(),
         ResourceType::Ipc => "__agentos_policy_probe_agent__".to_string(),
+        ResourceType::Memory => "__agentos_policy_probe_key__".to_string(),
     }
 }
 

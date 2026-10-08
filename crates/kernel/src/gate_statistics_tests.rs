@@ -124,21 +124,40 @@ async fn cgroup_denial_is_exposed_per_agent() { assert_denial_exposed(DenialClas
 #[tokio::test]
 async fn hidden_and_absent_names_have_identical_errors_and_counter_deltas() {
     let kernel = AgentKernelImpl::new().unwrap();
-    let agent = kernel.create_agent_full(config("counter-oracle")).await.unwrap();
+    let tenant = kernel.create_tenant("counter-oracle").await.unwrap();
+    let user = kernel.register_user(&tenant, "user", "user@counter.invalid", Role::User).await.unwrap();
+    let principal = Principal { user_id: user, tenant_id: tenant.clone(), role: Role::User, credential: None };
+    let agent = kernel.create_agent_for_tenant(&tenant, config("counter-oracle")).await.unwrap();
     kernel.syscall_gate.register_tool_namespace("read_file", u64::MAX);
-    let before = kernel.syscall_gate.agent_stats(agent.id);
-    let hidden = dispatch(&kernel, Syscall::CallTool {
+    let read = || Syscall::AgentInfo { agent_id: agent.id.to_string() };
+    let snapshot = |reply| match reply {
+        SyscallReply::AgentInfo { gate_decisions, .. } => gate_decisions,
+        other => panic!("expected owned counter reply, got {other:?}"),
+    };
+    let before = snapshot(dispatch_scoped(&kernel, read(), Some(&principal)).await);
+    let hidden = dispatch_scoped(&kernel, Syscall::CallTool {
         agent_id: agent.id.to_string(), tool: "read_file".into(), args: serde_json::json!({"path":"never-read"}),
-    }).await;
-    let after_hidden = kernel.syscall_gate.agent_stats(agent.id);
-    let absent = dispatch(&kernel, Syscall::CallTool {
+    }, Some(&principal)).await;
+    let after_hidden = snapshot(dispatch_scoped(&kernel, read(), Some(&principal)).await);
+    let absent = dispatch_scoped(&kernel, Syscall::CallTool {
         agent_id: agent.id.to_string(), tool: "absent-counter-tool".into(), args: serde_json::json!({}),
-    }).await;
-    let after_absent = kernel.syscall_gate.agent_stats(agent.id);
+    }, Some(&principal)).await;
+    let after_absent = snapshot(dispatch_scoped(&kernel, read(), Some(&principal)).await);
     assert_eq!(serde_json::to_value(hidden).unwrap(), serde_json::to_value(absent).unwrap());
     assert_eq!(before, GateStats::default());
     assert_eq!(after_hidden, GateStats { denied_unknown: 1, ..Default::default() });
     assert_eq!(after_absent, GateStats { denied_unknown: 2, ..Default::default() });
+}
+
+#[tokio::test]
+async fn invalid_tool_declaration_counts_once_without_admitting_the_call() {
+    let kernel = AgentKernelImpl::new().unwrap();
+    let agent = kernel.create_agent_full(config("invalid-declaration")).await.unwrap();
+    assert!(matches!(dispatch(&kernel, Syscall::CallTool {
+        agent_id: agent.id.to_string(), tool: "http_get".into(), args: serde_json::json!({"url":7}),
+    }).await, SyscallReply::Error { .. }));
+    assert_eq!(kernel.syscall_gate.agent_stats(agent.id), GateStats { denied_unknown: 1, ..Default::default() });
+    assert_eq!(kernel.syscall_gate.stats(), GateStats { denied_unknown: 1, ..Default::default() });
 }
 
 #[tokio::test]

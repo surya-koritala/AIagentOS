@@ -1,5 +1,65 @@
 [
   {
+    "name": "fixture",
+    "op": "create_tenant"
+  },
+  {
+    "op": "list_tenants"
+  },
+  {
+    "confirm": true,
+    "op": "revoke_tenant",
+    "tenant_id": "fixture"
+  },
+  {
+    "email": "fixture",
+    "op": "create_user",
+    "role": "user",
+    "username": "fixture"
+  },
+  {
+    "op": "list_users"
+  },
+  {
+    "confirm": true,
+    "op": "revoke_user",
+    "user_id": "fixture"
+  },
+  {
+    "name": "fixture",
+    "op": "issue_api_key",
+    "user_id": "fixture"
+  },
+  {
+    "op": "list_api_keys"
+  },
+  {
+    "confirm": true,
+    "key_id": "fixture",
+    "op": "revoke_api_key"
+  },
+  {
+    "email": "fixture",
+    "op": "create_user_for_tenant",
+    "role": "user",
+    "tenant_id": "fixture",
+    "username": "fixture"
+  },
+  {
+    "op": "list_users_for_tenant",
+    "tenant_id": "fixture"
+  },
+  {
+    "name": "fixture",
+    "op": "issue_api_key_for_tenant",
+    "tenant_id": "fixture",
+    "user_id": "fixture"
+  },
+  {
+    "op": "list_api_keys_for_tenant",
+    "tenant_id": "fixture"
+  },
+  {
     "agent_id": "00000000-0000-0000-0000-000000000001",
     "op": "vfs_open_data",
     "path": "fixture",

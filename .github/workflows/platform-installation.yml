@@ -82,10 +82,10 @@ jobs:
       - name: Build twice at the same stable path and compare every binary
         shell: bash
         run: |
-          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
           mv target-repro target-a
-          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
-          for binary in agent agent-server agentctl agent-tui; do
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
+          for binary in agent agent-server agentctl agent-tui agent-code; do
             cmp "target-a/${{ matrix.target }}/release/$binary" "target-repro/${{ matrix.target }}/release/$binary"
             file "target-a/${{ matrix.target }}/release/$binary"
             if [[ "${{ matrix.target }}" == aarch64-apple-darwin ]]; then
@@ -107,7 +107,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p sbom-stage
-          for binary in agent agent-server agentctl agent-tui; do
+          for binary in agent agent-server agentctl agent-tui agent-code; do
             cp "target-a/${{ matrix.target }}/release/$binary" sbom-stage/
           done
           syft dir:sbom-stage -o "cyclonedx-json=dist/agentos-ci-${INSTALLATION_SOURCE_SHA}-${{ matrix.target }}.cdx.json"

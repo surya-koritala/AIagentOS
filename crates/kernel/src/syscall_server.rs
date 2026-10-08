@@ -78,6 +78,10 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// the released prose-only error reply; version 2 adds typed public errors.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
+#[cfg(test)]
+#[path = "identity_admin_tests.rs"]
+mod identity_admin_tests;
+
 /// Maximum duration accepted from an untrusted wire `WaitAgent` request.
 ///
 /// This remains below the production credential-drain bound, leaving time for
@@ -246,6 +250,56 @@ pub struct AgentMutationFenceProof {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Syscall {
+    /// Trusted-system tenant administration and first-operator bootstrap.
+    CreateTenant {
+        name: String,
+    },
+    ListTenants,
+    RevokeTenant {
+        tenant_id: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Tenant-admin operations derive scope from the authenticated principal.
+    CreateUser {
+        username: String,
+        email: String,
+        role: Role,
+    },
+    ListUsers,
+    RevokeUser {
+        user_id: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    IssueApiKey {
+        user_id: String,
+        name: String,
+    },
+    ListApiKeys,
+    RevokeApiKey {
+        key_id: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Explicit tenant selection is available only to trusted-system callers.
+    CreateUserForTenant {
+        tenant_id: String,
+        username: String,
+        email: String,
+        role: Role,
+    },
+    ListUsersForTenant {
+        tenant_id: String,
+    },
+    IssueApiKeyForTenant {
+        tenant_id: String,
+        user_id: String,
+        name: String,
+    },
+    ListApiKeysForTenant {
+        tenant_id: String,
+    },
     /// Create an agent through the full kernel path (gate registration, cgroup,
     /// namespaces, scheduler admission, procfs).
     CreateAgent {
@@ -1203,6 +1257,7 @@ impl WireErrorCode {
             (Self::QuotaExceeded, false)
         } else if message.contains("quota exceeded")
             || message.contains("quota exhausted")
+            || message.contains("context storage pressure")
             || message.contains("budget exceeded")
             || message.contains("budget exhausted")
             || message.contains("queue is full")
@@ -1249,6 +1304,34 @@ impl WireErrorCode {
 pub enum SyscallReply {
     AgentCloned {
         result: crate::cloning::CloneResult,
+    },
+    TenantCreated {
+        id: String,
+    },
+    Tenants {
+        tenants: Vec<crate::auth::Tenant>,
+    },
+    TenantRevoked {
+        existed: bool,
+    },
+    UserCreated {
+        id: String,
+    },
+    Users {
+        users: Vec<crate::auth::User>,
+    },
+    UserRevoked {
+        existed: bool,
+    },
+    ApiKeyIssued {
+        key_id: String,
+        key: String,
+    },
+    ApiKeys {
+        keys: Vec<crate::auth::ApiKeyDescriptor>,
+    },
+    ApiKeyRevoked {
+        existed: bool,
     },
     AgentCreated {
         id: String,
@@ -1644,6 +1727,7 @@ impl std::fmt::Debug for SyscallReply {
         let mut value =
             serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!("<unserializable>"));
         let fields: &[&str] = match self {
+            Self::ApiKeyIssued { .. } => &["key"],
             Self::Message { .. } | Self::StreamCompleted { .. } => &["content"],
             Self::StreamEvent { .. } => &["event"],
             Self::ToolResult { .. } => &["data"],
@@ -1699,6 +1783,19 @@ fn role_allows(role: Role, required: AccessLevel) -> bool {
 
 fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
     match call {
+        Syscall::CreateTenant { .. } => (AccessLevel::System, "auth.tenant.create", None),
+        Syscall::ListTenants => (AccessLevel::System, "auth.tenant.list", None),
+        Syscall::RevokeTenant { .. } => (AccessLevel::System, "auth.tenant.revoke", None),
+        Syscall::CreateUser { .. } => (AccessLevel::Admin, "auth.user.create", None),
+        Syscall::ListUsers => (AccessLevel::Admin, "auth.user.list", None),
+        Syscall::RevokeUser { .. } => (AccessLevel::Admin, "auth.user.revoke", None),
+        Syscall::IssueApiKey { .. } => (AccessLevel::Admin, "auth.api_key.issue", None),
+        Syscall::ListApiKeys => (AccessLevel::Admin, "auth.api_key.list", None),
+        Syscall::RevokeApiKey { .. } => (AccessLevel::Admin, "auth.api_key.revoke", None),
+        Syscall::CreateUserForTenant { .. } => (AccessLevel::System, "auth.user.create", None),
+        Syscall::ListUsersForTenant { .. } => (AccessLevel::System, "auth.user.list", None),
+        Syscall::IssueApiKeyForTenant { .. } => (AccessLevel::System, "auth.api_key.issue", None),
+        Syscall::ListApiKeysForTenant { .. } => (AccessLevel::System, "auth.api_key.list", None),
         Syscall::CreateAgent { .. } => (AccessLevel::User, "agent.create", None),
         Syscall::CloneAgent { agent_id, .. } => (AccessLevel::User, "agent.clone", Some(agent_id)),
         Syscall::ListAgents => (AccessLevel::ReadOnly, "agent.list", None),
@@ -1944,6 +2041,112 @@ fn authorization_error() -> SyscallReply {
     }
 }
 
+fn audit_identity_mutation(
+    principal: Option<&Principal>,
+    action: &str,
+    target_tenant: &str,
+    target_id: &str,
+) {
+    tracing::info!(
+        target: "agentos::auth_audit",
+        actor_tenant = principal.map(|actor| actor.tenant_id.as_str()).unwrap_or("system"),
+        actor_user = principal.map(|actor| actor.user_id.as_str()).unwrap_or("system"),
+        actor_role = principal.map(|actor| actor.role.as_str()).unwrap_or("system"),
+        action,
+        target_tenant,
+        target_id,
+        "identity mutation committed"
+    );
+}
+
+fn valid_identity_label(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn identity_error(message: &str) -> SyscallReply {
+    SyscallReply::Error {
+        message: message.into(),
+    }
+}
+
+fn audit_committed_revocation(
+    principal: Option<&Principal>,
+    action: &str,
+    tenant_id: &str,
+    target_id: &str,
+    result: &Result<bool, crate::KernelError>,
+) {
+    // A drain timeout occurs after durable revocation. Retain the committed
+    // audit event even when the complete-drain receipt cannot be returned.
+    if result.is_ok()
+        || matches!(
+            result,
+            Err(crate::KernelError::CredentialRevocationIncomplete { .. })
+        )
+    {
+        audit_identity_mutation(principal, action, tenant_id, target_id);
+    }
+}
+
+fn revokes_calling_credential(call: &Syscall, principal: &Principal) -> bool {
+    match call {
+        Syscall::RevokeUser {
+            user_id,
+            confirm: true,
+        } => user_id == &principal.user_id,
+        Syscall::RevokeApiKey {
+            key_id,
+            confirm: true,
+        } => principal.credential.as_ref().is_some_and(|credential| {
+            credential.kind == crate::auth::CredentialKind::ApiKey && credential.id == *key_id
+        }),
+        _ => false,
+    }
+}
+
+async fn provision_user(
+    kernel: &AgentKernelImpl,
+    principal: Option<&Principal>,
+    tenant_id: &str,
+    username: &str,
+    email: &str,
+    role: Role,
+) -> SyscallReply {
+    if !valid_identity_label(username, 256) || !valid_identity_label(email, 320) {
+        return identity_error("invalid user name or email");
+    }
+    match kernel.register_user(tenant_id, username, email, role).await {
+        Ok(id) => {
+            audit_identity_mutation(principal, "auth.user.create", tenant_id, &id);
+            SyscallReply::UserCreated { id }
+        }
+        Err(_) => identity_error("user provisioning failed: tenant unavailable or storage error"),
+    }
+}
+
+async fn provision_api_key(
+    kernel: &AgentKernelImpl,
+    principal: Option<&Principal>,
+    tenant_id: &str,
+    user_id: &str,
+    name: &str,
+) -> SyscallReply {
+    if !valid_identity_label(name, 256) {
+        return identity_error("invalid API-key name");
+    }
+    if !kernel.user_belongs_to_tenant(user_id, tenant_id).await {
+        return authorization_error();
+    }
+    match kernel.issue_api_key(user_id, name).await {
+        Ok(key) => {
+            let key_id = crate::auth::hash_secret(&key);
+            audit_identity_mutation(principal, "auth.api_key.issue", tenant_id, &key_id);
+            SyscallReply::ApiKeyIssued { key_id, key }
+        }
+        Err(_) => identity_error("API-key issuance failed: user unavailable or storage error"),
+    }
+}
+
 fn audit_authorization_denial(
     kernel: &AgentKernelImpl,
     principal: &Principal,
@@ -2042,6 +2245,30 @@ async fn authorize(
             _ => {}
         }
         audit_authorization_denial(kernel, principal, action, target_id, "insufficient role");
+        return Err(authorization_error());
+    }
+
+    let owns_identity = match call {
+        Syscall::IssueApiKey { user_id, .. } | Syscall::RevokeUser { user_id, .. } => {
+            kernel
+                .user_belongs_to_tenant(user_id, &principal.tenant_id)
+                .await
+        }
+        Syscall::RevokeApiKey { key_id, .. } => {
+            kernel
+                .api_key_belongs_to_tenant(key_id, &principal.tenant_id)
+                .await
+        }
+        _ => true,
+    };
+    if !owns_identity {
+        audit_authorization_denial(
+            kernel,
+            principal,
+            action,
+            None,
+            "identity is outside tenant",
+        );
         return Err(authorization_error());
     }
 
@@ -2803,6 +3030,136 @@ async fn dispatch_scoped_inner_with_fence(
         .map(|principal| principal.user_id.as_str())
         .unwrap_or("system");
     match call {
+        Syscall::CreateTenant { name } => {
+            if !valid_identity_label(&name, 256) {
+                return identity_error("invalid tenant name");
+            }
+            match kernel.create_tenant(&name).await {
+                Ok(id) => {
+                    audit_identity_mutation(principal, "auth.tenant.create", &id, &id);
+                    SyscallReply::TenantCreated { id }
+                }
+                Err(_) => identity_error("tenant provisioning failed: storage error"),
+            }
+        }
+        Syscall::ListTenants => SyscallReply::Tenants {
+            tenants: kernel.list_tenants().await,
+        },
+        Syscall::RevokeTenant { tenant_id, confirm } => {
+            if uuid::Uuid::parse_str(&tenant_id).is_err() {
+                return identity_error("invalid tenant identifier");
+            }
+            if !confirm {
+                return identity_error("tenant revocation requires confirmation");
+            }
+            let result = kernel.revoke_tenant(&tenant_id).await;
+            audit_committed_revocation(
+                principal,
+                "auth.tenant.revoke",
+                &tenant_id,
+                &tenant_id,
+                &result,
+            );
+            match result {
+                Ok(existed) => SyscallReply::TenantRevoked { existed },
+                Err(error) => identity_error(&error.to_string()),
+            }
+        }
+        Syscall::CreateUser {
+            username,
+            email,
+            role,
+        } => {
+            let Some(tenant) = tenant else {
+                return identity_error(
+                    "trusted-system user creation requires explicit tenant selection",
+                );
+            };
+            provision_user(kernel, principal, tenant, &username, &email, role).await
+        }
+        Syscall::CreateUserForTenant {
+            tenant_id,
+            username,
+            email,
+            role,
+        } => provision_user(kernel, principal, &tenant_id, &username, &email, role).await,
+        Syscall::ListUsers => {
+            let Some(tenant) = tenant else {
+                return identity_error(
+                    "trusted-system user listing requires explicit tenant selection",
+                );
+            };
+            SyscallReply::Users {
+                users: kernel.list_users(tenant).await,
+            }
+        }
+        Syscall::ListUsersForTenant { tenant_id } => SyscallReply::Users {
+            users: kernel.list_users(&tenant_id).await,
+        },
+        Syscall::RevokeUser { user_id, confirm } => {
+            if uuid::Uuid::parse_str(&user_id).is_err() {
+                return identity_error("invalid user identifier");
+            }
+            if !confirm {
+                return identity_error("user revocation requires confirmation");
+            }
+            let target_tenant = tenant.unwrap_or("system");
+            let result = kernel.revoke_user(&user_id).await;
+            audit_committed_revocation(
+                principal,
+                "auth.user.revoke",
+                target_tenant,
+                &user_id,
+                &result,
+            );
+            match result {
+                Ok(existed) => SyscallReply::UserRevoked { existed },
+                Err(error) => identity_error(&error.to_string()),
+            }
+        }
+        Syscall::IssueApiKey { user_id, name } => {
+            let Some(tenant) = tenant else {
+                return identity_error(
+                    "trusted-system key issuance requires explicit tenant selection",
+                );
+            };
+            provision_api_key(kernel, principal, tenant, &user_id, &name).await
+        }
+        Syscall::IssueApiKeyForTenant {
+            tenant_id,
+            user_id,
+            name,
+        } => provision_api_key(kernel, principal, &tenant_id, &user_id, &name).await,
+        Syscall::ListApiKeys => {
+            let Some(tenant) = tenant else {
+                return identity_error(
+                    "trusted-system key listing requires explicit tenant selection",
+                );
+            };
+            SyscallReply::ApiKeys {
+                keys: kernel.list_api_keys(tenant).await,
+            }
+        }
+        Syscall::ListApiKeysForTenant { tenant_id } => SyscallReply::ApiKeys {
+            keys: kernel.list_api_keys(&tenant_id).await,
+        },
+        Syscall::RevokeApiKey { key_id, confirm } => {
+            if !confirm {
+                return identity_error("API-key revocation requires confirmation");
+            }
+            let result = kernel.revoke_api_key_id(&key_id).await;
+            audit_committed_revocation(
+                principal,
+                "auth.api_key.revoke",
+                tenant.unwrap_or("system"),
+                &key_id,
+                &result,
+            );
+            match result {
+                Ok(existed) => SyscallReply::ApiKeyRevoked { existed },
+                Err(error) => identity_error(&error.to_string()),
+            }
+        }
         Syscall::CreateAgent {
             agent_id,
             ownership_proof,
@@ -6712,7 +7069,17 @@ impl SyscallServer {
                     // linearizable without blocking unrelated auth writes.
                     if let Some(identity) = credential.as_ref() {
                         match kernel.acquire_credential_principal(identity).await {
-                            Some((resolved, _credential_lease)) => {
+                            Some((resolved, credential_lease)) => {
+                                // An authorized self-revocation cannot retain
+                                // the very lease its kernel drain waits for.
+                                // Other calls keep their lease through dispatch;
+                                // other in-flight requests still must drain.
+                                let mut credential_lease = Some(credential_lease);
+                                if revokes_calling_credential(&call, &resolved)
+                                    && authorize(&kernel, Some(&resolved), &call).await.is_ok()
+                                {
+                                    credential_lease.take();
+                                }
                                 match tokio::time::timeout(
                                     WIRE_REQUEST_TIMEOUT,
                                     dispatch_scoped(&kernel, call, Some(&resolved)),
@@ -10079,7 +10446,86 @@ memory = ["remember this"]
             );
         }
 
+        let identity_key = kernel
+            .issue_api_key(&admin.user_id, "policy-fixture")
+            .await
+            .unwrap();
+        let identity_key_id = crate::auth::hash_secret(&identity_key);
         let unscoped_calls = vec![
+            (
+                Syscall::CreateTenant {
+                    name: "fixture".into(),
+                },
+                AccessLevel::System,
+            ),
+            (Syscall::ListTenants, AccessLevel::System),
+            (
+                Syscall::RevokeTenant {
+                    tenant_id: tenant.clone(),
+                    confirm: true,
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::CreateUser {
+                    username: "fixture".into(),
+                    email: "fixture@example.test".into(),
+                    role: Role::User,
+                },
+                AccessLevel::Admin,
+            ),
+            (Syscall::ListUsers, AccessLevel::Admin),
+            (
+                Syscall::RevokeUser {
+                    user_id: admin.user_id.clone(),
+                    confirm: true,
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::IssueApiKey {
+                    user_id: admin.user_id.clone(),
+                    name: "fixture".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (Syscall::ListApiKeys, AccessLevel::Admin),
+            (
+                Syscall::RevokeApiKey {
+                    key_id: identity_key_id,
+                    confirm: true,
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::CreateUserForTenant {
+                    tenant_id: tenant.clone(),
+                    username: "fixture".into(),
+                    email: "fixture@example.test".into(),
+                    role: Role::User,
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ListUsersForTenant {
+                    tenant_id: tenant.clone(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::IssueApiKeyForTenant {
+                    tenant_id: tenant.clone(),
+                    user_id: admin.user_id.clone(),
+                    name: "fixture".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ListApiKeysForTenant {
+                    tenant_id: tenant.clone(),
+                },
+                AccessLevel::System,
+            ),
             (
                 Syscall::CreateAgent {
                     agent_id: None,
@@ -10546,7 +10992,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 115);
+        assert_eq!(calls.len(), 128);
         assert_eq!(fixture_tags, schema_tags);
     }
 

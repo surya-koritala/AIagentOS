@@ -55,6 +55,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   updater assets, fail-closed platform documentation checks, and fresh-runner ARM
   CLI installation evidence. Native desktop signing and public installer
   qualification remain open (#344, #346).
+- Added trusted first-operator tenant bootstrap and tenant-admin user/key
+  administration through the public wire, Rust SDK, and `agentctl`. Key
+  inventory and revocation use non-secret IDs, issuance prints the secret once,
+  and mutations emit actor/target audit events. Keyless CI drives shipped
+  binaries through multi-tenant isolation, permission/quota denials, credential
+  revocation, and process restart. Relates #329 and #330.
 
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,

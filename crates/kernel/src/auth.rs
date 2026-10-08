@@ -37,7 +37,7 @@ pub fn hash_secret(secret: &str) -> String {
 /// A tenant — the top-level isolation boundary. Every user, session, api-key and
 /// agent belongs to exactly one tenant; the kernel maps each tenant onto its own
 /// namespace group + cgroup so cross-tenant access is denied at the syscall gate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tenant {
     pub id: String,
     pub name: String,
@@ -45,7 +45,7 @@ pub struct Tenant {
 }
 
 /// User account, scoped to a tenant.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct User {
     pub id: String,
     pub tenant_id: String,
@@ -56,7 +56,8 @@ pub struct User {
 }
 
 /// User roles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Admin,
     User,
@@ -93,6 +94,33 @@ pub struct ApiKey {
     pub user_id: String,
     pub tenant_id: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// Non-secret API-key inventory. The full digest identifies a key without
+/// retaining or transmitting its bearer secret.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApiKeyDescriptor {
+    pub key_id: String,
+    pub name: String,
+    pub user_id: String,
+    pub tenant_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// An issued bearer secret, returned once and redacted from debug output.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct IssuedApiKey {
+    pub key_id: String,
+    pub key: String,
+}
+
+impl std::fmt::Debug for IssuedApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedApiKey")
+            .field("key_id", &self.key_id)
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Session token record — interactive login for a user. Stored hashed.
@@ -554,6 +582,27 @@ impl AuthSystem {
     /// Insert an api-key record (rehydration).
     pub fn insert_api_key(&mut self, key: ApiKey) {
         self.api_keys.insert(key.key_hash.clone(), key);
+    }
+
+    pub fn get_api_key(&self, key_id: &str) -> Option<&ApiKey> {
+        self.api_keys.get(key_id)
+    }
+
+    pub fn list_api_keys(&self, tenant_id: &str) -> Vec<ApiKeyDescriptor> {
+        let mut keys: Vec<_> = self
+            .api_keys
+            .values()
+            .filter(|key| key.tenant_id == tenant_id)
+            .map(|key| ApiKeyDescriptor {
+                key_id: key.key_hash.clone(),
+                name: key.name.clone(),
+                user_id: key.user_id.clone(),
+                tenant_id: key.tenant_id.clone(),
+                created_at: key.created_at,
+            })
+            .collect();
+        keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        keys
     }
 
     /// Revoke an API key by its plaintext value.

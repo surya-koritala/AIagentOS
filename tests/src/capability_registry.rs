@@ -755,6 +755,12 @@ fn canonical_client_contract_is_explicit_and_honest() {
         "canonical operator client no longer uses the shared public client"
     );
     for command in [
+        "tenant-create NAME",
+        "tenant-revoke TENANT_ID --confirm TENANT_ID",
+        "user-create USERNAME EMAIL ROLE",
+        "user-revoke USER_ID --confirm USER_ID",
+        "api-key-issue USER_ID NAME",
+        "api-key-revoke KEY_ID --confirm KEY_ID",
         "policy-validate POLICY_FILE",
         "policy-explain POLICY_FILE",
         "gate-stats",

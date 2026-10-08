@@ -90,12 +90,12 @@ release = "v0.4"
 tracking_issue = 107
 qualification_issue = 127
 kernel_modules = ["auth", "namespaces", "permissions"]
-source_paths = ["crates/kernel/src/auth.rs", "crates/kernel/src/context.rs", "crates/kernel/src/syscall_server.rs", "crates/cli/src/bin/agent-server.rs"]
+source_paths = ["crates/kernel/src/auth.rs", "crates/kernel/src/context.rs", "crates/kernel/src/syscall_server.rs", "crates/cli/src/bin/agent-server.rs", "crates/cli/src/bin/agentctl.rs", "crates/sdk/src/lib.rs", "docs/SERVER_QUICKSTART.md", ".github/workflows/operator-onboarding.yml"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::authorize", "crates/kernel/src/syscall_server.rs::dispatch_scoped"]
-test_evidence = ["crates/kernel/src/syscall_server.rs", "tests/src/tenancy_props.rs"]
+test_evidence = ["crates/kernel/src/syscall_server.rs", "tests/src/tenancy_props.rs", "crates/kernel/src/identity_admin_tests.rs", "crates/cli/tests/identity_commands.rs", ".github/workflows/operator-onboarding.yml"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["All current ID-addressed wire operations are centrally tenant-authorized; independent penetration testing and cross-platform soak qualification remain outstanding."]
+limitations = ["Trusted-system bootstrap and tenant-admin user/key operations use the public wire; scoped admin requests cannot select another tenant. Key inventory/revocation uses non-secret IDs and issuer debug output redacts plaintext. Shipped-binary CI covers isolated multiple agents, quota/tool denials and crash restart. All current ID-addressed wire operations are centrally tenant-authorized; independent penetration testing and cross-platform soak qualification remain outstanding."]
 
 [[capability]]
 id = "tool-governance"

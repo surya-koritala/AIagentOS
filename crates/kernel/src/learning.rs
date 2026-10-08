@@ -437,7 +437,7 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "correction storage must be a current-owner-only regular file",
+            "private operator storage must be a current-owner-only regular file",
         ));
     }
     Ok(file)
@@ -448,7 +448,7 @@ fn open_private_lock(path: &Path) -> io::Result<File> {
     open_private(path, true)
 }
 #[cfg(unix)]
-fn open_private_existing(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_existing(path: &Path) -> io::Result<File> {
     open_private(path, false)
 }
 #[cfg(windows)]
@@ -456,7 +456,7 @@ fn open_private_lock(path: &Path) -> io::Result<File> {
     crate::windows_private_fs::open_private_rw(path)
 }
 #[cfg(windows)]
-fn open_private_existing(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_existing(path: &Path) -> io::Result<File> {
     crate::windows_private_fs::open_read(path, true)
 }
 #[cfg(not(any(unix, windows)))]
@@ -467,7 +467,7 @@ fn open_private_lock(_path: &Path) -> io::Result<File> {
     ))
 }
 #[cfg(not(any(unix, windows)))]
-fn open_private_existing(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_existing(path: &Path) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "private correction storage unsupported",

@@ -85,6 +85,19 @@ fn unrecognized_flag(argv: &[String]) -> Option<&str> {
     None
 }
 
+fn positional_prompt(argv: &[String]) -> Option<&str> {
+    let mut index = 1;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--" => return argv.get(index + 1).map(String::as_str),
+            "--config" | "--conversation" | "-c" => index += 2,
+            argument if !argument.starts_with('-') || argument == "-" => return Some(argument),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() {
     // Offline subcommands that don't need a kernel/DB are dispatched before any
@@ -108,7 +121,7 @@ async fn main() {
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
     {
-        println!("{USAGE}");
+        println!("{USAGE}\n\nDefault configuration: {}", kernel::config::config_file_path().display());
         return;
     }
     if let Some(unknown) = unrecognized_flag(&argv) {
@@ -130,9 +143,9 @@ async fn main() {
         Some(path) => {
             let path = std::path::Path::new(path);
             if !path.is_file() { fail(format!("explicit configuration file is missing or is not a file: {}", path.display())); }
-            Config::try_load_from(path)
+            Config::try_load_private_from(path)
         }
-        None => Config::try_load(),
+        None => Config::try_load_private(),
     }
         .unwrap_or_else(|error| fail(format!("failed to load configuration: {error}")));
     // Startup failures (unwritable data dir, corrupt DB, unreachable provider)
@@ -265,10 +278,7 @@ async fn main() {
 
     // Pipe mode (no prompt, just process)
     if let Some(piped) = piped_input {
-        let prompt = args
-            .get(1)
-            .map(|s| s.as_str())
-            .unwrap_or("Process this input");
+        let prompt = positional_prompt(&args).unwrap_or("Process this input");
         let msg = format!("{}\n\nInput:\n{}", prompt, piped);
         let output = run_cli_turn(&kernel, agent_id, &msg)
             .await
@@ -401,6 +411,24 @@ async fn run_cli_turn(
         .await
         .map_err(|error| format!("terminal event display failed: {error}"))?;
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::positional_prompt;
+
+    #[test]
+    fn configuration_and_resume_values_never_become_pipe_prompts() {
+        for (arguments, expected) in [
+            (vec!["agent", "--config", "/private/config.toml"], None),
+            (vec!["agent", "--config", "/private/config.toml", "actual prompt"], Some("actual prompt")),
+            (vec!["agent", "--conversation", "id", "--config", "/private/config.toml", "actual prompt"], Some("actual prompt")),
+            (vec!["agent", "--", "-literal prompt"], Some("-literal prompt")),
+        ] {
+            let arguments: Vec<String> = arguments.into_iter().map(str::to_string).collect();
+            assert_eq!(positional_prompt(&arguments), expected);
+        }
+    }
 }
 
 /// Print a clean, user-facing startup error and exit non-zero.

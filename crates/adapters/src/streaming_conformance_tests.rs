@@ -48,6 +48,12 @@ fn native_adapters(uri: &str) -> Vec<Box<dyn LlmProviderAdapter>> {
                 .with_base_url(uri.into())
                 .with_model("fixture".into()),
         ),
+        Box::new(
+            HuggingFaceAdapter::new("fixture-key".into())
+                .with_chat_completions()
+                .with_base_url(uri.into())
+                .with_model("Qwen/Qwen3.5-9B:deepinfra".into()),
+        ),
     ]
 }
 
@@ -117,7 +123,7 @@ pub(super) fn assert_conformance(
 }
 
 #[tokio::test]
-async fn nine_network_adapters_conform_to_declared_streaming() {
+async fn network_adapters_and_huggingface_modes_conform_to_declared_streaming() {
     let server = MockServer::start().await;
     for request_path in [
         "/chat/completions",
@@ -211,6 +217,7 @@ async fn nine_network_adapters_conform_to_declared_streaming() {
             "gemini",
             "groq",
             "huggingface",
+            "huggingface",
             "local",
             "openai",
             "vllm"
@@ -220,9 +227,10 @@ async fn nine_network_adapters_conform_to_declared_streaming() {
         let (response, deltas) = collect(adapter.as_ref(), &[]).await.unwrap();
         assert_eq!(response.content, "Hello 🌐", "{}", adapter.id());
         assert_conformance(adapter.as_ref(), &response, &deltas);
-        if adapter.id() == "huggingface" {
-            assert_eq!(response.usage, LlmUsage::default());
-            assert_eq!(response.tokens_used, 0);
+        if adapter.id() == "huggingface" && !adapter.capabilities().native_streaming {
+            assert!(!response.usage.provider_reported);
+            assert!(response.usage.input_tokens > 0 && response.usage.output_tokens > 0);
+            assert!(response.tokens_used > 0);
         } else {
             assert!(response.usage.provider_reported, "{}", adapter.id());
             assert_eq!(response.usage.input_tokens, 11, "{}", adapter.id());
@@ -249,7 +257,7 @@ async fn native_adapters_assemble_interleaved_parallel_tool_arguments() {
     Mock::given(method("POST"))
         .and(body_partial_json(json!({"stream": true, "tools": [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]})))
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
-        .expect(5)
+        .expect(6)
         .mount(&server)
         .await;
     let tools = [ToolDefinition {
@@ -295,7 +303,7 @@ async fn native_adapters_reject_oversized_streams_and_malformed_tool_calls() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
-            .expect(5)
+            .expect(6)
             .mount(&server)
             .await;
         for adapter in native_adapters(&server.uri()) {
@@ -366,7 +374,7 @@ async fn native_stream_delivers_before_completion_and_preserves_split_utf8() {
         .position(|byte| *byte == 0xf0)
         .unwrap()
         + 2;
-    for index in 0..5 {
+    for index in 0..native_adapters("").len() {
         let (uri, resume, server) = paused_stream(vec![
             first.clone().into_bytes(),
             second.as_bytes()[..split].to_vec(),
@@ -410,7 +418,7 @@ async fn native_stream_delivers_before_completion_and_preserves_split_utf8() {
 
 #[tokio::test]
 async fn native_stream_cancellation_and_deadline_cover_backpressure() {
-    for index in 0..5 {
+    for index in 0..native_adapters("").len() {
         for timeout in [false, true] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -538,7 +546,7 @@ async fn native_stream_without_event_sink_preserves_history_and_zero_usage() {
             {"role": "tool", "content": "fixture-result", "tool_call_id": "call"}
         ]})))
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
-        .expect(5)
+        .expect(6)
         .mount(&server)
         .await;
     let mut assistant = StandardMessage::assistant("");
@@ -571,7 +579,7 @@ async fn native_stream_without_event_sink_preserves_history_and_zero_usage() {
 
 #[tokio::test]
 async fn cancelled_native_attempt_makes_no_request_and_http_errors_stay_typed() {
-    for index in 0..5 {
+    for index in 0..native_adapters("").len() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(

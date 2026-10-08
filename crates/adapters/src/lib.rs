@@ -255,6 +255,7 @@ pub mod anthropic;
 pub mod azure_openai;
 pub mod deepseek;
 pub mod gemini;
+
 pub mod groq;
 pub mod huggingface;
 pub mod local;
@@ -264,6 +265,7 @@ mod model_discovery;
 #[cfg(feature = "candle")]
 pub mod on_device;
 pub mod openai;
+mod openai_chat;
 pub mod streaming;
 pub mod vllm;
 

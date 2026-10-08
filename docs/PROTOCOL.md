@@ -116,6 +116,22 @@ server's typed authorization denial; the clients have no in-process fallback.
 
 ## Version and feature negotiation
 
+Identity administration uses the `tenant_identity_administration` feature.
+The System-only operations are `create_tenant`, `list_tenants`, `revoke_tenant`,
+and the explicit-scope `*_for_tenant` bootstrap/inventory operations. Tenant
+`Admin` credentials use `create_user`, `list_users`, `revoke_user`,
+`issue_api_key`, `list_api_keys`, and `revoke_api_key`; their tenant is derived
+from authentication. User and read-only roles cannot administer identities.
+API-key inventory and revocation use the complete non-secret `key_id`, not a
+bearer secret or an ambiguous key name. The issuance reply returns the secret
+once; debug and audit output redact it. Revocations require `confirm: true`.
+The canonical CLI and typed SDK expose all operations, including explicit
+trusted-system bootstrap. See [First operator bootstrap](SERVER_QUICKSTART.md#first-operator-bootstrap).
+
+These are additive operations, so the v1/v2 compatibility window remains
+unchanged. Clients check the advertised feature or protocol description before
+depending on the new commands; existing request/reply shapes are preserved.
+
 The wire protocol is versioned independently from the crate. Protocol v2 serves
 the compatibility window v1 through v2:
 
@@ -145,9 +161,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 116 current syscalls and rejects either a missing schema operation or an
-undocumented extra. Deterministic golden request arrays cover all 84 v1
-operations and all 116 v2 operations. Domain payload examples and
+all 129 current syscalls and rejects either a missing schema operation or an
+undocumented extra. Deterministic golden request arrays cover all 97 v1
+operations and all 129 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -715,13 +731,13 @@ distributed kernel.
 Versioned fixtures:
 
 - `protocol/v1/error.json`
-- `protocol/v1/requests.json` (all 84 v1 operations)
+- `protocol/v1/requests.json` (all 97 v1 operations)
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/provider-models.json` (system-only identifier catalog)
 - `protocol/v2/unsupported-model-discovery.json` (unsupported catalog error)
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 116 v2 operations)
+- `protocol/v2/requests.json` (all 129 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

@@ -39,6 +39,87 @@ Only the LLM-backed `SendMessage` needs a reachable provider. Point
 (see `docker-compose.yml`). The server itself never blocks on the provider, so
 it is **not** hard-wired to `ollama` becoming healthy.
 
+## First operator bootstrap
+
+After installing the runtime binaries on a supported host, the operator creates
+tenant identities through `agentctl`. These commands use the shipped server and
+public wire API. No application needs to embed the Rust kernel.
+
+Start a loopback server with a secret held only by the server operator:
+
+```bash
+umask 077
+read -r -s -p 'Server operator secret: ' AGENT_SERVER_TOKEN; printf '\n'
+export AGENT_SERVER_TOKEN
+agent-server 127.0.0.1:7777 >agent-server.log 2>&1 &
+
+TENANT_ID="$(agentctl tenant-create research | jq -er .id)"
+ADMIN_ID="$(agentctl --tenant "$TENANT_ID" \
+  user-create research-admin admin@example.test admin | jq -er .id)"
+agentctl --tenant "$TENANT_ID" api-key-issue "$ADMIN_ID" first-operator \
+  >research-admin.key
+```
+
+`api-key-issue` writes the bearer key once as a single stdout line. Its warning
+and non-secret key ID go to stderr. Keys are stored hashed and cannot be
+recovered from `api-keys`. Keep the file owner-only, transfer it to the tenant
+admin through a trusted channel, and keep the server operator secret private.
+Use TLS and a verified client connection profile when connecting off-host.
+
+In the tenant admin's shell, use their key instead of the shared operator secret:
+
+```bash
+export AGENT_SERVER_TOKEN="$(cat research-admin.key)"
+agentctl user-create researcher researcher@example.test user
+agentctl users
+agentctl api-keys
+agentctl create researcher 'Read project evidence' stub read-only 3
+agentctl create reviewer 'Review project evidence' stub standard 3
+agentctl list
+```
+
+These keyless control-plane examples admit agents and inspect their state.
+`stub` does not execute a model. Configure an actual model endpoint and model
+name before requesting a turn. For an existing Ollama endpoint, the server's
+explicit `AGENT_SERVER_CONFIG` TOML selects `llm_provider = "local"`, the
+chosen `default_model`, and `[api_keys] local = "http://HOST:11434"`. Inspect
+`agentctl providers`, then create agents with the returned provider ID before
+using `agentctl message AGENT_ID MESSAGE`. Provider selection, secrets, and
+budgets belong to server configuration; tenant keys do not contain provider
+credentials. Live paid qualification still requires an explicit model/budget
+and the protected secret-backed workflow.
+
+The tenant admin can provision only their own tenant. `--tenant` selects a
+separate System-only bootstrap/inventory syscall and fails for every tenant
+credential, including an admin. Repeat the first three operator commands with
+a new tenant name to onboard another isolated team. Their `list`, storage,
+memory, and tool requests cannot reach the first team's agents.
+
+Revocation uses the non-secret full `key_id` returned by `api-keys`:
+
+```bash
+agentctl api-key-revoke KEY_ID --confirm KEY_ID
+agentctl user-revoke USER_ID --confirm USER_ID
+# Server operator only:
+agentctl tenant-revoke TENANT_ID --confirm TENANT_ID
+```
+
+Confirmations must match the exact target. Revocation invalidates fresh and
+already-open connections after admitted work drains; it retains agent data.
+The separate `erase-*` commands perform confirmed data deletion. Every identity
+mutation emits a structured `agentos::auth_audit` log event with actor
+tenant/user/role and target ID, without bearer secrets. Authentication frames
+necessarily carry the presented credential, and the issuance reply contains
+the new key once; inventory/revocation frames and debug output never expose it.
+
+The CI `Operator onboarding evidence` workflow executes this command sequence
+against actual `agent-server`/`agentctl` processes with disposable fixture
+credentials. It proves two tenant boundaries, multiple-agent visibility,
+permission and quota denials, durable state after process restart, key inventory
+and revocation, exact confirmations, role parsing, and log redaction. Its
+source-bound logs are regression evidence; a hosted runner does not prove
+installation or capacity on every hardware configuration.
+
 ## The wire protocol
 
 Requests and replies are newline-delimited JSON. The request enum is internally

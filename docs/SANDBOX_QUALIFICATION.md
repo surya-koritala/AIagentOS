@@ -165,6 +165,19 @@ access, provider panic, generic envelopes, and cross-surface policy. The
 artifact remains `production_claim_allowed: false`; it is proof of the
 restricted live-provider suite, not a substitute for independent review.
 
+## macOS native prerequisites
+
+The maintained App Sandbox was tested independently on native ARM64 and Intel
+macOS hosts. Its explicit workspace and controlled network denials worked, but
+the process could write to its runtime temporary directory outside the
+workspace, leave its original process group, and execute an undeclared system
+program. The requested 64 MiB address-space limit was rejected, and the Unix
+process-count primitive uses the shared real UID rather than an agent boundary.
+These are feasibility observations, not Linux-contract parity. The precise
+results, source-bound CI evidence, and remaining design decision are recorded
+in [macOS process isolation status](MACOS_PROCESS_ISOLATION.md). Native
+execution stays unavailable and issue #335 remains open.
+
 ## Residual qualification
 
 The capability registry records this boundary as `public-api-e2e`, not

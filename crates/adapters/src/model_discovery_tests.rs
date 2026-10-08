@@ -89,6 +89,11 @@ async fn model_discovery_capabilities_match_every_adapter_and_registered_catalog
             crate::huggingface::HuggingFaceAdapter::new("fixture-key".into())
                 .with_base_url(server.uri()),
         ),
+        Arc::new(
+            crate::huggingface::HuggingFaceAdapter::new("fixture-key".into())
+                .with_chat_completions()
+                .with_base_url(server.uri()),
+        ),
     ];
     #[cfg(feature = "candle")]
     let unsupported = {

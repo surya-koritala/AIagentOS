@@ -133,6 +133,33 @@ async fn corrections_cannot_grant_denied_tool_authority() {
 }
 
 #[tokio::test]
+async fn local_resume_uses_verified_original_owner_and_rejects_stale_erased_or_foreign_state() {
+    let directory = PrivateDirectory::new();
+    let store = rules(&directory.0.join("rules.json"));
+    let kernel = AgentKernelImpl::new().unwrap();
+    let requests = fixture(&kernel, Vec::new(), false);
+    let owner = kernel.create_agent_full(agent_config("cli-agent")).await.unwrap();
+    let conversation = kernel.configure_local_cli_agent(owner.id, store.clone(), "owner policy".into(), None).await.unwrap();
+    kernel.send_message(owner.id, "original owner message").await.unwrap();
+    assert_eq!(store.cli_conversation(&conversation).unwrap().unwrap().agent_id, owner.id);
+    assert_eq!(kernel.configure_local_cli_agent(owner.id, store.clone(), "owner policy".into(), Some(&conversation)).await.unwrap(), conversation);
+    kernel.send_message(owner.id, "continue original conversation").await.unwrap();
+    assert!(requests.lock().unwrap()[1].messages.iter().any(|message| message.content == "original owner message"));
+    let peer = kernel.create_agent_full(agent_config("peer")).await.unwrap();
+    assert!(kernel.configure_local_cli_agent(peer.id, store.clone(), "foreign".into(), Some(&conversation)).await.is_err());
+    assert!(kernel.configure_local_cli_agent(owner.id, store.clone(), "unknown".into(), Some(&kernel::AgentId::new_v4().to_string())).await.is_err());
+    kernel.context_manager.delete_conversation(&conversation).unwrap();
+    assert!(store.cli_conversation(&conversation).unwrap().is_some());
+    assert!(kernel.configure_local_cli_agent(owner.id, store.clone(), "stale".into(), Some(&conversation)).await.is_err());
+    kernel.stop_agent(owner.id).await.unwrap();
+    assert!(kernel.configure_local_cli_agent(owner.id, store.clone(), "stopped".into(), Some(&conversation)).await.is_err());
+    kernel.erase_agent_data(owner.id).await.unwrap().unwrap();
+    assert!(store.cli_conversation(&conversation).unwrap().is_some());
+    assert!(kernel.configure_local_cli_agent(owner.id, store, "erased".into(), Some(&conversation)).await.is_err());
+    assert_eq!(requests.lock().unwrap().len(), 2, "rejected bindings must not call a provider");
+}
+
+#[tokio::test]
 async fn planning_is_parsed_bounded_accounted_and_never_executes_calls() {
     let kernel = AgentKernelImpl::new().unwrap();
     let mut malicious = response("1. Write a file");
@@ -296,4 +323,22 @@ async fn shipped_agent_add_list_remove_restart_and_plan_status() {
     let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
     assert!(body["options"]["num_predict"].as_u64().is_some_and(|bound| bound > 0));
     assert!(body.get("tools").is_none());
+    success(binary(&home.0, "original saved message"));
+    let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(config.data_dir.join("rules.json")).unwrap()).unwrap();
+    let binding = &disk["conversations"][0];
+    let conversation = binding["conversation_id"].as_str().unwrap();
+    let original_agent: kernel::AgentId = binding["agent_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(binding["tenant_id"], kernel::context::DEFAULT_TENANT);
+    let resumed = success(binary_command(&home.0).args(["--conversation", conversation, "-c", "/id"]).output().unwrap());
+    assert!(resumed.contains(conversation));
+    success(binary_command(&home.0).args(["--conversation", conversation, "-c", "continue saved message"]).output().unwrap());
+    let captured = server.received_requests().await.unwrap();
+    let continuation: serde_json::Value = serde_json::from_slice(&captured.last().unwrap().body).unwrap();
+    assert!(continuation["messages"].as_array().unwrap().iter().any(|message| message["content"].as_str().is_some_and(|content| content.contains("original saved message"))));
+    let inspect = AgentKernelImpl::from_config(&config).unwrap();
+    assert_eq!(inspect.context_manager.conversation_owner(conversation).unwrap(), original_agent);
+    inspect.context_manager.delete_conversation(conversation).unwrap();
+    drop(inspect);
+    let stale = binary_command(&home.0).args(["--conversation", conversation, "-c", "/id"]).output().unwrap();
+    assert!(!stale.status.success());
 }

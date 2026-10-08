@@ -23,6 +23,30 @@ It uses the standard library's [exclusive file lock](https://doc.rust-lang.org/s
 The operator identity is derived from the effective Unix UID or the Windows
 TokenUser SID, rather than caller-supplied environment names.
 
+The same private file holds at most 128 conversation ownership bindings,
+registered only after the local executor saves its own conversation. Each
+binding records only the conversation UUID, original agent UUID, default
+tenant, and registration time. `agent --conversation UUID` selects that
+original owner after kernel rehydration; it creates no replacement agent
+and copies no permissions, approvals, credentials, or foreign messages.
+The kernel rechecks private registration, SQL ownership, tenant, running
+lifecycle, and current gate/cgroup admission before loading history. The
+current CLI provider/profile must still match the restored owner's
+configuration. Missing, erased, unregistered, foreign, terminal, or stale
+bindings fail closed. An unfinished durable checkpoint requires the
+existing checkpoint-resume route instead of discarding its pending work.
+Conversation IDs from before this private registry existed are unregistered
+and are rejected; they are never adopted automatically.
+
+The `file/local-cli-corrections` data inventory entry includes the rules,
+provenance, and registry. This file is plaintext under owner-only access and
+is excluded from database backups and SQLCipher database encryption. The
+local operator must protect and recover it separately. Retiring the file
+clears corrections and local resume bindings; it does not erase SQLite
+history. `/unlearn` removes correction text while preserving ownership
+bindings. Erasing an agent's database state leaves an unusable stale ID in
+the private registry, which cannot resurrect the erased agent.
+
 The default correction scope belongs to the local embedded CLI operator and
 the default tenant. The terminal explicitly attaches it to its executor.
 Another kernel agent or tenant receives no rules automatically, and a

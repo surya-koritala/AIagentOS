@@ -44,12 +44,12 @@ USAGE:
   agent                          Interactive session
   agent \"prompt\"                 One-shot prompt (also reads piped stdin)
   agent -c \"do something\"        One-shot command
-  agent --conversation ID        Resume a stored conversation
+  agent --conversation ID        Resume a registered local conversation
   agent policy <ARGS...>         Validate or dry-run a policy document (offline)
 
 OPTIONS:
   -c <COMMAND>                   Run one command and exit
-  --conversation <ID>            Resume conversation <ID>
+  --conversation <ID>            Resume a registered local conversation <ID>
   -h, --help                     Print this help and exit
   -V, --version                  Print the exact build version and exit
 
@@ -156,35 +156,45 @@ async fn main() {
         None
     };
 
-    // Create agent
-    let handle = kernel
-        .create_agent_full(AgentConfig {
+    let operator = kernel::config::local_operator_identity()
+        .unwrap_or_else(|error| fail(format!("failed to determine local operator: {error}")));
+    let rules = Arc::new(RuleStore::from_file(
+        &config.data_dir.join("rules.json"), RuleScope::local_cli(), &operator,
+    ).unwrap_or_else(|error| fail(format!("failed to load local correction rules: {error}"))));
+    // Restore the original registered owner through the existing kernel
+    // lifecycle, rather than copying another agent's history into a new one.
+    kernel.rehydrate_agents().await
+        .unwrap_or_else(|error| fail(format!("failed to restore kernel agents: {error}")));
+    let agent_id = if let Some(id) = conversation_id.as_deref() {
+        let binding = rules.cli_conversation(id)
+            .unwrap_or_else(|error| fail(format!("failed to read local conversation binding: {error}")))
+            .unwrap_or_else(|| fail("conversation is not registered to this local operator"));
+        let restored = kernel.agent_manager.get_agent_config(binding.agent_id)
+            .unwrap_or_else(|| fail("registered conversation owner is missing or was erased"));
+        if restored.llm_provider != config.llm_provider || restored.permission_profile != config.permission_profile {
+            fail("registered conversation provider or permission profile differs from the current CLI configuration");
+        }
+        binding.agent_id
+    } else {
+        kernel.create_agent_full(AgentConfig {
             name: "cli-agent".into(),
             task: "interactive assistant".into(),
             llm_provider: config.llm_provider.clone(),
             permission_profile: config.permission_profile.clone(),
             priority: Priority::default(),
             sandbox_config: None,
-        })
-        .await
-        .unwrap_or_else(|e| fail(format!("failed to create agent: {e}")));
-
-    // Create executor with project context
+        }).await.unwrap_or_else(|error| fail(format!("failed to create agent: {error}"))).id
+    };
     let project_ctx = project_context();
     let system_prompt = format!("You are a helpful AI assistant running in a terminal. Be concise and use tools when needed.\n\n{}", project_ctx);
 
-    let operator = kernel::config::local_operator_identity()
-        .unwrap_or_else(|error| fail(format!("failed to determine local operator: {error}")));
-    let rules = Arc::new(RuleStore::from_file(
-        &config.data_dir.join("rules.json"), RuleScope::local_cli(), &operator,
-    ).unwrap_or_else(|error| fail(format!("failed to load local correction rules: {error}"))));
     let conversation = kernel.configure_local_cli_agent(
-        handle.id, rules.clone(), system_prompt, conversation_id.as_deref(),
+        agent_id, rules.clone(), system_prompt, conversation_id.as_deref(),
     ).await.unwrap_or_else(|error| fail(format!("failed to configure CLI agent: {error}")));
 
     // One-shot mode
     if let Some(cmd) = one_shot {
-        match cancellable_cli_operation(&kernel, handle.id, handle_slash(&cmd, &kernel, handle.id, &conversation, &rules)).await {
+        match cancellable_cli_operation(&kernel, agent_id, handle_slash(&cmd, &kernel, agent_id, &conversation, &rules)).await {
             Ok(SlashOutcome::Output(output)) => { println!("{output}"); return; }
             Ok(SlashOutcome::Quit) => return,
             Ok(SlashOutcome::NotSlash) => {},
@@ -195,7 +205,7 @@ async fn main() {
         } else {
             cmd
         };
-        let output = run_cli_turn(&kernel, handle.id, &msg)
+        let output = run_cli_turn(&kernel, agent_id, &msg)
             .await
             .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
@@ -209,7 +219,7 @@ async fn main() {
             .map(|s| s.as_str())
             .unwrap_or("Process this input");
         let msg = format!("{}\n\nInput:\n{}", prompt, piped);
-        let output = run_cli_turn(&kernel, handle.id, &msg)
+        let output = run_cli_turn(&kernel, agent_id, &msg)
             .await
             .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
@@ -242,13 +252,13 @@ async fn main() {
             continue;
         }
 
-        match cancellable_cli_operation(&kernel, handle.id, handle_slash(input, &kernel, handle.id, &conversation, &rules)).await {
+        match cancellable_cli_operation(&kernel, agent_id, handle_slash(input, &kernel, agent_id, &conversation, &rules)).await {
             Ok(SlashOutcome::Output(output)) => { println!("{output}"); continue; }
             Ok(SlashOutcome::Quit) => break,
             Ok(SlashOutcome::NotSlash) => {},
             Err(error) => { eprintln!("Error: {error}"); continue; },
         }
-        let output = run_cli_turn(&kernel, handle.id, input).await;
+        let output = run_cli_turn(&kernel, agent_id, input).await;
 
         match output {
             Ok(out) => {
@@ -267,7 +277,7 @@ async fn main() {
             Err(e) => eprintln!("\x1b[31m  Error: {}\x1b[0m\n", e),
         }
     }
-    if kernel.context_manager.conversation_owner(&conversation).ok() == Some(handle.id) {
+    if kernel.context_manager.conversation_owner(&conversation).ok() == Some(agent_id) {
         eprintln!("\n\x1b[90mSaved: {}\x1b[0m", conversation);
     } else {
         eprintln!("\n\x1b[90mNo messages saved. Conversation: {}\x1b[0m", conversation);

@@ -5363,19 +5363,33 @@ impl AgentKernelImpl {
         system_prompt: String,
         conversation: Option<&str>,
     ) -> Result<String, KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        let lifecycle = self.lifecycle_lock(agent_id);
+        let _guard = lifecycle.lock().await;
         if store.scope() != &crate::learning::RuleScope::local_cli()
+            || !store.is_durable()
             || store.operator() != crate::config::local_operator_identity().map_err(|error| KernelError::Policy(error.to_string()))?
             || self.context_manager.agent_tenant(agent_id)?.as_deref() != Some(crate::context::DEFAULT_TENANT)
         {
             return Err(KernelError::Policy("local CLI corrections require the local operator scope and tenant".into()));
         }
+        if self.get_agent_status(agent_id)? != AgentState::Running || self.syscall_gate.pid_of(agent_id).is_none() {
+            return Err(KernelError::Policy("local CLI conversation owner is not an eligible running agent".into()));
+        }
+        self.syscall_gate.cgroup_quota_constraints(agent_id).map_err(|error| KernelError::Policy(error.message()))?;
         if let Some(conversation) = conversation {
+            let binding = store.cli_conversation(conversation).map_err(|error| KernelError::Policy(error.to_string()))?
+                .ok_or_else(|| KernelError::Policy("conversation is not registered to this local operator".into()))?;
+            if binding.agent_id != agent_id || binding.tenant_id != crate::context::DEFAULT_TENANT {
+                return Err(KernelError::Policy("conversation registry owner does not match this agent and tenant".into()));
+            }
             if self.context_manager.conversation_owner(conversation)? != agent_id {
                 return Err(KernelError::Policy("conversation belongs to another agent".into()));
             }
+            if !self.context_manager.list_generation_checkpoints(&binding.tenant_id, Some(agent_id))?.is_empty() {
+                return Err(KernelError::Policy("conversation has an unfinished checkpoint; use the governed checkpoint-resume flow".into()));
+            }
         }
-        let lifecycle = self.lifecycle_lock(agent_id);
-        let _guard = lifecycle.lock().await;
         let executor = self.ensure_executor(agent_id).await?;
         let mut executor = executor.try_lock().map_err(|_| KernelError::Policy("cannot configure CLI corrections during an active turn".into()))?;
         executor.configure_terminal_prompt(system_prompt, conversation)?;

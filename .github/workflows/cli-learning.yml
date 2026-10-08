@@ -9,6 +9,7 @@ on:
       - 'crates/kernel/src/planning.rs'
       - 'crates/kernel/src/execution.rs'
       - 'crates/kernel/src/config.rs'
+      - 'crates/kernel/src/data_inventory.rs'
       - 'crates/kernel/src/windows_private_fs.rs'
       - 'crates/kernel/src/lib.rs'
       - '.github/workflows/cli-learning.yml'

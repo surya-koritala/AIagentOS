@@ -676,7 +676,7 @@ impl AgentExecutor {
         let authorized = match store.scope() {
             crate::learning::RuleScope::Agent(agent) => agent == &self.agent_id.to_string(),
             crate::learning::RuleScope::LocalOperator { tenant_id, operator } => {
-                operator == "local-cli" && self.context_admission.as_ref().is_some_and(|(_, tenant)| tenant == tenant_id)
+                store.is_durable() && operator == "local-cli" && self.context_admission.as_ref().is_some_and(|(_, tenant)| tenant == tenant_id)
             }
             _ => false,
         };
@@ -1594,7 +1594,15 @@ impl AgentExecutor {
     fn save_conversation(&self) -> Result<(), KernelError> {
         self.context_manager
             .save_conversation(&self.conversation_id, self.agent_id, &self.messages)
-            .map_err(KernelError::Context)
+            .map_err(KernelError::Context)?;
+        if let Some(store) = &self.rule_store {
+            if store.scope() == &crate::learning::RuleScope::local_cli() {
+                let tenant = self.context_manager.agent_tenant(self.agent_id)?.ok_or(crate::AgentError::NotFound(self.agent_id))?;
+                store.register_cli_conversation(&self.conversation_id, self.agent_id, &tenant)
+                    .map_err(|error| KernelError::Policy(format!("conversation registry persistence could not be confirmed: {error}")))?;
+            }
+        }
+        Ok(())
     }
 
     /// Clean messages: remove orphaned tool results (tool messages without preceding tool_calls).

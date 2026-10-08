@@ -1130,10 +1130,10 @@ pub struct AgentKernelImpl {
     /// Serializes structural get-or-create operations. Cgroup membership has a
     /// separate mutation lock in the syscall gate.
     cgroup_tree_lock: std::sync::Mutex<()>,
-    /// Agent+Tool namespaces per agent group, created lazily. Agents created via
+    /// Agent, Tool, and Mount namespaces per agent group, created lazily. Agents created via
     /// `create_agent_in_namespace` with the same group share these (and can
     /// see/message each other); ungrouped agents use the registry defaults.
-    group_namespaces: DashMap<String, (NamespaceId, NamespaceId)>,
+    group_namespaces: DashMap<String, (NamespaceId, NamespaceId, NamespaceId)>,
     /// Publishes a namespace tag and its group-scoped tool binding as one
     /// kernel transaction. Readers may observe the tag before the binding
     /// exists (safe), but competing group registrations cannot overwrite and
@@ -1899,7 +1899,7 @@ impl AgentKernelImpl {
         binding.security.namespace_visibility = crate::tools::NamespaceVisibility::CallerNamespace;
         // Tag the gate before publishing to the LLM-visible registry so there
         // is no concurrent window where the scoped tool appears global.
-        let (_agent_ns, tool_ns) = self.namespaces_for_group(Some(group));
+        let (_agent_ns, tool_ns, _mount_ns) = self.namespaces_for_group(Some(group));
         if let Some(ns) = tool_ns {
             self.syscall_gate.register_tool_namespace(name.clone(), ns);
             if let Err(error) = self.tool_registry.register_namespace_scoped(binding) {
@@ -1924,7 +1924,7 @@ impl AgentKernelImpl {
         // Resolve the caller namespaces before looking up the tool.  This keeps
         // package validation from exposing a side-effect/timing distinction
         // between a missing name and a name scoped to another group.
-        let (_agent_namespace, tool_namespace) = self.namespaces_for_group(group);
+        let (_agent_namespace, tool_namespace, _mount_namespace) = self.namespaces_for_group(group);
         let registered = self.tool_registry.has_tool(tool_name);
         let namespace_visible = tool_namespace.is_some_and(|namespace| {
             self.syscall_gate
@@ -2217,16 +2217,21 @@ impl AgentKernelImpl {
         })
     }
 
-    /// Resolve the (Agent, Tool) namespaces for a group, creating them lazily.
+    /// Resolve the (Agent, Tool, Mount) namespaces for a group, creating them lazily.
     /// `None` → the registry's shared defaults.
     fn namespaces_for_group(
         &self,
         group: Option<&str>,
-    ) -> (Option<NamespaceId>, Option<NamespaceId>) {
+    ) -> (
+        Option<NamespaceId>,
+        Option<NamespaceId>,
+        Option<NamespaceId>,
+    ) {
         match group {
             None => (
                 self.os.namespaces.default_ns(NamespaceType::Agent),
                 self.os.namespaces.default_ns(NamespaceType::Tool),
+                self.os.namespaces.default_ns(NamespaceType::Mount),
             ),
             Some(g) => {
                 // Atomic get-or-create so two agents created concurrently for a
@@ -2238,9 +2243,10 @@ impl AgentKernelImpl {
                         (
                             self.os.namespaces.create(NamespaceType::Agent, None),
                             self.os.namespaces.create(NamespaceType::Tool, None),
+                            self.os.namespaces.create(NamespaceType::Mount, None),
                         )
                     });
-                (Some(e.0), Some(e.1))
+                (Some(e.0), Some(e.1), Some(e.2))
             }
         }
     }
@@ -2380,14 +2386,18 @@ impl AgentKernelImpl {
             .label_mac_agent(pid, format!("profile:{}", config.permission_profile))
             .await;
 
-        // Join the Agent + Tool namespaces for this agent's group.
-        let (agent_ns, tool_ns) = self.namespaces_for_group(group);
+        // Join this group's Agent, Tool, and Mount namespaces.
+        let (agent_ns, tool_ns, mount_ns) = self.namespaces_for_group(group);
         let mut agent_ns_ids = Vec::new();
         if let Some(ns) = agent_ns {
             self.os.namespaces.join(ns, pid);
             agent_ns_ids.push(ns);
         }
         if let Some(ns) = tool_ns {
+            self.os.namespaces.join(ns, pid);
+            agent_ns_ids.push(ns);
+        }
+        if let Some(ns) = mount_ns {
             self.os.namespaces.join(ns, pid);
             agent_ns_ids.push(ns);
         }

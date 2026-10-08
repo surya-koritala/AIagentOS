@@ -10,6 +10,11 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added bounded per-namespace VFS mount tables with governed tool/workspace
+  aliases, tenant admin authority, exact table revisions, mount revocation and
+  descriptor reclamation. SDK and agentctl expose the control surface;
+  namespace leave/rejoin and remount never resurrect descriptors. Relates #392.
+
 - Added the `/workspace` VFS mount with agent-owned file/directory entry handles,
   child opening, rights-narrowing duplication, bounded binary I/O, listing, and
   metadata. Directory and sandbox rebinding revoke handles; atomic writes retain
@@ -19,7 +24,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 - Added an initial tool VFS at `/tools/<name>` through the public wire, Rust SDK,
   and `agentctl`. Bounded agent-owned handles identify exact registrations;
   invocation retains current tool governance, and close/teardown revoke them.
-  Workspace and other mounts plus durable cloning remain tracked in #392/#393.
+  Remaining resource mounts and durable cloning remain tracked in #392/#393.
 
 - Integrated the pending Rust, frontend, workflow-action, and container dependency
   updates, and refreshed vulnerable HTTP/TLS, Wasm, and frontend dependencies.

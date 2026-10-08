@@ -1,6 +1,31 @@
 [
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "vfs_namespace_mounts"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "vfs_mount_entries",
+    "path": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "expected_generation": 1,
+    "expected_table_id": "fixture",
+    "kind": "tools",
+    "op": "vfs_mount",
+    "path": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "expected_generation": 1,
+    "expected_table_id": "fixture",
+    "mount_id": "fixture",
+    "op": "vfs_unmount",
+    "path": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
     "op": "vfs_workspace_mounts"
   },
   {

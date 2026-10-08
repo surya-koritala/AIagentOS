@@ -394,7 +394,11 @@ async fn workspace_path_aliases_reject_ambient_paths_and_parent_traversal() {
             .unwrap_err();
         assert_eq!(
             error.wire_code(),
-            Some(WireErrorCode::InvalidArgument),
+            Some(if path == "/etc/passwd" {
+                WireErrorCode::NotFound
+            } else {
+                WireErrorCode::InvalidArgument
+            }),
             "{path}"
         );
     }

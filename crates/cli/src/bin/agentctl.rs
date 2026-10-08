@@ -9,13 +9,17 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] vfs-mounts AGENT_ID\n\
            agentctl [SERVER OPTIONS] vfs-open AGENT_ID /tools/NAME\n\
            agentctl [SERVER OPTIONS] vfs-invoke AGENT_ID HANDLE ARGUMENTS_JSON\n\
            agentctl [SERVER OPTIONS] vfs-close AGENT_ID HANDLE\n\
+           agentctl [SERVER OPTIONS] vfs-namespace-mounts AGENT_ID\n\
+           agentctl [SERVER OPTIONS] vfs-mount-entries AGENT_ID MOUNT_PATH\n\
+           agentctl [SERVER OPTIONS] vfs-mount AGENT_ID TABLE_ID TABLE_GENERATION MOUNT_PATH <tools|workspace>\n\
+           agentctl [SERVER OPTIONS] vfs-unmount AGENT_ID TABLE_ID TABLE_GENERATION MOUNT_PATH MOUNT_ID\n\
            agentctl [SERVER OPTIONS] vfs-workspace-mounts AGENT_ID\n\
            agentctl [SERVER OPTIONS] vfs-workspace-open AGENT_ID PATH <file|directory> RIGHTS [--allow-missing]\n\
            agentctl [SERVER OPTIONS] vfs-open-at AGENT_ID DIRECTORY_HANDLE RELATIVE_PATH <file|directory> RIGHTS [--allow-missing]\n\
@@ -1086,6 +1090,75 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             print_json(&view, "workspace mount");
+            return;
+        }
+        "vfs-namespace-mounts" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let view = client
+                .vfs_namespace_mounts(agent)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&view, "namespace mounts");
+            return;
+        }
+        "vfs-mount-entries" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let path = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let view = client
+                .vfs_mount_entries(agent, path)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&view, "mount entries");
+            return;
+        }
+        "vfs-mount" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let table_id = args.next().unwrap_or_else(|| usage());
+            let generation = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let path = args.next().unwrap_or_else(|| usage());
+            let kind = match args.next().unwrap_or_else(|| usage()).as_str() {
+                "tools" => agent_sdk::MountKind::Tools,
+                "workspace" => agent_sdk::MountKind::Workspace,
+                _ => usage(),
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            let view = client
+                .vfs_mount(agent, table_id, generation, path, kind)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&view, "namespace mounts");
+            return;
+        }
+        "vfs-unmount" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let table_id = args.next().unwrap_or_else(|| usage());
+            let generation = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let path = args.next().unwrap_or_else(|| usage());
+            let mount = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let view = client
+                .vfs_unmount(agent, table_id, generation, path, mount)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&view, "namespace mounts");
             return;
         }
         "vfs-workspace-open" => {

@@ -880,6 +880,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_wire_unmount_allows_an_admitted_write_to_finish_and_revokes_new_work() {
+        use crate::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer};
+        use base64::Engine;
+        let (root, kernel, agent, handle) = setup().await;
+        let view = kernel.vfs_namespace_mounts(agent).unwrap();
+        let mount = view
+            .mounts
+            .iter()
+            .find(|entry| entry.path == "/workspace")
+            .unwrap();
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let task = tokio::spawn(server.serve());
+        let mut writer = SyscallClient::connect(addr).await.unwrap();
+        let mut operator = SyscallClient::connect(addr).await.unwrap();
+        let (entered, release, _) = kernel.sandbox_manager.pause_next_filesystem_for_test();
+        writer
+            .send(&Syscall::VfsWriteWorkspace {
+                agent_id: agent.to_string(),
+                handle: handle.id.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(b"admitted write"),
+            })
+            .await
+            .unwrap();
+        observed(&entered).await;
+        assert!(matches!(
+            operator
+                .call(Syscall::VfsUnmount {
+                    agent_id: agent.to_string(),
+                    expected_table_id: view.table_id.clone(),
+                    expected_generation: view.generation,
+                    path: mount.path.clone(),
+                    mount_id: mount.id.clone(),
+                })
+                .await
+                .unwrap(),
+            SyscallReply::VfsNamespaceMounts { .. }
+        ));
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 0);
+        assert!(kernel
+            .vfs_read_workspace(agent, &handle.id, 0, 64)
+            .await
+            .is_err());
+        release.store(true, Ordering::Release);
+        assert!(matches!(
+            writer.read_reply().await.unwrap(),
+            SyscallReply::WorkspaceWritten { written_bytes: 14 }
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("file.bin")).unwrap(),
+            b"admitted write"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn unmount_during_a_native_open_prevents_late_descriptor_publication() {
+        let (_root, kernel, agent, _handle) = setup().await;
+        let view = kernel.vfs_namespace_mounts(agent).unwrap();
+        let mount = view
+            .mounts
+            .iter()
+            .find(|entry| entry.path == "/workspace")
+            .unwrap();
+        let (entered, release, _) = kernel.sandbox_manager.pause_next_filesystem_for_test();
+        let worker = tokio::spawn({
+            let kernel = kernel.clone();
+            async move {
+                kernel
+                    .vfs_open_workspace(
+                        agent,
+                        WorkspaceOpenRequest {
+                            path: "/workspace/file.bin".into(),
+                            kind: WorkspaceKind::File,
+                            rights: vec![WorkspaceRight::Read],
+                            allow_missing: false,
+                        },
+                    )
+                    .await
+            }
+        });
+        observed(&entered).await;
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 2);
+        kernel
+            .vfs_unmount(
+                agent,
+                &view.table_id,
+                view.generation,
+                &mount.path,
+                &mount.id,
+            )
+            .unwrap();
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 0);
+        release.store(true, Ordering::Release);
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(WorkspaceError::Vfs(super::super::VfsError::NotFound))
+        ));
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 0);
+    }
+
+    #[tokio::test]
     async fn public_wire_kill_revokes_a_paused_workspace_write_before_commit() {
         use crate::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer};
         use base64::Engine;

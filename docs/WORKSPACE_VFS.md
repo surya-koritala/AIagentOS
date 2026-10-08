@@ -31,6 +31,8 @@ duplicate, dot, parent, drive, backslash, control-character, trailing-space/dot,
 and portable device-name aliases are rejected. Percent characters are literal;
 the VFS does not URL-decode them. UTF-8 names are supported within the portable
 name constraints. Symlink components and special files cannot be opened.
+Additional absolute roots can be selected by the namespace mount table;
+`open_at` paths remain relative to their directory descriptor.
 
 ## I/O and lifecycle
 
@@ -80,7 +82,7 @@ sends bounded bytes to the remote governed entry. It does not let an agent name
 a host path on the kernel. Readers must inspect `eof`; JSON output never labels
 a partial chunk as a complete file.
 
-Namespace mount administration and revocation generations, memory/KV/IPC
-mounts, and full qualification remain in
+Namespace mount administration and revocation are described in
+[Namespace mounts](NAMESPACE_MOUNTS.md). Memory/KV/IPC mounts and full qualification remain in
 [#392](https://github.com/surya-koritala/AIagentOS/issues/392). Native process
 isolation and platform durability gaps retain their existing support status.

@@ -73,9 +73,54 @@ async fn agentctl_vfs_open_invoke_and_close_use_the_public_server() {
     let closed = command(addr, vec!["vfs-close".into(), agent.clone(), id]).await;
     assert_eq!(closed, json!({"closed":true}));
     assert_eq!(
-        command(addr, vec!["vfs-mounts".into(), agent]).await["open_handles"],
+        command(addr, vec!["vfs-mounts".into(), agent.clone()]).await["open_handles"],
         0
     );
+    let view = command(addr, vec!["vfs-namespace-mounts".into(), agent.clone()]).await;
+    let updated = command(
+        addr,
+        vec![
+            "vfs-mount".into(),
+            agent.clone(),
+            view["table_id"].as_str().unwrap().into(),
+            view["generation"].as_u64().unwrap().to_string(),
+            "/commands".into(),
+            "tools".into(),
+        ],
+    )
+    .await;
+    let entries = command(
+        addr,
+        vec![
+            "vfs-mount-entries".into(),
+            agent.clone(),
+            "/commands".into(),
+        ],
+    )
+    .await;
+    assert!(entries["entries"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("/commands/read_file")));
+    let mount = updated["mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mount| mount["path"] == "/commands")
+        .unwrap();
+    let removed = command(
+        addr,
+        vec![
+            "vfs-unmount".into(),
+            agent,
+            updated["table_id"].as_str().unwrap().into(),
+            updated["generation"].as_u64().unwrap().to_string(),
+            "/commands".into(),
+            mount["id"].as_str().unwrap().into(),
+        ],
+    )
+    .await;
+    assert_eq!(removed["mounts"].as_array().unwrap().len(), 2);
     task.abort();
     let _ = task.await;
     std::fs::remove_dir_all(root).unwrap();

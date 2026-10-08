@@ -268,6 +268,8 @@ struct GateRecord {
     /// mutations. Exact field comparison catches mismatches; this generation
     /// additionally catches change-then-restore ABA.
     authorization_revision: u64,
+    /// Namespace-only epoch binds VFS descriptors across leave/rejoin ABA.
+    namespace_revision: u64,
 }
 
 /// Durable quota constraints paired with the membership revision they were
@@ -741,6 +743,7 @@ impl SyscallGate {
                 accepting_tool_calls: true,
                 namespaces: Vec::new(),
                 authorization_revision,
+                namespace_revision: authorization_revision,
             },
         );
         self.agent_stats.entry(kid).or_default();
@@ -808,6 +811,7 @@ impl SyscallGate {
             rec.authorization_revision = self
                 .next_authorization_revision
                 .fetch_add(1, Ordering::SeqCst);
+            rec.namespace_revision = rec.authorization_revision;
         }
     }
 
@@ -820,8 +824,22 @@ impl SyscallGate {
                 rec.authorization_revision = self
                     .next_authorization_revision
                     .fetch_add(1, Ordering::SeqCst);
+                rec.namespace_revision = rec.authorization_revision;
             }
         }
+    }
+
+    pub(crate) fn namespace_membership(
+        &self,
+        kid: uuid::Uuid,
+    ) -> Option<(Pid, Vec<NamespaceId>, u64)> {
+        self.records.get(&kid).map(|record| {
+            (
+                record.pid,
+                record.namespaces.clone(),
+                record.namespace_revision,
+            )
+        })
     }
 
     pub fn try_unregister_agent(&self, kid: uuid::Uuid) -> Result<(), GateMutationError> {

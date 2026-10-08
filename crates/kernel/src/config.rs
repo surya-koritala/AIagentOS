@@ -980,6 +980,10 @@ pub struct Config {
     pub embeddings: Option<crate::memory_manager::HttpEmbeddingConfig>,
     #[serde(default)]
     pub provider_routing: HashMap<ProviderId, crate::connector::ProviderRoutingPolicy>,
+    /// Explicit conservative image input bounds for exact models/deployments.
+    /// Empty means image accounting is unknown and image requests fail closed.
+    #[serde(default)]
+    pub image_input_profiles: HashMap<ProviderId, crate::message_content::ImageInputProfile>,
     #[serde(default)]
     pub huggingface_api_mode: HuggingFaceApiMode,
     #[serde(default)]
@@ -1264,6 +1268,7 @@ impl Default for Config {
             default_model: "gpt-4o".to_string(),
             embeddings: None,
             provider_routing: HashMap::new(),
+            image_input_profiles: HashMap::new(),
             huggingface_api_mode: HuggingFaceApiMode::default(),
             huggingface_base_url: None,
             api_keys: HashMap::new(),

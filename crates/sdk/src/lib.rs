@@ -54,6 +54,9 @@ pub use kernel::cluster_control::{
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
+pub use kernel::message_content::{
+    ContentPart, ImageInput, ImageInputProfile, ImageMediaType, MessageContent,
+};
 pub use kernel::model_discovery::ModelCatalog;
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::package::{
@@ -1071,6 +1074,111 @@ impl KernelClient {
             }),
             other => Err(unexpected("Message", &other)),
         }
+    }
+
+    pub async fn send_message_content(
+        &mut self,
+        agent_id: impl Into<String>,
+        content: MessageContent,
+    ) -> Result<MessageResult, SdkError> {
+        match self
+            .call(Syscall::SendMessageContent {
+                agent_id: agent_id.into(),
+                content,
+            })
+            .await?
+        {
+            SyscallReply::Message {
+                content,
+                tool_calls,
+                tokens,
+            } => Ok(MessageResult {
+                content,
+                tool_calls,
+                tokens,
+            }),
+            other => Err(unexpected("Message", &other)),
+        }
+    }
+
+    pub async fn send_message_content_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        content: MessageContent,
+    ) -> Result<MessageResult, SdkError> {
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::SendMessageContent { agent_id, content },
+            )
+            .await?
+        {
+            SyscallReply::Message {
+                content,
+                tool_calls,
+                tokens,
+            } => Ok(MessageResult {
+                content,
+                tool_calls,
+                tokens,
+            }),
+            other => Err(unexpected("Message", &other)),
+        }
+    }
+
+    pub async fn send_message_content_stream<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        content: MessageContent,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let request_id = request_id.into();
+        self.send_message_stream_call(
+            request_id.clone(),
+            Syscall::SendMessageContentStream {
+                request_id,
+                agent_id: agent_id.into(),
+                content,
+            },
+            on_event,
+        )
+        .await
+    }
+
+    pub async fn send_message_content_stream_fenced<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        content: MessageContent,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let request_id = request_id.into();
+        let agent_id = agent_id.into();
+        self.send_message_stream_call(
+            request_id.clone(),
+            Syscall::FencedAgentMutation {
+                agent_id: agent_id.clone(),
+                proof,
+                mutation: Box::new(Syscall::SendMessageContentStream {
+                    request_id,
+                    agent_id,
+                    content,
+                }),
+            },
+            on_event,
+        )
+        .await
     }
 
     /// Drive one turn and deliver ordered stream events as they arrive.
@@ -3732,7 +3840,10 @@ fn mutation_operation_name(call: &Syscall) -> &'static str {
         Syscall::CallTool { .. } | Syscall::VfsInvoke { .. } => "tool call",
         Syscall::VfsOpen { .. } => "VFS open",
         Syscall::VfsClose { .. } => "VFS close",
-        Syscall::SendMessage { .. } | Syscall::SendMessageStream { .. } => "agent turn",
+        Syscall::SendMessage { .. }
+        | Syscall::SendMessageStream { .. }
+        | Syscall::SendMessageContent { .. }
+        | Syscall::SendMessageContentStream { .. } => "agent turn",
         Syscall::FencedAgentMutation { mutation, .. } => mutation_operation_name(mutation),
         _ => "side-effecting syscall",
     }

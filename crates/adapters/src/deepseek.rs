@@ -89,6 +89,7 @@ impl LlmSession for DeepseekSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let msgs: Vec<serde_json::Value> =
             messages
                 .iter()
@@ -213,6 +214,7 @@ impl LlmSession for DeepseekSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         crate::streaming::send_openai_stream_controlled(
             &self.provider_id,
             self.streaming_request(&messages, tools, options),
@@ -231,6 +233,7 @@ impl LlmSession for DeepseekSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         crate::streaming::send_openai_stream_controlled(
             &self.provider_id,
             self.streaming_request(&messages, tools, options),
@@ -315,7 +318,7 @@ impl LlmProviderAdapter for DeepseekAdapter {
         Some(StandardMessage {
             provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
-            content: value.get("content")?.as_str().unwrap_or("").to_string(),
+            content: value.get("content")?.as_str().unwrap_or("").into(),
             tool_call_id: None,
             tool_calls: None,
         })

@@ -53,6 +53,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "data_vfs",
     "durable_cloning",
     "model_discovery",
+    "image_input",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -101,6 +102,7 @@ enum JsonKind {
     StringOrNull,
     IntegerOrNull,
     ObjectOrNull,
+    StringOrArray,
 }
 
 impl JsonKind {
@@ -115,6 +117,7 @@ impl JsonKind {
             Self::StringOrNull => json!({"type": ["string", "null"]}),
             Self::IntegerOrNull => json!({"type": ["integer", "null"]}),
             Self::ObjectOrNull => json!({"type": ["object", "null"]}),
+            Self::StringOrArray => json!({"type": ["string", "array"]}),
         }
     }
 }
@@ -159,6 +162,7 @@ const X: JsonKind = JsonKind::Any;
 const N: JsonKind = JsonKind::StringOrNull;
 const NI: JsonKind = JsonKind::IntegerOrNull;
 const ON: JsonKind = JsonKind::ObjectOrNull;
+const SA: JsonKind = JsonKind::StringOrArray;
 
 const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
@@ -425,6 +429,21 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[
             Field::required("agent_id", S),
             Field::required("message", S),
+        ],
+    },
+    Variant {
+        tag: "send_message_content",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("content", SA),
+        ],
+    },
+    Variant {
+        tag: "send_message_content_stream",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("agent_id", S),
+            Field::required("content", SA),
         ],
     },
     Variant {
@@ -946,6 +965,8 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     variant.tag,
                     "send_message_stream"
                         | "list_provider_models"
+                        | "send_message_content"
+                        | "send_message_content_stream"
                         | "cancel_request"
                         | "enforce_storage_backup_retention"
                         | "storage_backup_status"
@@ -1055,6 +1076,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     (_, JsonKind::Boolean) => Value::Bool(true),
                     (_, JsonKind::Object) | (_, JsonKind::Any) => Value::Object(Map::new()),
                     (_, JsonKind::Array) => Value::Array(Vec::new()),
+                    (_, JsonKind::StringOrArray) => serde_json::json!([{"type":"text","text":"fixture"}]),
                     (
                         _,
                         JsonKind::StringOrNull
@@ -1885,7 +1907,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 129);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 131);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

@@ -122,7 +122,7 @@ async fn streamed_native_signed_boundaries_survive_governed_tools_and_restart() 
     let versions: (i64, i64) = connection.query_row("SELECT schema_version, min_reader_schema_version FROM storage_meta WHERE singleton = 1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!(
         versions,
-        (12, 12),
+        (13, 13),
         "readers that flatten short signed chunks must be excluded"
     );
     drop(connection);

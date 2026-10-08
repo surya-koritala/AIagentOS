@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added bounded typed inline PNG/JPEG input through governed v2 requests,
+  SDK and CLI commands, four native provider adapters, and schema-fenced
+  conversation/checkpoint persistence. Image admission uses explicit
+  model-bound operator profiles; live-provider qualification remains open.
+- Shared terminal correction-store health checks across legacy text, typed
+  content and planning, with a failed-persistence regression that requires
+  refusal before provider I/O.
+
 - Added bounded system-operator model catalogs through the wire API, SDK and
   `agentctl`, with explicit unsupported providers and redacted diagnostics.
   Added tenant-scoped per-agent gate statistics while preserving the existing

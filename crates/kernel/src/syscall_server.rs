@@ -386,6 +386,10 @@ pub enum Syscall {
         agent_id: String,
         message: String,
     },
+    SendMessageContent {
+        agent_id: String,
+        content: crate::message_content::MessageContent,
+    },
     /// Drive one turn while emitting ordered request-scoped event frames on
     /// this connection. Cancellation is sent from another authenticated
     /// connection with [`CancelRequest`](Self::CancelRequest).
@@ -393,6 +397,11 @@ pub enum Syscall {
         request_id: String,
         agent_id: String,
         message: String,
+    },
+    SendMessageContentStream {
+        request_id: String,
+        agent_id: String,
+        content: crate::message_content::MessageContent,
     },
     /// Cooperatively cancel one exact active streaming request. The agent id
     /// keeps the operation inside the normal tenant ownership check.
@@ -1183,6 +1192,7 @@ pub enum WireErrorCode {
     IncompatibleVersion,
     Provider,
     Unsupported,
+    UnsupportedContent,
     Lifecycle,
     Internal,
 }
@@ -1195,6 +1205,8 @@ impl WireErrorCode {
             // non-oracle message. Preserve the authorization category instead
             // of allowing the phrase "not found" to misclassify it.
             (Self::AuthorizationDenied, false)
+        } else if message.contains("content unsupported") {
+            (Self::UnsupportedContent, false)
         } else if message.contains("incompatible wire-protocol") {
             (Self::IncompatibleVersion, false)
         } else if message.contains("authentication required") {
@@ -1724,6 +1736,7 @@ impl std::fmt::Debug for Syscall {
         let fields: &[&str] = match self {
             Self::Authenticate { .. } => &["token"],
             Self::SendMessage { .. } | Self::SendMessageStream { .. } => &["message"],
+            Self::SendMessageContent { .. } | Self::SendMessageContentStream { .. } => &["content"],
             Self::CallTool { .. }
             | Self::VfsInvoke { .. }
             | Self::VfsReadData { .. }
@@ -1840,6 +1853,16 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::SendMessage { agent_id, .. } => {
             (AccessLevel::User, "agent.send_message", Some(agent_id))
         }
+        Syscall::SendMessageContent { agent_id, .. } => (
+            AccessLevel::User,
+            "agent.send_message_content",
+            Some(agent_id),
+        ),
+        Syscall::SendMessageContentStream { agent_id, .. } => (
+            AccessLevel::User,
+            "agent.send_message_content_stream",
+            Some(agent_id),
+        ),
         Syscall::SendMessageStream { agent_id, .. } => (
             AccessLevel::User,
             "agent.send_message_stream",
@@ -2438,6 +2461,8 @@ fn starts_new_work(call: &Syscall) -> bool {
             | Syscall::ResumeGenerationCheckpoint { .. }
             | Syscall::SendMessage { .. }
             | Syscall::SendMessageStream { .. }
+            | Syscall::SendMessageContent { .. }
+            | Syscall::SendMessageContentStream { .. }
             | Syscall::CallTool { .. }
             | Syscall::VfsOpen { .. }
             | Syscall::VfsInvoke { .. }
@@ -2470,6 +2495,8 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
         | Syscall::DeleteGenerationCheckpoint { agent_id, .. }
         | Syscall::SendMessage { agent_id, .. }
         | Syscall::SendMessageStream { agent_id, .. }
+        | Syscall::SendMessageContent { agent_id, .. }
+        | Syscall::SendMessageContentStream { agent_id, .. }
         | Syscall::CancelRequest { agent_id, .. }
         | Syscall::CallTool { agent_id, .. }
         | Syscall::VfsOpen { agent_id, .. }
@@ -3635,9 +3662,27 @@ async fn dispatch_scoped_inner_with_fence(
                 message: format!("invalid agent id: {agent_id}"),
             },
         },
-        Syscall::SendMessageStream { .. } => SyscallReply::Error {
-            message: "streaming requests require the streaming wire transport".into(),
+        Syscall::SendMessageContent { agent_id, content } => match uuid::Uuid::parse_str(&agent_id)
+        {
+            Ok(id) => match kernel.send_message_content(id, content).await {
+                Ok(output) => SyscallReply::Message {
+                    content: output.content,
+                    tool_calls: output.tool_calls_made,
+                    tokens: output.tokens_used,
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(_) => SyscallReply::Error {
+                message: "invalid agent id".into(),
+            },
         },
+        Syscall::SendMessageStream { .. } | Syscall::SendMessageContentStream { .. } => {
+            SyscallReply::Error {
+                message: "streaming requests require the streaming wire transport".into(),
+            }
+        }
         Syscall::CancelRequest {
             request_id,
             agent_id,
@@ -5996,11 +6041,13 @@ where
 
 /// Authorize and drive one live stream on the current connection. The
 /// credential lease acquired by the caller remains held until this returns.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_message_stream<W>(
     kernel: &AgentKernelImpl,
     request_id: String,
     agent_id: String,
     message: String,
+    multipart: Option<crate::message_content::MessageContent>,
     principal: Option<&Principal>,
     write: &mut W,
     negotiated_version: u32,
@@ -6031,6 +6078,7 @@ where
             request_id,
             agent_id,
             message,
+            multipart,
             None,
             principal,
             write,
@@ -6066,6 +6114,7 @@ async fn dispatch_fenced_message_stream<W>(
     request_id: String,
     agent_id: String,
     message: String,
+    multipart: Option<crate::message_content::MessageContent>,
     fenced_agent_id: String,
     proof: AgentMutationFenceProof,
     principal: Option<&Principal>,
@@ -6093,6 +6142,7 @@ where
             request_id,
             agent_id,
             message,
+            multipart,
             Some((fenced_agent_id, proof)),
             principal,
             write,
@@ -6132,6 +6182,7 @@ async fn dispatch_message_stream_inner<W>(
     request_id: String,
     agent_id: String,
     message: String,
+    multipart: Option<crate::message_content::MessageContent>,
     fence: Option<(String, AgentMutationFenceProof)>,
     principal: Option<&Principal>,
     write: &mut W,
@@ -6148,10 +6199,17 @@ where
         write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
         return Ok(crate::telemetry::RequestOutcome::Rejected);
     }
-    let call = Syscall::SendMessageStream {
-        request_id: request_id.clone(),
-        agent_id: agent_id.clone(),
-        message: message.clone(),
+    let call = match &multipart {
+        Some(content) => Syscall::SendMessageContentStream {
+            request_id: request_id.clone(),
+            agent_id: agent_id.clone(),
+            content: content.clone(),
+        },
+        None => Syscall::SendMessageStream {
+            request_id: request_id.clone(),
+            agent_id: agent_id.clone(),
+            message: message.clone(),
+        },
     };
     let authorization_call = match fence.as_ref() {
         Some((fenced_agent_id, proof)) => Syscall::FencedAgentMutation {
@@ -6242,9 +6300,9 @@ where
     // A bounded channel makes the socket writer the backpressure boundary:
     // provider/executor production cannot outrun a slow client without bound.
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(STREAM_EVENT_BUFFER_CAPACITY);
-    let run = kernel.send_message_stream_with_fence(
+    let run = kernel.send_message_content_stream_with_fence(
         parsed_agent,
-        &message,
+        multipart.unwrap_or_else(|| message.into()),
         &request_id,
         events_tx,
         request_fence,
@@ -6939,7 +6997,7 @@ impl SyscallServer {
                 && matches!(
                     &parsed,
                     Ok(Syscall::FencedAgentMutation { mutation, .. })
-                        if matches!(mutation.as_ref(), Syscall::SendMessageStream { .. })
+                        if matches!(mutation.as_ref(), Syscall::SendMessageStream { .. } | Syscall::SendMessageContentStream { .. })
                 )
             {
                 let Ok(Syscall::FencedAgentMutation {
@@ -6950,13 +7008,23 @@ impl SyscallServer {
                 else {
                     unreachable!("fenced stream pattern checked above")
                 };
-                let Syscall::SendMessageStream {
-                    request_id,
-                    agent_id,
-                    message,
-                } = *mutation
-                else {
-                    unreachable!("nested stream pattern checked above")
+                let (request_id, agent_id, message, multipart) = match *mutation {
+                    Syscall::SendMessageStream {
+                        request_id,
+                        agent_id,
+                        message,
+                    } => (request_id, agent_id, message, None),
+                    Syscall::SendMessageContentStream {
+                        request_id,
+                        agent_id,
+                        content,
+                    } => (
+                        request_id,
+                        agent_id,
+                        content.text_projection(),
+                        Some(content),
+                    ),
+                    _ => unreachable!("nested stream pattern checked above"),
                 };
                 if let Some(identity) = credential.as_ref() {
                     match kernel.acquire_credential_principal(identity).await {
@@ -6966,6 +7034,7 @@ impl SyscallServer {
                                 request_id,
                                 agent_id,
                                 message,
+                                multipart,
                                 fenced_agent_id,
                                 proof,
                                 Some(&resolved),
@@ -6990,6 +7059,7 @@ impl SyscallServer {
                         request_id,
                         agent_id,
                         message,
+                        multipart,
                         fenced_agent_id,
                         proof,
                         None,
@@ -7004,20 +7074,27 @@ impl SyscallServer {
             if authed
                 && matches!(
                     &parsed,
-                    Ok(Syscall::SendMessageStream {
-                        request_id: _,
-                        agent_id: _,
-                        message: _
-                    })
+                    Ok(Syscall::SendMessageStream { .. }
+                        | Syscall::SendMessageContentStream { .. })
                 )
             {
-                let Ok(Syscall::SendMessageStream {
-                    request_id,
-                    agent_id,
-                    message,
-                }) = parsed
-                else {
-                    unreachable!("stream pattern checked above")
+                let (request_id, agent_id, message, multipart) = match parsed {
+                    Ok(Syscall::SendMessageStream {
+                        request_id,
+                        agent_id,
+                        message,
+                    }) => (request_id, agent_id, message, None),
+                    Ok(Syscall::SendMessageContentStream {
+                        request_id,
+                        agent_id,
+                        content,
+                    }) => (
+                        request_id,
+                        agent_id,
+                        content.text_projection(),
+                        Some(content),
+                    ),
+                    _ => unreachable!("stream pattern checked above"),
                 };
                 if let Some(identity) = credential.as_ref() {
                     match kernel.acquire_credential_principal(identity).await {
@@ -7027,6 +7104,7 @@ impl SyscallServer {
                                 request_id,
                                 agent_id,
                                 message,
+                                multipart,
                                 Some(&resolved),
                                 &mut write,
                                 negotiated_version,
@@ -7049,6 +7127,7 @@ impl SyscallServer {
                         request_id,
                         agent_id,
                         message,
+                        multipart,
                         None,
                         &mut write,
                         negotiated_version,
@@ -7143,6 +7222,8 @@ impl SyscallServer {
                             &call,
                             Syscall::SendMessageStream { .. }
                                 | Syscall::ListProviderModels { .. }
+                                | Syscall::SendMessageContent { .. }
+                                | Syscall::SendMessageContentStream { .. }
                                 | Syscall::CancelRequest { .. }
                                 | Syscall::CreateAgent {
                                     agent_id: Some(_),
@@ -10391,6 +10472,15 @@ memory = ["remember this"]
                 agent_id: id.clone(),
                 checkpoint_id: checkpoint,
             },
+            Syscall::SendMessageContent {
+                agent_id: id.clone(),
+                content: "test".into(),
+            },
+            Syscall::SendMessageContentStream {
+                request_id: "content-fixture".into(),
+                agent_id: id.clone(),
+                content: "test".into(),
+            },
             Syscall::SendMessage {
                 agent_id: id.clone(),
                 message: "test".into(),
@@ -11150,7 +11240,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 129);
+        assert_eq!(calls.len(), 131);
         assert_eq!(fixture_tags, schema_tags);
     }
 

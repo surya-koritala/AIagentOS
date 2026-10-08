@@ -9,7 +9,7 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenant TENANT_ID] \
-         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|clone|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|models|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|clone|list|inspect|message|message-content|stream|stream-content|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|models|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] tenant-create NAME\n\
@@ -109,6 +109,33 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm AGENT_ID\n\
            agentctl [SERVER OPTIONS] erase-user USER_ID --confirm USER_ID\n\
            agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm TENANT_ID";
+
+fn read_message_content(source: &str) -> agent_sdk::MessageContent {
+    let mut bytes = Vec::new();
+    let limit = kernel::message_content::MAX_MESSAGE_CONTENT_BYTES as u64 + 1;
+    if source == "-" {
+        std::io::stdin()
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|_| content_input_error("could not read content input"));
+    } else {
+        std::fs::File::open(source)
+            .unwrap_or_else(|_| content_input_error("could not open content input"))
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|_| content_input_error("could not read content input"));
+    }
+    if bytes.len() as u64 == limit {
+        content_input_error("message content input exceeds byte limit");
+    }
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| content_input_error("invalid message content input"))
+}
+
+fn content_input_error(message: &'static str) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(1);
+}
 
 /// Usage error. Diagnostics go to stderr with a non-zero exit so a mistyped
 /// command can never be mistaken for success by a script.
@@ -1114,6 +1141,44 @@ async fn run_online(
                         "snapshot encoding failed: {error}"
                     )))
                 })
+            );
+            return;
+        }
+        "message-content" => {
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let source = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let content = read_message_content(&source);
+            let result = client
+                .send_message_content(agent_id, content)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&result, "agent message");
+            return;
+        }
+        "stream-content" => {
+            let request_id = args.next().unwrap_or_else(|| usage());
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let source = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let content = read_message_content(&source);
+            let result = client
+                .send_message_content_stream(request_id.clone(), agent_id, content, |event| {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"event","request_id":request_id,"event":event})
+                    );
+                    let _ = std::io::stdout().flush();
+                })
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::json!({"type":"completed","request_id":request_id,"result":result})
             );
             return;
         }

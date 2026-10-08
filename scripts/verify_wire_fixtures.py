@@ -49,6 +49,8 @@ V2_ONLY_OPERATIONS = {
     "retire_agent_mutation_fence",
     "renew_cluster_agent_ownership",
     "send_message_stream",
+    "send_message_content",
+    "send_message_content_stream",
     "set_cluster_member_state",
     "set_node_availability",
     "set_node_profile",

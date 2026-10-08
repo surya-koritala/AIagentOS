@@ -2294,6 +2294,73 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn matching_native_file_handles(path: &Path) -> std::io::Result<Vec<(usize, u32, u32)>> {
+        use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessHandleInformation};
+        use windows_sys::Win32::Storage::FileSystem::{GetFileType, GetFinalPathNameByHandleW, FILE_TYPE_DISK};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct HandleEntry {
+            value: *mut core::ffi::c_void,
+            _handle_count: usize,
+            _pointer_count: usize,
+            access: u32,
+            _object_type: u32,
+            attributes: u32,
+            _reserved: u32,
+        }
+
+        // Read only this test process. Native pointers/paths from unrelated
+        // handles are neither dereferenced nor logged. Bound all query storage
+        // and validate the returned table before reading its entries.
+        let mut bytes = 16 * 1024;
+        let snapshot = loop {
+            let mut buffer = vec![0usize; bytes / std::mem::size_of::<usize>()];
+            let mut needed = 0u32;
+            let status = unsafe { NtQueryInformationProcess(
+                GetCurrentProcess(), ProcessHandleInformation, buffer.as_mut_ptr().cast(),
+                bytes as u32, &mut needed,
+            ) };
+            if status == 0 { break buffer; }
+            if status as u32 != 0xc000_0004 || bytes == 16 * 1024 * 1024 {
+                return Err(std::io::Error::other(format!("native handle snapshot status {status:#x}")));
+            }
+            if needed as usize > 16 * 1024 * 1024 {
+                return Err(std::io::Error::other("native handle snapshot exceeds bound"));
+            }
+            bytes = (bytes * 2).max(needed as usize).next_multiple_of(std::mem::size_of::<usize>());
+        };
+        let header_bytes = 2 * std::mem::size_of::<usize>();
+        let count = snapshot[0];
+        let capacity = (snapshot.len() * std::mem::size_of::<usize>() - header_bytes)
+            / std::mem::size_of::<HandleEntry>();
+        if count > capacity {
+            return Err(std::io::Error::other("native handle snapshot has invalid count"));
+        }
+        let entries = unsafe { std::slice::from_raw_parts(
+            snapshot.as_ptr().add(2).cast::<HandleEntry>(), count,
+        ) };
+        let normalize = |value: &str| value.strip_prefix("\\\\?\\").unwrap_or(value).to_lowercase();
+        let target = normalize(&path.to_string_lossy());
+        let mut names = vec![0u16; 32 * 1024];
+        let mut matching = Vec::new();
+        for entry in entries {
+            // A concurrent test may have closed/reused a snapshot handle. The
+            // Win32 queries fail normally; no ownership is taken or close made.
+            if unsafe { GetFileType(entry.value) } != FILE_TYPE_DISK { continue; }
+            let length = unsafe { GetFinalPathNameByHandleW(
+                entry.value, names.as_mut_ptr(), names.len() as u32, 0,
+            ) } as usize;
+            if length == 0 || length >= names.len() { continue; }
+            if normalize(&String::from_utf16_lossy(&names[..length])) == target {
+                matching.push((entry.value as usize, entry.access, entry.attributes));
+            }
+        }
+        Ok(matching)
+    }
+
     fn test_config() -> SandboxConfig {
         SandboxConfig {
             workspace_dir: std::env::temp_dir()
@@ -3329,6 +3396,8 @@ mod tests {
         // Retaining state must not retain its native directory capability
         // after teardown, including the bounded-listing early error path.
         let retained = mgr.sandboxes.get(&sid).unwrap().clone();
+        #[cfg(windows)]
+        assert!(!matching_native_file_handles(&root).unwrap().is_empty(), "native snapshot must find the live workspace capability");
         std::fs::write(root.join("z.txt"), "z").unwrap();
         std::fs::create_dir(root.join("a-dir")).unwrap();
         #[cfg(unix)]
@@ -3376,7 +3445,10 @@ mod tests {
             // until teardown; the failed listing's child iterator must already
             // have released its own native directory reference.
             assert_eq!(deletion_handle(&root).unwrap_err().raw_os_error(), Some(32));
-            drop(deletion_handle(&crowded).expect("bounded-list error retained its directory"));
+            match deletion_handle(&crowded) {
+                Ok(handle) => drop(handle),
+                Err(error) => panic!("bounded-list directory sharing failure: {error}; current_process_matching_handles={:?}", matching_native_file_handles(&crowded)),
+            }
         }
         mgr.destroy_sandbox(sid).unwrap();
         assert!(retained.workspace.lock().unwrap().is_none());

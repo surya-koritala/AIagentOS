@@ -130,11 +130,16 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("HUGGINGFACE_API_KEY").ok())
                 .or_else(|| std::env::var("HF_API_KEY").ok())
             {
-                let mut adapter = HuggingFaceAdapter::new(key).with_model(config.default_model.clone());
-                if config.huggingface_api_mode == kernel::config::HuggingFaceApiMode::ChatCompletions {
+                let mut adapter =
+                    HuggingFaceAdapter::new(key).with_model(config.default_model.clone());
+                if config.huggingface_api_mode
+                    == kernel::config::HuggingFaceApiMode::ChatCompletions
+                {
                     adapter = adapter.with_chat_completions();
                 }
-                if let Some(url) = &config.huggingface_base_url { adapter = adapter.with_base_url(url.clone()); }
+                if let Some(url) = &config.huggingface_base_url {
+                    adapter = adapter.with_base_url(url.clone());
+                }
                 register_and_report(kernel, adapter);
             }
         }

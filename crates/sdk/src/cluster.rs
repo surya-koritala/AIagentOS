@@ -33,6 +33,37 @@ use crate::{
 pub const DEFAULT_OWNERSHIP_LEASE_SECONDS: u64 = 30;
 pub const DEFAULT_OWNERSHIP_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Caller-retained operation identities for challenged membership mutations.
+/// A configured replicated authority records receipts for these UUIDs. Legacy
+/// local authority mode does not provide replicated receipt replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterAdmissionOperationIds {
+    pub challenge: uuid::Uuid,
+    pub mutation: uuid::Uuid,
+}
+
+impl Default for ClusterAdmissionOperationIds {
+    fn default() -> Self {
+        Self {
+            challenge: uuid::Uuid::new_v4(),
+            mutation: uuid::Uuid::new_v4(),
+        }
+    }
+}
+
+impl ClusterAdmissionOperationIds {
+    fn validate(self) -> Result<(), SdkError> {
+        if self.challenge == self.mutation {
+            return Err(SdkError::Wire {
+                code: WireErrorCode::InvalidArgument,
+                message: "cluster challenge and mutation require distinct operation UUIDs".into(),
+                retryable: false,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// One kernel node in the cluster: its stable id, transport address, and client.
 pub struct NodeHandle {
     id: String,
@@ -195,8 +226,32 @@ impl ClusterClient {
         expected_generation: Option<u64>,
         reason: impl Into<String>,
     ) -> Result<ClusterMember, SdkError> {
+        Self::admit_node_with_operation_ids(
+            authority,
+            node,
+            endpoint,
+            expected_generation,
+            reason,
+            ClusterAdmissionOperationIds::default(),
+        )
+        .await
+    }
+
+    /// Admit a node with explicit, distinct challenge and mutation operation IDs.
+    /// The challenged identity check is identical to [`Self::admit_node`].
+    pub async fn admit_node_with_operation_ids(
+        authority: &mut KernelClient,
+        node: &mut KernelClient,
+        endpoint: impl Into<String>,
+        expected_generation: Option<u64>,
+        reason: impl Into<String>,
+        operation_ids: ClusterAdmissionOperationIds,
+    ) -> Result<ClusterMember, SdkError> {
+        operation_ids.validate()?;
         let endpoint = endpoint.into();
-        let challenge = authority.issue_cluster_join_challenge(30).await?;
+        let challenge = authority
+            .issue_cluster_join_challenge_with_operation_id(operation_ids.challenge.to_string(), 30)
+            .await?;
         let load = node.node_info().await?;
         let control = load.control.ok_or_else(|| {
             SdkError::Kernel("cluster membership requires durable node identity support".into())
@@ -232,7 +287,8 @@ impl ClusterClient {
             });
         }
         authority
-            .register_cluster_member(
+            .register_cluster_member_with_operation_id(
+                operation_ids.mutation.to_string(),
                 registration,
                 challenge.challenge_hex,
                 proof.signature_hex,
@@ -258,7 +314,37 @@ impl ClusterClient {
         minimum_overlap_seconds: u64,
         reason: impl Into<String>,
     ) -> Result<(ClusterMember, crate::ClusterCertificateRollout), SdkError> {
-        let challenge = authority.issue_cluster_join_challenge(30).await?;
+        Self::prepare_node_certificate_rollout_with_operation_ids(
+            authority,
+            node,
+            endpoint,
+            next_tls_server_certificate_fingerprint,
+            expected_generation,
+            prepare_ttl_seconds,
+            minimum_overlap_seconds,
+            reason,
+            ClusterAdmissionOperationIds::default(),
+        )
+        .await
+    }
+
+    /// Stage a certificate with caller-retained challenge and mutation IDs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_node_certificate_rollout_with_operation_ids(
+        authority: &mut KernelClient,
+        node: &mut KernelClient,
+        endpoint: impl Into<String>,
+        next_tls_server_certificate_fingerprint: impl Into<String>,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        reason: impl Into<String>,
+        operation_ids: ClusterAdmissionOperationIds,
+    ) -> Result<(ClusterMember, crate::ClusterCertificateRollout), SdkError> {
+        operation_ids.validate()?;
+        let challenge = authority
+            .issue_cluster_join_challenge_with_operation_id(operation_ids.challenge.to_string(), 30)
+            .await?;
         let load = node.node_info().await?;
         let control = load.control.ok_or_else(|| {
             SdkError::Kernel("certificate rollout requires durable node identity support".into())
@@ -294,7 +380,8 @@ impl ClusterClient {
             });
         }
         authority
-            .prepare_cluster_member_certificate_rollout(
+            .prepare_cluster_member_certificate_rollout_with_operation_id(
+                operation_ids.mutation.to_string(),
                 registration,
                 challenge.challenge_hex,
                 proof.signature_hex,

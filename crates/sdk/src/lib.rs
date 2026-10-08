@@ -129,7 +129,7 @@ pub mod cluster;
 pub mod patterns;
 
 pub use cluster::{
-    ClusterClient, ClusterMaintenanceConfig, ClusterMaintenanceStatus, ClusterReconciliationReport,
+    ClusterAdmissionOperationIds, ClusterClient, ClusterMaintenanceConfig, ClusterMaintenanceStatus, ClusterReconciliationReport,
     NodeHandle, PlacedAgent, Placement, PlacementConstraints, DEFAULT_OWNERSHIP_LEASE_SECONDS,
     DEFAULT_OWNERSHIP_RENEW_INTERVAL,
 };

@@ -21,7 +21,10 @@ async fn write_trial_frame<W: AsyncWrite + Unpin>(
     // Exact pre-change writer, including the same limit and flush contract.
     let payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     if payload.len() > FRAME_LIMIT {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame bound"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame bound",
+        ));
     }
     writer.write_all(&payload).await?;
     writer.write_all(b"\n").await?;
@@ -38,7 +41,10 @@ async fn trial(split: bool, ordinal: usize) -> Value {
         let (read, mut write) = socket.into_split();
         let mut reader = BufReader::new(read);
         for _ in 0..WARMUP + SAMPLES {
-            let frame = read_bounded_line(&mut reader, FRAME_LIMIT).await.unwrap().unwrap();
+            let frame = read_bounded_line(&mut reader, FRAME_LIMIT)
+                .await
+                .unwrap()
+                .unwrap();
             let value: Value = serde_json::from_str(&frame).unwrap();
             write_trial_frame(&mut write, &value, split).await.unwrap();
         }
@@ -53,10 +59,18 @@ async fn trial(split: bool, ordinal: usize) -> Value {
     for sequence in 0..WARMUP + SAMPLES {
         let expected = json!({"sequence": sequence, "payload": "bounded loopback λ".repeat(4)});
         let started = Instant::now();
-        write_trial_frame(&mut write, &expected, split).await.unwrap();
-        let frame = read_bounded_line(&mut reader, FRAME_LIMIT).await.unwrap().unwrap();
+        write_trial_frame(&mut write, &expected, split)
+            .await
+            .unwrap();
+        let frame = read_bounded_line(&mut reader, FRAME_LIMIT)
+            .await
+            .unwrap()
+            .unwrap();
         let actual: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(actual, expected, "framing must preserve sequence and Unicode bytes");
+        assert_eq!(
+            actual, expected,
+            "framing must preserve sequence and Unicode bytes"
+        );
         if sequence >= WARMUP {
             elapsed_us.push(started.elapsed().as_micros());
             bytes += frame.len();
@@ -90,5 +104,8 @@ async fn same_run_loopback_frame_latency_preserves_protocol() {
     })
     .await
     .expect("bounded loopback comparison did not finish");
-    println!("FRAME_LATENCY {}", serde_json::to_string(&measurements).unwrap());
+    println!(
+        "FRAME_LATENCY {}",
+        serde_json::to_string(&measurements).unwrap()
+    );
 }

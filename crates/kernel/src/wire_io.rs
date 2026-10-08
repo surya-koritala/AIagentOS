@@ -478,7 +478,10 @@ mod tests {
             .await
             .expect_err("oversized");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(output, b"{\"ok\":true}\n", "rejected frames emit no partial bytes");
+        assert_eq!(
+            output, b"{\"ok\":true}\n",
+            "rejected frames emit no partial bytes"
+        );
         let mut exact = Vec::new();
         write_bounded_json(&mut exact, &"λ", 4).await.unwrap();
         assert_eq!(exact, "\"λ\"\n".as_bytes());

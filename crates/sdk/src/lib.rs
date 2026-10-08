@@ -42,6 +42,7 @@ use tokio::net::ToSocketAddrs;
 
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
+pub use kernel::auth::{ApiKeyDescriptor, IssuedApiKey, Role, Tenant, User};
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
     ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,
@@ -49,7 +50,6 @@ pub use kernel::cluster_control::{
     ClusterMemberState, ClusterMembershipAudit, ClusterMembershipSnapshot, ClusterOwnershipState,
     NodeAvailability, NodeControlAudit, NodeControlStatus, NodeIdentity, NodeProfile,
 };
-pub use kernel::auth::{ApiKeyDescriptor, IssuedApiKey, Role, Tenant, User};
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
@@ -2933,7 +2933,10 @@ impl KernelClient {
     }
 
     pub async fn create_tenant(&mut self, name: impl Into<String>) -> Result<String, SdkError> {
-        match self.call(Syscall::CreateTenant { name: name.into() }).await? {
+        match self
+            .call(Syscall::CreateTenant { name: name.into() })
+            .await?
+        {
             SyscallReply::TenantCreated { id } => Ok(id),
             other => Err(unexpected("TenantCreated", &other)),
         }
@@ -2951,7 +2954,13 @@ impl KernelClient {
         tenant_id: impl Into<String>,
         _confirmation: ConfirmIdentityRevocation,
     ) -> Result<bool, SdkError> {
-        match self.call(Syscall::RevokeTenant { tenant_id: tenant_id.into(), confirm: true }).await? {
+        match self
+            .call(Syscall::RevokeTenant {
+                tenant_id: tenant_id.into(),
+                confirm: true,
+            })
+            .await?
+        {
             SyscallReply::TenantRevoked { existed } => Ok(existed),
             other => Err(unexpected("TenantRevoked", &other)),
         }
@@ -2964,7 +2973,12 @@ impl KernelClient {
         email: impl Into<String>,
         role: Role,
     ) -> Result<String, SdkError> {
-        self.provision_user(Syscall::CreateUser { username: username.into(), email: email.into(), role }).await
+        self.provision_user(Syscall::CreateUser {
+            username: username.into(),
+            email: email.into(),
+            role,
+        })
+        .await
     }
 
     /// Trusted-system bootstrap; a tenant credential can never select scope.
@@ -2975,7 +2989,13 @@ impl KernelClient {
         email: impl Into<String>,
         role: Role,
     ) -> Result<String, SdkError> {
-        self.provision_user(Syscall::CreateUserForTenant { tenant_id: tenant_id.into(), username: username.into(), email: email.into(), role }).await
+        self.provision_user(Syscall::CreateUserForTenant {
+            tenant_id: tenant_id.into(),
+            username: username.into(),
+            email: email.into(),
+            role,
+        })
+        .await
     }
 
     async fn provision_user(&mut self, call: Syscall) -> Result<String, SdkError> {
@@ -2989,8 +3009,14 @@ impl KernelClient {
         self.users_reply(Syscall::ListUsers).await
     }
 
-    pub async fn list_users_for_tenant(&mut self, tenant_id: impl Into<String>) -> Result<Vec<User>, SdkError> {
-        self.users_reply(Syscall::ListUsersForTenant { tenant_id: tenant_id.into() }).await
+    pub async fn list_users_for_tenant(
+        &mut self,
+        tenant_id: impl Into<String>,
+    ) -> Result<Vec<User>, SdkError> {
+        self.users_reply(Syscall::ListUsersForTenant {
+            tenant_id: tenant_id.into(),
+        })
+        .await
     }
 
     async fn users_reply(&mut self, call: Syscall) -> Result<Vec<User>, SdkError> {
@@ -3005,19 +3031,43 @@ impl KernelClient {
         user_id: impl Into<String>,
         _confirmation: ConfirmIdentityRevocation,
     ) -> Result<bool, SdkError> {
-        match self.call(Syscall::RevokeUser { user_id: user_id.into(), confirm: true }).await? {
+        match self
+            .call(Syscall::RevokeUser {
+                user_id: user_id.into(),
+                confirm: true,
+            })
+            .await?
+        {
             SyscallReply::UserRevoked { existed } => Ok(existed),
             other => Err(unexpected("UserRevoked", &other)),
         }
     }
 
     /// Return the bearer secret once. Debug output is redacted.
-    pub async fn issue_api_key(&mut self, user_id: impl Into<String>, name: impl Into<String>) -> Result<IssuedApiKey, SdkError> {
-        self.key_reply(Syscall::IssueApiKey { user_id: user_id.into(), name: name.into() }).await
+    pub async fn issue_api_key(
+        &mut self,
+        user_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<IssuedApiKey, SdkError> {
+        self.key_reply(Syscall::IssueApiKey {
+            user_id: user_id.into(),
+            name: name.into(),
+        })
+        .await
     }
 
-    pub async fn issue_api_key_for_tenant(&mut self, tenant_id: impl Into<String>, user_id: impl Into<String>, name: impl Into<String>) -> Result<IssuedApiKey, SdkError> {
-        self.key_reply(Syscall::IssueApiKeyForTenant { tenant_id: tenant_id.into(), user_id: user_id.into(), name: name.into() }).await
+    pub async fn issue_api_key_for_tenant(
+        &mut self,
+        tenant_id: impl Into<String>,
+        user_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<IssuedApiKey, SdkError> {
+        self.key_reply(Syscall::IssueApiKeyForTenant {
+            tenant_id: tenant_id.into(),
+            user_id: user_id.into(),
+            name: name.into(),
+        })
+        .await
     }
 
     async fn key_reply(&mut self, call: Syscall) -> Result<IssuedApiKey, SdkError> {
@@ -3031,8 +3081,14 @@ impl KernelClient {
         self.keys_reply(Syscall::ListApiKeys).await
     }
 
-    pub async fn list_api_keys_for_tenant(&mut self, tenant_id: impl Into<String>) -> Result<Vec<ApiKeyDescriptor>, SdkError> {
-        self.keys_reply(Syscall::ListApiKeysForTenant { tenant_id: tenant_id.into() }).await
+    pub async fn list_api_keys_for_tenant(
+        &mut self,
+        tenant_id: impl Into<String>,
+    ) -> Result<Vec<ApiKeyDescriptor>, SdkError> {
+        self.keys_reply(Syscall::ListApiKeysForTenant {
+            tenant_id: tenant_id.into(),
+        })
+        .await
     }
 
     async fn keys_reply(&mut self, call: Syscall) -> Result<Vec<ApiKeyDescriptor>, SdkError> {
@@ -3042,8 +3098,18 @@ impl KernelClient {
         }
     }
 
-    pub async fn revoke_api_key(&mut self, key_id: impl Into<String>, _confirmation: ConfirmIdentityRevocation) -> Result<bool, SdkError> {
-        match self.call(Syscall::RevokeApiKey { key_id: key_id.into(), confirm: true }).await? {
+    pub async fn revoke_api_key(
+        &mut self,
+        key_id: impl Into<String>,
+        _confirmation: ConfirmIdentityRevocation,
+    ) -> Result<bool, SdkError> {
+        match self
+            .call(Syscall::RevokeApiKey {
+                key_id: key_id.into(),
+                confirm: true,
+            })
+            .await?
+        {
             SyscallReply::ApiKeyRevoked { existed } => Ok(existed),
             other => Err(unexpected("ApiKeyRevoked", &other)),
         }

@@ -358,7 +358,10 @@ async fn main() {
     let mut token = std::env::var("AGENT_SERVER_TOKEN").ok();
     let mut tenant_override = None;
 
-    while matches!(args.peek().map(String::as_str), Some("--addr" | "--token" | "--tenant")) {
+    while matches!(
+        args.peek().map(String::as_str),
+        Some("--addr" | "--token" | "--tenant")
+    ) {
         match args.next().as_deref() {
             Some("--addr") => address_override = Some(args.next().unwrap_or_else(|| usage())),
             Some("--token") => token = Some(args.next().unwrap_or_else(|| usage())),
@@ -368,7 +371,12 @@ async fn main() {
     }
 
     let command = args.next().unwrap_or_else(|| usage());
-    if tenant_override.is_some() && !matches!(command.as_str(), "user-create" | "users" | "api-key-issue" | "api-keys") {
+    if tenant_override.is_some()
+        && !matches!(
+            command.as_str(),
+            "user-create" | "users" | "api-key-issue" | "api-keys"
+        )
+    {
         usage();
     }
 
@@ -890,31 +898,54 @@ async fn main() {
     let result = match command.as_str() {
         "tenant-create" => {
             let name = args.next().unwrap_or_else(|| usage());
-            if args.next().is_some() { usage(); }
-            let id = client.create_tenant(name).await.unwrap_or_else(|error| fail(error));
+            if args.next().is_some() {
+                usage();
+            }
+            let id = client
+                .create_tenant(name)
+                .await
+                .unwrap_or_else(|error| fail(error));
             print_json(&serde_json::json!({ "id": id }), "tenant");
             return;
         }
         "tenants" => {
-            if args.next().is_some() { usage(); }
-            let tenants = client.list_tenants().await.unwrap_or_else(|error| fail(error));
+            if args.next().is_some() {
+                usage();
+            }
+            let tenants = client
+                .list_tenants()
+                .await
+                .unwrap_or_else(|error| fail(error));
             print_json(&tenants, "tenants");
             return;
         }
         "tenant-revoke" => {
             let target = args.next().unwrap_or_else(|| usage());
             require_target_confirmation(&mut args, &target);
-            let revoked = client.revoke_tenant(target, agent_sdk::CONFIRM_IDENTITY_REVOCATION).await.unwrap_or_else(|error| fail(error));
-            print_json(&serde_json::json!({ "revoked": revoked }), "tenant revocation");
+            let revoked = client
+                .revoke_tenant(target, agent_sdk::CONFIRM_IDENTITY_REVOCATION)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "revoked": revoked }),
+                "tenant revocation",
+            );
             return;
         }
         "user-create" => {
             let username = args.next().unwrap_or_else(|| usage());
             let email = args.next().unwrap_or_else(|| usage());
-            let role = agent_sdk::Role::parse(&args.next().unwrap_or_else(|| usage())).unwrap_or_else(|| usage());
-            if args.next().is_some() { usage(); }
+            let role = agent_sdk::Role::parse(&args.next().unwrap_or_else(|| usage()))
+                .unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
             let result = match tenant_override {
-                Some(tenant) => client.create_user_for_tenant(tenant, username, email, role).await,
+                Some(tenant) => {
+                    client
+                        .create_user_for_tenant(tenant, username, email, role)
+                        .await
+                }
                 None => client.create_user(username, email, role).await,
             };
             let id = result.unwrap_or_else(|error| fail(error));
@@ -922,7 +953,9 @@ async fn main() {
             return;
         }
         "users" => {
-            if args.next().is_some() { usage(); }
+            if args.next().is_some() {
+                usage();
+            }
             let result = match tenant_override {
                 Some(tenant) => client.list_users_for_tenant(tenant).await,
                 None => client.list_users().await,
@@ -933,25 +966,38 @@ async fn main() {
         "user-revoke" => {
             let target = args.next().unwrap_or_else(|| usage());
             require_target_confirmation(&mut args, &target);
-            let revoked = client.revoke_user(target, agent_sdk::CONFIRM_IDENTITY_REVOCATION).await.unwrap_or_else(|error| fail(error));
-            print_json(&serde_json::json!({ "revoked": revoked }), "user revocation");
+            let revoked = client
+                .revoke_user(target, agent_sdk::CONFIRM_IDENTITY_REVOCATION)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "revoked": revoked }),
+                "user revocation",
+            );
             return;
         }
         "api-key-issue" => {
             let user = args.next().unwrap_or_else(|| usage());
             let name = args.next().unwrap_or_else(|| usage());
-            if args.next().is_some() { usage(); }
+            if args.next().is_some() {
+                usage();
+            }
             let result = match tenant_override {
                 Some(tenant) => client.issue_api_key_for_tenant(tenant, user, name).await,
                 None => client.issue_api_key(user, name).await,
             };
             let issued = result.unwrap_or_else(|error| fail(error));
-            eprintln!("Store this API key securely; it is shown once and cannot be recovered. Key ID: {}", issued.key_id);
+            eprintln!(
+                "Store this API key securely; it is shown once and cannot be recovered. Key ID: {}",
+                issued.key_id
+            );
             println!("{}", issued.key);
             return;
         }
         "api-keys" => {
-            if args.next().is_some() { usage(); }
+            if args.next().is_some() {
+                usage();
+            }
             let result = match tenant_override {
                 Some(tenant) => client.list_api_keys_for_tenant(tenant).await,
                 None => client.list_api_keys().await,
@@ -962,8 +1008,14 @@ async fn main() {
         "api-key-revoke" => {
             let target = args.next().unwrap_or_else(|| usage());
             require_target_confirmation(&mut args, &target);
-            let revoked = client.revoke_api_key(target, agent_sdk::CONFIRM_IDENTITY_REVOCATION).await.unwrap_or_else(|error| fail(error));
-            print_json(&serde_json::json!({ "revoked": revoked }), "API-key revocation");
+            let revoked = client
+                .revoke_api_key(target, agent_sdk::CONFIRM_IDENTITY_REVOCATION)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "revoked": revoked }),
+                "API-key revocation",
+            );
             return;
         }
         "create" => {

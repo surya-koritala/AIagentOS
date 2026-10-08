@@ -158,19 +158,74 @@ const NI: JsonKind = JsonKind::IntegerOrNull;
 const ON: JsonKind = JsonKind::ObjectOrNull;
 
 const REQUEST_VARIANTS: &[Variant] = &[
-    Variant { tag: "create_tenant", fields: &[Field::required("name", S)] },
-    Variant { tag: "list_tenants", fields: &[] },
-    Variant { tag: "revoke_tenant", fields: &[Field::required("tenant_id", S), Field::optional("confirm", B)] },
-    Variant { tag: "create_user", fields: &[Field::required("username", S), Field::required("email", S), Field::required("role", S)] },
-    Variant { tag: "list_users", fields: &[] },
-    Variant { tag: "revoke_user", fields: &[Field::required("user_id", S), Field::optional("confirm", B)] },
-    Variant { tag: "issue_api_key", fields: &[Field::required("user_id", S), Field::required("name", S)] },
-    Variant { tag: "list_api_keys", fields: &[] },
-    Variant { tag: "revoke_api_key", fields: &[Field::required("key_id", S), Field::optional("confirm", B)] },
-    Variant { tag: "create_user_for_tenant", fields: &[Field::required("tenant_id", S), Field::required("username", S), Field::required("email", S), Field::required("role", S)] },
-    Variant { tag: "list_users_for_tenant", fields: &[Field::required("tenant_id", S)] },
-    Variant { tag: "issue_api_key_for_tenant", fields: &[Field::required("tenant_id", S), Field::required("user_id", S), Field::required("name", S)] },
-    Variant { tag: "list_api_keys_for_tenant", fields: &[Field::required("tenant_id", S)] },
+    Variant {
+        tag: "create_tenant",
+        fields: &[Field::required("name", S)],
+    },
+    Variant {
+        tag: "list_tenants",
+        fields: &[],
+    },
+    Variant {
+        tag: "revoke_tenant",
+        fields: &[
+            Field::required("tenant_id", S),
+            Field::optional("confirm", B),
+        ],
+    },
+    Variant {
+        tag: "create_user",
+        fields: &[
+            Field::required("username", S),
+            Field::required("email", S),
+            Field::required("role", S),
+        ],
+    },
+    Variant {
+        tag: "list_users",
+        fields: &[],
+    },
+    Variant {
+        tag: "revoke_user",
+        fields: &[Field::required("user_id", S), Field::optional("confirm", B)],
+    },
+    Variant {
+        tag: "issue_api_key",
+        fields: &[Field::required("user_id", S), Field::required("name", S)],
+    },
+    Variant {
+        tag: "list_api_keys",
+        fields: &[],
+    },
+    Variant {
+        tag: "revoke_api_key",
+        fields: &[Field::required("key_id", S), Field::optional("confirm", B)],
+    },
+    Variant {
+        tag: "create_user_for_tenant",
+        fields: &[
+            Field::required("tenant_id", S),
+            Field::required("username", S),
+            Field::required("email", S),
+            Field::required("role", S),
+        ],
+    },
+    Variant {
+        tag: "list_users_for_tenant",
+        fields: &[Field::required("tenant_id", S)],
+    },
+    Variant {
+        tag: "issue_api_key_for_tenant",
+        fields: &[
+            Field::required("tenant_id", S),
+            Field::required("user_id", S),
+            Field::required("name", S),
+        ],
+    },
+    Variant {
+        tag: "list_api_keys_for_tenant",
+        fields: &[Field::required("tenant_id", S)],
+    },
     Variant {
         tag: "vfs_open_data",
         fields: &[
@@ -994,15 +1049,42 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
 }
 
 const REPLY_VARIANTS: &[Variant] = &[
-    Variant { tag: "tenant_created", fields: &[Field::required("id", S)] },
-    Variant { tag: "tenants", fields: &[Field::required("tenants", A)] },
-    Variant { tag: "tenant_revoked", fields: &[Field::required("existed", B)] },
-    Variant { tag: "user_created", fields: &[Field::required("id", S)] },
-    Variant { tag: "users", fields: &[Field::required("users", A)] },
-    Variant { tag: "user_revoked", fields: &[Field::required("existed", B)] },
-    Variant { tag: "api_key_issued", fields: &[Field::required("key_id", S), Field::required("key", S)] },
-    Variant { tag: "api_keys", fields: &[Field::required("keys", A)] },
-    Variant { tag: "api_key_revoked", fields: &[Field::required("existed", B)] },
+    Variant {
+        tag: "tenant_created",
+        fields: &[Field::required("id", S)],
+    },
+    Variant {
+        tag: "tenants",
+        fields: &[Field::required("tenants", A)],
+    },
+    Variant {
+        tag: "tenant_revoked",
+        fields: &[Field::required("existed", B)],
+    },
+    Variant {
+        tag: "user_created",
+        fields: &[Field::required("id", S)],
+    },
+    Variant {
+        tag: "users",
+        fields: &[Field::required("users", A)],
+    },
+    Variant {
+        tag: "user_revoked",
+        fields: &[Field::required("existed", B)],
+    },
+    Variant {
+        tag: "api_key_issued",
+        fields: &[Field::required("key_id", S), Field::required("key", S)],
+    },
+    Variant {
+        tag: "api_keys",
+        fields: &[Field::required("keys", A)],
+    },
+    Variant {
+        tag: "api_key_revoked",
+        fields: &[Field::required("existed", B)],
+    },
     Variant {
         tag: "vfs_data_opened",
         fields: &[Field::required("handle", O)],

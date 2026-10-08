@@ -1086,3 +1086,391 @@ async fn workspace_symlinks_never_escape_or_redirect_a_capability() {
     );
     std::fs::remove_file(outside).unwrap();
 }
+
+#[cfg(windows)]
+mod windows_public_wire {
+    use super::*;
+    use std::{io::ErrorKind, os::windows::fs::MetadataExt, path::Path};
+
+    const ORIGINAL: &[u8] = &[0, 255, 1, 2, 3, 128];
+    const OUTSIDE: &[u8] = b"private outside fixture bytes";
+
+    fn outside_directory(f: &Fixture) -> PathBuf {
+        let path = f.root.with_extension("outside");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("secret.bin"), OUTSIDE).unwrap();
+        path
+    }
+
+    fn assert_reparse(path: &Path) {
+        assert_ne!(
+            std::fs::symlink_metadata(path).unwrap().file_attributes() & 0x400,
+            0,
+            "native fixture must be an actual reparse object"
+        );
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        // mklink /J creates a real directory junction without substituting a
+        // pathname mock or changing the runtime's native sharing policy.
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "native junction creation failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_reparse(link);
+    }
+
+    fn held_directory_cannot_move(source: &Path, destination: &Path) {
+        let error = std::fs::rename(source, destination)
+            .expect_err("a live native directory capability must prevent retirement");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+    }
+
+    async fn finish(
+        mut f: Fixture,
+        mut client: KernelClient,
+        agent: &str,
+        root: &Path,
+        outside: &Path,
+    ) {
+        client.stop_agent(agent).await.unwrap();
+        assert_eq!(client.agent_status(agent).await.unwrap(), "Stopped");
+        client.close().await.unwrap();
+        f.server.abort();
+        match (&mut f.server).await {
+            Err(error) if error.is_cancelled() => (),
+            result => panic!("fixture server ended unexpectedly: {result:?}"),
+        }
+        // Cleanup is an asserted native operation, not a best-effort Drop.
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(std::fs::read(outside.join("secret.bin")).unwrap(), OUTSIDE);
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn windows_public_wire_junctions_never_escape_the_workspace() {
+        let f = Fixture::new().await;
+        let agent = f.agent("native junction escape").await;
+        let outside = outside_directory(&f);
+        let alias = f.root.join("escape");
+        junction(&alias, &outside);
+        assert_eq!(std::fs::read(alias.join("secret.bin")).unwrap(), OUTSIDE);
+        let mut client = f.client().await;
+        let real = client
+            .vfs_open_workspace(
+                &agent,
+                request(
+                    "/workspace/project/file.bin",
+                    WorkspaceKind::File,
+                    &[WorkspaceRight::Read],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &real.id, 0, 64)
+                .await
+                .unwrap()
+                .bytes,
+            ORIGINAL
+        );
+        client.vfs_close(&agent, &real.id).await.unwrap();
+        let directory = directory(
+            &mut client,
+            &agent,
+            &[WorkspaceRight::Read, WorkspaceRight::List],
+        )
+        .await;
+        let before = f.kernel.syscall_gate.stats().allowed;
+        for attempt in [
+            request(
+                "/workspace/escape",
+                WorkspaceKind::Directory,
+                &[WorkspaceRight::List],
+            ),
+            request(
+                "/workspace/escape/secret.bin",
+                WorkspaceKind::File,
+                &[WorkspaceRight::Read],
+            ),
+            WorkspaceOpenRequest {
+                path: "/workspace/escape/new.bin".into(),
+                kind: WorkspaceKind::File,
+                rights: vec![WorkspaceRight::Write],
+                allow_missing: true,
+            },
+        ] {
+            let error = client
+                .vfs_open_workspace(&agent, attempt)
+                .await
+                .unwrap_err();
+            assert!(!error
+                .to_string()
+                .contains(std::str::from_utf8(OUTSIDE).unwrap()));
+        }
+        // The same native component check also applies beneath an opaque base.
+        junction(&f.root.join("project/escape"), &outside);
+        assert!(client
+            .vfs_open_at(
+                &agent,
+                &directory.id,
+                request(
+                    "escape/secret.bin",
+                    WorkspaceKind::File,
+                    &[WorkspaceRight::Read]
+                )
+            )
+            .await
+            .is_err());
+        let inside_alias = f.root.join("inside-alias");
+        junction(&inside_alias, &f.root.join("project"));
+        assert_eq!(
+            std::fs::read(inside_alias.join("file.bin")).unwrap(),
+            ORIGINAL
+        );
+        assert!(
+            client
+                .vfs_open_workspace(
+                    &agent,
+                    request(
+                        "/workspace/inside-alias/file.bin",
+                        WorkspaceKind::File,
+                        &[WorkspaceRight::Read]
+                    )
+                )
+                .await
+                .is_err(),
+            "NoFollow also rejects an alias whose target stays inside the workspace"
+        );
+        assert_eq!(f.kernel.syscall_gate.stats().allowed, before + 5);
+        assert!(!outside.join("new.bin").exists());
+        assert_eq!(std::fs::read(outside.join("secret.bin")).unwrap(), OUTSIDE);
+        assert_eq!(
+            client
+                .vfs_workspace_mounts(&agent)
+                .await
+                .unwrap()
+                .open_handles,
+            1
+        );
+        client.vfs_close(&agent, &directory.id).await.unwrap();
+        assert_eq!(
+            client
+                .vfs_workspace_mounts(&agent)
+                .await
+                .unwrap()
+                .open_handles,
+            0
+        );
+        std::fs::remove_dir(f.root.join("project/escape")).unwrap();
+        std::fs::remove_dir(inside_alias).unwrap();
+        std::fs::remove_dir(alias).unwrap();
+        let root = f.root.clone();
+        finish(f, client, &agent, &root, &outside).await;
+    }
+
+    #[tokio::test]
+    async fn windows_public_wire_live_file_reparse_replacement_never_redirects_io() {
+        let f = Fixture::new().await;
+        let agent = f.agent("native reparse replacement").await;
+        let outside = outside_directory(&f);
+        let path = f.root.join("project/file.bin");
+        let mut client = f.client().await;
+        let file = client
+            .vfs_open_workspace(
+                &agent,
+                request(
+                    "/workspace/project/file.bin",
+                    WorkspaceKind::File,
+                    &[
+                        WorkspaceRight::Read,
+                        WorkspaceRight::Write,
+                        WorkspaceRight::Stat,
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &file.id, 0, 64)
+                .await
+                .unwrap()
+                .bytes,
+            ORIGINAL
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::os::windows::fs::symlink_file(outside.join("secret.bin"), &path).unwrap();
+        assert_reparse(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), OUTSIDE);
+        let before = f.kernel.syscall_gate.stats().allowed;
+        assert!(client
+            .vfs_read_bytes(&agent, &file.id, 0, 64)
+            .await
+            .is_err());
+        assert!(client
+            .vfs_write_bytes(&agent, &file.id, b"never overwrite outside")
+            .await
+            .is_err());
+        assert!(client.vfs_stat_workspace(&agent, &file.id).await.is_err());
+        assert_eq!(f.kernel.syscall_gate.stats().allowed, before + 3);
+        assert_eq!(std::fs::read(outside.join("secret.bin")).unwrap(), OUTSIDE);
+        // The capability names an entry in a bound directory. An ordinary
+        // replacement stays usable; a reparse replacement never gains authority.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, ORIGINAL).unwrap();
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &file.id, 0, 64)
+                .await
+                .unwrap()
+                .bytes,
+            ORIGINAL
+        );
+        client.vfs_close(&agent, &file.id).await.unwrap();
+        assert_eq!(
+            client
+                .vfs_workspace_mounts(&agent)
+                .await
+                .unwrap()
+                .open_handles,
+            0
+        );
+        let root = f.root.clone();
+        finish(f, client, &agent, &root, &outside).await;
+    }
+
+    #[tokio::test]
+    async fn windows_public_wire_last_close_and_stop_release_native_directories() {
+        let f = Fixture::new().await;
+        let agent = f.agent("native capability retirement").await;
+        let outside = outside_directory(&f);
+        let project = f.root.join("project");
+        let retired = f.root.join("retired-project");
+        let moved_root = f.root.with_extension("retired");
+        let mut client = f.client().await;
+        let file = client
+            .vfs_open_workspace(
+                &agent,
+                request(
+                    "/workspace/project/file.bin",
+                    WorkspaceKind::File,
+                    &[WorkspaceRight::Read, WorkspaceRight::Write],
+                ),
+            )
+            .await
+            .unwrap();
+        let duplicate = client
+            .vfs_dup_workspace(&agent, &file.id, vec![WorkspaceRight::Read])
+            .await
+            .unwrap();
+        let before = f.kernel.syscall_gate.stats().allowed;
+        assert_eq!(
+            client
+                .vfs_write_bytes(&agent, &duplicate.id, b"forbidden")
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::PermissionDenied)
+        );
+        assert_eq!(f.kernel.syscall_gate.stats().allowed, before);
+        held_directory_cannot_move(&project, &retired);
+        client.vfs_close(&agent, &file.id).await.unwrap();
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &duplicate.id, 0, 64)
+                .await
+                .unwrap()
+                .bytes,
+            ORIGINAL
+        );
+        held_directory_cannot_move(&project, &retired);
+        client.vfs_close(&agent, &duplicate.id).await.unwrap();
+        assert_eq!(
+            client
+                .vfs_workspace_mounts(&agent)
+                .await
+                .unwrap()
+                .open_handles,
+            0
+        );
+        std::fs::rename(&project, &retired).unwrap();
+        junction(&project, &outside);
+        assert_eq!(std::fs::read(project.join("secret.bin")).unwrap(), OUTSIDE);
+        let before = f.kernel.syscall_gate.stats().allowed;
+        for id in [&file.id, &duplicate.id] {
+            assert_eq!(
+                client
+                    .vfs_read_bytes(&agent, id, 0, 64)
+                    .await
+                    .unwrap_err()
+                    .wire_code(),
+                Some(WireErrorCode::NotFound)
+            );
+        }
+        assert_eq!(f.kernel.syscall_gate.stats().allowed, before);
+        assert!(client
+            .vfs_open_workspace(
+                &agent,
+                request(
+                    "/workspace/project/secret.bin",
+                    WorkspaceKind::File,
+                    &[WorkspaceRight::Read]
+                )
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            client
+                .vfs_workspace_mounts(&agent)
+                .await
+                .unwrap()
+                .open_handles,
+            0
+        );
+        let fresh = client
+            .vfs_open_workspace(
+                &agent,
+                request(
+                    "/workspace/retired-project/file.bin",
+                    WorkspaceKind::File,
+                    &[WorkspaceRight::Read],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(fresh.id, file.id);
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &fresh.id, 0, 64)
+                .await
+                .unwrap()
+                .bytes,
+            ORIGINAL
+        );
+        held_directory_cannot_move(&f.root, &moved_root);
+        client.stop_agent(&agent).await.unwrap();
+        assert_eq!(client.agent_status(&agent).await.unwrap(), "Stopped");
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &fresh.id, 0, 64)
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::NotFound)
+        );
+        std::fs::remove_dir(project).unwrap();
+        std::fs::rename(&f.root, &moved_root).unwrap();
+        finish(f, client, &agent, &moved_root, &outside).await;
+    }
+}

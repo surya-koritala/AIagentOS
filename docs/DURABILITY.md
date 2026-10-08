@@ -44,6 +44,17 @@ Private configuration replacement stages a new owner-only file, flushes it,
 and publishes it with a same-directory write-through move. SQLite's main file
 is protected before opening and its private parent restricts sidecar creation.
 
+Trusted in-process operator persistence uses
+`config::write_owner_only_atomic(path, contents)`, shared by configuration and
+local operator stores. It supplies no new wire or tool authority. Callers bound
+and validate payloads and hold any required mutation lock; publication errors
+must be reconciled by rereading. Unix replacement also stages a new mode-0600
+file, tightens any existing current-user-owned file before new bytes, verifies
+the target identity again, renames, and syncs the parent. Windows uses the same
+protected-DACL writer described above. `config::local_operator_identity` derives
+a stable effective UID or a hash of the current TokenUser SID; it is an OS
+operator identity, not a tenant or remote authentication principal.
+
 Windows publication and rollback moves use `MoveFileExW` with
 `MOVEFILE_WRITE_THROUGH`; cross-volume copy/delete fallback is prohibited.
 Directory sync explicitly opens a directory with `FILE_FLAG_BACKUP_SEMANTICS`

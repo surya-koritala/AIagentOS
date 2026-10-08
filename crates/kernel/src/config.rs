@@ -1538,7 +1538,7 @@ impl Config {
             // load-bearing control.
             let _ = set_owner_only_directory(parent);
         }
-        write_owner_only(path, content.as_bytes())
+        write_owner_only_atomic(path, content.as_bytes())
     }
 
     /// Get API key for a provider.
@@ -1579,27 +1579,62 @@ fn read_configuration_text(path: &Path) -> std::io::Result<String> {
 /// Windows creates a protected current-user DACL before writing and publishes
 /// replacements with a same-directory write-through rename.
 #[cfg(unix)]
-fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+pub fn write_owner_only_atomic(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let existing = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                    "operator file must be a regular current-user-owned object"));
+            }
+            let file = std::fs::OpenOptions::new().write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)?;
+            let opened = file.metadata()?;
+            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "operator file changed before protection"));
+            }
+            // Tighten the old object before any new secret bytes are written.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Some(opened)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let stage = parent.join(format!(".agentos-operator-{}.stage", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut output = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(&stage)?;
+        output.write_all(contents)?;
+        output.sync_all()?;
+        drop(output);
+        match (existing.as_ref(), std::fs::symlink_metadata(path)) {
+            (Some(previous), Ok(current)) if current.is_file() && current.uid() == unsafe { libc::geteuid() }
+                && previous.dev() == current.dev() && previous.ino() == current.ino() => {},
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {},
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "operator file changed before publication")),
+        }
+        std::fs::rename(&stage, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&stage); }
+    result
 }
 
+/// Atomically replace a private local operator file with caller-supplied bytes.
+///
+/// This is a trusted in-process persistence seam. It grants no tool or wire
+/// authority. Callers bound and validate their payload and hold any required
+/// same-directory mutation lock. Reparse/symlink targets and foreign ownership
+/// are rejected; publication errors must be reconciled by rereading the file.
 #[cfg(windows)]
-fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+pub fn write_owner_only_atomic(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     crate::windows_private_fs::write_config(path, contents)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_owner_only(_path: &Path, _contents: &[u8]) -> Result<(), std::io::Error> {
+pub fn write_owner_only_atomic(_path: &Path, _contents: &[u8]) -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "private configuration storage is unsupported",
@@ -1637,6 +1672,24 @@ pub fn config_file_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Stable owner identity for trusted local operator persistence.
+///
+/// This identifies the OS operator, not a tenant or remote API principal.
+pub fn local_operator_identity() -> std::io::Result<String> {
+    #[cfg(windows)]
+    {
+        crate::windows_private_fs::operator_identity()
+    }
+    #[cfg(unix)]
+    {
+        Ok(format!("unix-user:{}", unsafe { libc::geteuid() }))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "local operator identity is unsupported"))
+    }
+}
+
 /// Get the default data directory.
 fn default_data_dir() -> PathBuf {
     dirs::data_dir()
@@ -1647,6 +1700,40 @@ fn default_data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_byte_writer_replaces_privately_rejects_links_and_cleans_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rules.json");
+        let first = br#"{"rules":["first"]}"#;
+        let second = br#"{"rules":["second"]}"#;
+        write_owner_only_atomic(&path, first).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(windows)]
+        crate::windows_private_fs::grant_world_read_for_test(&path, false);
+        write_owner_only_atomic(&path, second).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        #[cfg(windows)]
+        crate::windows_private_fs::verify_path(&path, false).unwrap();
+        let linked = root.path().join("linked-rules.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&path, &linked).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&path, &linked).unwrap();
+        assert!(write_owner_only_atomic(&linked, first).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), second);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+        assert_eq!(local_operator_identity().unwrap(), local_operator_identity().unwrap());
+    }
 
     #[test]
     fn default_config() {

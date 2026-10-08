@@ -478,9 +478,13 @@ pub(crate) fn ensure_directory(path: &Path) -> io::Result<()> {
 pub(crate) fn durable_rename(source: &Path, destination: &Path) -> io::Result<()> {
     reject_reparse_ancestors(destination)?;
     let directory = std::fs::symlink_metadata(source)?.is_dir();
-    drop(open(source, directory, READ_CONTROL)?);
+    let source_handle = open(source, directory, READ_CONTROL)?;
+    owner_and_acl(&source_handle, &UserSid::current()?, false)?;
+    drop(source_handle);
     if let Ok(metadata) = std::fs::symlink_metadata(destination) {
-        drop(open(destination, metadata.is_dir(), READ_CONTROL)?);
+        let destination_handle = open(destination, metadata.is_dir(), READ_CONTROL)?;
+        owner_and_acl(&destination_handle, &UserSid::current()?, false)?;
+        drop(destination_handle);
     }
     let source = local_path(source)?;
     let destination = local_path(destination)?;
@@ -568,6 +572,22 @@ pub(crate) fn copy_private(source: &Path, destination: &Path) -> io::Result<u64>
     let count = io::copy(&mut source, &mut destination)?;
     destination.sync_all()?;
     Ok(count)
+}
+
+/// Stable local operator identity, derived only from the current TokenUser SID.
+pub(crate) fn operator_identity() -> io::Result<String> {
+    let user = UserSid::current()?;
+    let sid = user.user();
+    unsafe {
+        bool_result(IsValidSid(sid))?;
+    }
+    let size = unsafe { GetLengthSid(sid) } as usize;
+    if size == 0 || size > 68 {
+        return Err(denied("invalid operator SID length"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), size) };
+    let identity = ring::digest::digest(&ring::digest::SHA256, bytes);
+    Ok(format!("windows-user:{}", identity.as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>()))
 }
 
 #[cfg(test)]
@@ -730,6 +750,7 @@ mod tests {
     #[test]
     fn windows_private_file_is_protected_at_birth_and_never_overwrites() {
         let root = private_root();
+        assert_eq!(operator_identity().unwrap(), operator_identity().unwrap());
         grant_world_read_for_test(root.path(), true);
         let path = root.path().join("private-key.json");
         let mut file = create_new_file(&path).unwrap();

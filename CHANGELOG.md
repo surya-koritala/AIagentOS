@@ -15,6 +15,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   handle-based ownership and reparse rejection, write-through storage publication,
   and native permission/durability CI regressions. Physical power-loss and final
   production qualification remain open (#337).
+- Share atomic owner-only local operator persistence with configuration, including
+  Unix permission tightening before replacement bytes and stable local owner
+  identity, without adding wire or tool authority (#337, #338).
 
 - Added Gemini native JSON-schema function declarations, ordered parallel calls
   and paired results, with bounded durable assistant replay state and preserved

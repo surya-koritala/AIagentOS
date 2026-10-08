@@ -128,9 +128,15 @@ def on_device_report():
         **exact_identity(
             "exact_release_candidate_on_device_gguf", ON_DEVICE_ENVIRONMENT
         ),
+        "schema_version": 2,
         "passed": True,
         "on_device_proof_eligible": True,
         "checks": {
+            "native_incremental_stream": True,
+            "stream_batch_byte_parity": True,
+            "bounded_stream_generation": True,
+            "mid_decode_cancellation_observed": True,
+            "mid_decode_worker_drained": True,
             "bounded_generation": True,
             "cancellation_worker_drained": True,
             "load_within_target": True,
@@ -820,6 +826,25 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
         self.assertIn(
             "resource-soak.result.passed", report["eligibility_blockers"]
         )
+
+    def test_on_device_requires_real_stream_parity_and_mid_decode_drain(self):
+        workspace = self.workspace()
+        workspace.reports["on-device"]["schema_version"] = 1
+        workspace.refresh()
+        with self.assertRaisesRegex(QualificationError, "schema_version"):
+            workspace.evaluate()
+        for check in ("native_incremental_stream", "stream_batch_byte_parity", "bounded_stream_generation", "mid_decode_cancellation_observed", "mid_decode_worker_drained"):
+            for missing in (False, True):
+                with self.subTest(check=check, missing=missing):
+                    workspace = self.workspace()
+                    if missing:
+                        del workspace.reports["on-device"]["checks"][check]
+                    else:
+                        workspace.reports["on-device"]["checks"][check] = False
+                    workspace.refresh()
+                    report = workspace.evaluate()
+                    self.assertFalse(report["phase1_release_candidate_ready"])
+                    self.assertIn(f"on-device.checks.{check}", report["eligibility_blockers"])
 
     def test_release_slo_must_bind_retained_soak_and_game_day(self):
         workspace = self.workspace()

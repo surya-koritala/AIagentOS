@@ -646,6 +646,9 @@ pub trait LlmProviderAdapter: Send + Sync {
     fn provider_type(&self) -> ProviderType;
     async fn is_available(&self) -> bool;
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError>;
+    /// Conservative HTTP/inference attempts one adapter session may start.
+    /// Protocol negotiation retries must be reserved before provider I/O.
+    fn max_provider_attempts(&self) -> u32 { 1 }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
@@ -1048,6 +1051,7 @@ impl AgentConnectorImpl {
                     _ = self.clock.sleep(self.retry_policy.backoff_for(attempt - 1)) => {}
                 }
             }
+            let attempts_before_session = *total_attempts;
             *total_attempts = total_attempts.saturating_add(1);
             if let Some(observed) = observed_attempts {
                 observed.store(*total_attempts, std::sync::atomic::Ordering::Release);
@@ -1107,12 +1111,13 @@ impl AgentConnectorImpl {
                                     | ConnectorError::ContentFiltered(_))
                             )
                         {
-                            return Err(ConnectorError::PartialStream(
+                            Err(ConnectorError::PartialStream(
                                 "provider failed after publishing output; retry and failover were suppressed"
                                     .into(),
-                            ));
+                            ))
+                        } else {
+                            result
                         }
-                        result
                     } else {
                         session
                             .send_streaming_controlled(
@@ -1126,6 +1131,8 @@ impl AgentConnectorImpl {
                 }
             };
 
+            *total_attempts = attempts_before_session.saturating_add(session.last_attempts().unwrap_or(1));
+            if let Some(observed) = observed_attempts { observed.store(*total_attempts, std::sync::atomic::Ordering::Release); }
             match result {
                 Ok(response) => return Ok(ProviderAttemptOutcome { response, model_id }),
                 Err(e) => {
@@ -1362,9 +1369,10 @@ impl LlmSession for ResilientSession {
     }
 
     fn max_provider_attempts(&self) -> u32 {
-        u32::try_from(self.connector.failover_chain(&self.primary).len())
-            .unwrap_or(u32::MAX)
-            .max(1)
+        self.connector.failover_chain(&self.primary).iter().fold(0_u32, |total, id| {
+            let attempts = self.connector.providers.get(id).map(|adapter| adapter.max_provider_attempts().max(1)).unwrap_or(1);
+            total.saturating_add(attempts)
+        }).max(1)
     }
 }
 

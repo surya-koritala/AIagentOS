@@ -31,8 +31,8 @@ plaintext tool shim is separate.
 | Gemini | Yes | Yes, SSE | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
 | vLLM | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
-| Candle/GGUF | Failure/template fixtures; gated real-model test | No | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
+| Ollama | Yes | Yes, NDJSON | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
+| Candle/GGUF | Controlled decoder/drain fixtures; gated real-model test | Yes, token decode | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
 
 No adapter currently advertises vision, audio, or a supported model-discovery
 API. Those fields default to false, so callers cannot infer support from a
@@ -67,7 +67,7 @@ and identities are bounded; malformed arguments, sparse indexes and duplicate
 identities fail before any tool execution. A truncated stream is an error.
 
 The reusable fixture checks all nine network adapters independently of their
-capability flags: seven native adapters publish multiple text deltas; compatibility
+capability flags: eight native network adapters publish multiple text deltas; compatibility
 adapters publish one completed delta. Concatenated text must equal the terminal
 response. A paused chunked HTTP fixture proves delivery before completion and
 split UTF-8 handling. Cancellation and deadlines cover channel backpressure;
@@ -173,6 +173,38 @@ initialize the new optional provider_metadata field, normally to None.
 
 The contracts follow Google's [GenerateContent API reference](https://ai.google.dev/api/generate-content)
 and [thinking state documentation](https://ai.google.dev/gemini-api/docs/thinking).
+
+### Local-provider streaming
+
+Ollama requests native NDJSON and emits each content fragment as its record
+arrives. UTF-8 survives HTTP chunk boundaries; terminal `done` supplies prompt,
+output and cached usage. The complete wire is capped at 8 MiB and each record at
+1 MiB. Native function calls are bounded, ordered by their indexes, validated as
+JSON objects and returned only with a terminal record. Unknown or truncated
+records fail; visible failures cannot restart or fail over. Thinking fields are
+not displayed; this change preserves the existing text/tool history contract.
+
+A model without a tool template retains its one retry without tool definitions
+and the existing governed plaintext recovery. Both sends are admitted through
+the current durable request/token budget, and actual attempts are reconciled on
+success, failure or cancellation. No extra tool execution path is introduced.
+
+Candle publishes stateful tokenizer suffixes during actual sampled-token
+decode, through a bounded four-item worker bridge. It buffers incomplete UTF-8,
+flushes only the pending tokenizer tail, and refuses a terminal response if its
+published prefix differs from the original batch decode. Output is capped at
+64 KiB; a tokenizer that revises its published prefix fails closed. Cancellation,
+deadlines and dropped futures signal the worker; cancellation/deadline close
+the bridge before awaiting the existing five-second cleanup bound. Model cache
+state resets between independent turns, and lock acquisition is cancellable.
+
+CI uses a controlled token source with the same detokenizer/worker bridge and
+shared capability conformance. This proves incremental transport and cleanup;
+it is not real GGUF inference or model-quality evidence. The protected
+on-device report is now schema 2 and must prove actual multi-delta decode,
+byte-identical stream/batch output for the same prompt/seed, and cancellation
+after a decoded delta. Older reports cannot authorize promotion. The gated
+real-model test and protected artifact remain **Not run** on this source.
 
 ## On-device boundary
 

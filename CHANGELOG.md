@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added bounded native Ollama NDJSON and per-token Candle progress through a
+  stateful tokenizer and cancellable bounded worker bridge. Ollama template
+  retries are admitted and counted; real-model stream/batch parity and
+  mid-decode cleanup are mandatory protected qualification checks. Controlled
+  fixtures run in CI; real-model evidence remains not run. Relates #353.
+
 - Added bounded native Anthropic Messages and Gemini SSE streams with shared
   byte framing, cancellation, usage and tool assembly. Signed thinking and
   Gemini streamed Content boundaries survive durable history; schema 12 refuses

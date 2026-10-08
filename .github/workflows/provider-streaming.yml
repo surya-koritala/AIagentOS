@@ -37,12 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           save-if: false
-      - name: Early streamed history through the governed executor
-        run: cargo test -p integration-tests streamed_native --locked
-      - name: All adapter and native-stream contracts without provider credentials
-        run: cargo test -p adapters --all-features --locked
       - name: Formatting gate and CI repair artifact
-        if: always()
         shell: bash
         run: |
           if cargo fmt --all -- --check > rustfmt-check.txt 2>&1; then
@@ -53,6 +48,16 @@ jobs:
             git diff --binary > rustfmt.patch
             exit 1
           fi
+      - name: Early local NDJSON and controlled decoder contracts
+        run: cargo test -p adapters --all-features --locked local_streaming_tests
+      - name: Controlled blocking worker cancellation and cleanup
+        run: cargo test -p adapters --all-features --locked on_device::tests::controlled_
+      - name: Protected real-model qualification contract without model execution
+        run: cargo test -p adapters --all-features --examples --locked
+      - name: Early streamed history through the governed executor
+        run: cargo test -p integration-tests streamed_native --locked
+      - name: All adapter and native-stream contracts without provider credentials
+        run: cargo test -p adapters --all-features --locked
       - name: Retain exact-source fixture results and formatting diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

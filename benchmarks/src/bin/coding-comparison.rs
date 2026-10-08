@@ -56,7 +56,24 @@ async fn verify_protected(io: &mut JobIo, agent: Uuid, j: &Journal) -> Result<()
     Ok(())
 }
 async fn governed(strategy: &str, image: &str) -> Result<Value, Error> {
-    let kernel = Arc::new(AgentKernelImpl::new()?);
+    let security = kernel::config::Config::default();
+    let budgets = coding_agent::task_budgets(
+        &fixture::spec(),
+        kernel::config::TokenPricing {
+            input_usd_per_1k_tokens: 0.0,
+            cached_input_usd_per_1k_tokens: 0.0,
+            output_usd_per_1k_tokens: 0.0,
+        },
+    )?;
+    let kernel = Arc::new(AgentKernelImpl::with_context_manager(
+        Arc::new(
+            kernel::context::SqliteContextManager::in_memory()
+                .map_err(kernel::KernelError::Context)?,
+        ),
+        &budgets,
+        security.mac_enforcing,
+        &security.mac_rules,
+    )?);
     let _runtime = kernel.start_runtime();
     kernel.register_provider(Arc::new(ProposalProvider::fixture()))?;
     register_test_tool(&kernel, "utf8_budget")?;

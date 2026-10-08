@@ -248,16 +248,7 @@ async fn execute(args: Vec<String>) -> Result<(), Error> {
         llm_provider: "coding".into(),
         ..Default::default()
     };
-    config.budgets.max_usd = locator.spec.max_usd;
-    config.budgets.max_output_tokens_per_request = locator.spec.max_output_tokens;
-    config.budgets.agent_tokens_per_min = 200_000;
-    config.budgets.tpm = 200_000;
-    config.budgets.max_context_tokens = 65_536;
-    config.budgets.max_concurrent = 1;
-    config
-        .budgets
-        .provider_token_pricing
-        .insert("coding".into(), locator.pricing);
+    config.budgets = coding_agent::task_budgets(&locator.spec, locator.pricing)?;
     let kernel = Arc::new(AgentKernelImpl::from_config(&config)?);
     let _runtime = kernel.start_runtime();
     let provider = if locator.mode == "fixture" {

@@ -19,6 +19,7 @@ The file is restricted to the current filesystem operator and replaced
 atomically using the same private-file writer as configuration. Unix uses
 owner-only mode `0600`; Windows uses the protected current-user DACL. A
 store-wide process lock prevents concurrent writers from losing updates.
+It uses the standard library's [exclusive file lock](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock), held for the store's lifetime.
 The operator identity is derived from the effective Unix UID or the Windows
 TokenUser SID, rather than caller-supplied environment names.
 

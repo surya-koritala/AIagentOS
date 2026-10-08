@@ -92,9 +92,10 @@ impl RuleStore {
         validate_text(operator, 128, "operator")?;
         let lock_path = path.with_extension("json.lock");
         let lock = open_private_lock(&lock_path)?;
-        lock.try_lock().map_err(|_| io::Error::new(
-            io::ErrorKind::WouldBlock, "correction store is already open in another process"
-        ))?;
+        lock.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(io::ErrorKind::WouldBlock, "correction store is already open in another process"),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
         let rules = match open_private_existing(path) {
             Ok(mut file) => {
                 if file.metadata()?.len() > MAX_RULE_FILE_BYTES {

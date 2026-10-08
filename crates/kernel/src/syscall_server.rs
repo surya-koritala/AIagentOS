@@ -269,6 +269,17 @@ pub enum Syscall {
     },
     /// List all agents the kernel knows about.
     ListAgents,
+    /// Branch an idle agent's execution history. Child identity is caller-known
+    /// for explicit reconciliation; ownership proof is required when fenced.
+    CloneAgent {
+        agent_id: String,
+        child_agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_ownership_proof: Option<AgentMutationFenceProof>,
+        name: String,
+        #[serde(default)]
+        drop_capabilities: Vec<String>,
+    },
     /// Pause new work and cooperatively cancel an in-flight turn.
     PauseAgent {
         agent_id: String,
@@ -1127,10 +1138,23 @@ impl WireErrorCode {
             (Self::AuthenticationFailed, false)
         } else if message.contains("authorization denied") {
             (Self::AuthorizationDenied, false)
+        } else if message.contains("primary provider tool incompatibility") {
+            (Self::Provider, false)
         } else if message.contains("bad request") {
             (Self::InvalidRequest, false)
         } else if message.contains("invalid agent id") || message.contains("invalid ") {
             (Self::InvalidArgument, false)
+        } else if message.contains("clone requires")
+            || message.contains("clone parent has an active or queued turn")
+            || message.contains("clone parent has live tool execution")
+            || message.contains("clone parent has an incompatible")
+            || message.contains("clone does not inherit an active generation checkpoint")
+        {
+            (Self::Lifecycle, false)
+        } else if (message.contains("clone parent") && message.contains("changed during creation"))
+            || message.contains("clone child creation is still pending")
+        {
+            (Self::Conflict, true)
         } else if message
             .contains("authority operation_id is already committed with a different command")
         {
@@ -1223,6 +1247,9 @@ impl WireErrorCode {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SyscallReply {
+    AgentCloned {
+        result: crate::cloning::CloneResult,
+    },
     AgentCreated {
         id: String,
     },
@@ -1673,6 +1700,7 @@ fn role_allows(role: Role, required: AccessLevel) -> bool {
 fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
     match call {
         Syscall::CreateAgent { .. } => (AccessLevel::User, "agent.create", None),
+        Syscall::CloneAgent { agent_id, .. } => (AccessLevel::User, "agent.clone", Some(agent_id)),
         Syscall::ListAgents => (AccessLevel::ReadOnly, "agent.list", None),
         Syscall::PauseAgent { agent_id } => (AccessLevel::User, "agent.pause", Some(agent_id)),
         Syscall::ResumeAgent { agent_id } => (AccessLevel::User, "agent.resume", Some(agent_id)),
@@ -2096,6 +2124,7 @@ fn starts_new_work(call: &Syscall) -> bool {
     matches!(
         call,
         Syscall::CreateAgent { .. }
+            | Syscall::CloneAgent { .. }
             | Syscall::ResumeAgent { .. }
             | Syscall::ResumeGenerationCheckpoint { .. }
             | Syscall::SendMessage { .. }
@@ -2124,6 +2153,7 @@ fn starts_new_work(call: &Syscall) -> bool {
 fn mutable_agent_target(call: &Syscall) -> Option<&str> {
     match call {
         Syscall::PauseAgent { agent_id }
+        | Syscall::CloneAgent { agent_id, .. }
         | Syscall::ResumeAgent { agent_id }
         | Syscall::StopAgent { agent_id }
         | Syscall::KillAgent { agent_id }
@@ -2846,6 +2876,101 @@ async fn dispatch_scoped_inner_with_fence(
                 },
                 Err(e) => SyscallReply::Error {
                     message: e.to_string(),
+                },
+            }
+        }
+        Syscall::CloneAgent {
+            agent_id,
+            child_agent_id,
+            child_ownership_proof,
+            name,
+            drop_capabilities,
+        } => {
+            let parent = match agent_id.parse::<uuid::Uuid>() {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: "invalid clone parent agent id".into(),
+                    }
+                }
+            };
+            if child_agent_id.parse::<uuid::Uuid>().ok() == Some(parent) {
+                return SyscallReply::Error {
+                    message: "clone child identity must differ from parent".into(),
+                };
+            }
+            let (child, barrier) = match mutation_fence_barrier_for(kernel, &child_agent_id) {
+                Ok(value) => value,
+                Err(message) => return SyscallReply::Error { message },
+            };
+            match (
+                kernel.context_manager.agent_tenant(parent),
+                kernel.context_manager.agent_tenant(child),
+            ) {
+                (Ok(Some(parent_tenant)), Ok(Some(child_tenant)))
+                    if parent_tenant != child_tenant =>
+                {
+                    return SyscallReply::Error {
+                        message: "authorization denied for clone child identity".into(),
+                    };
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+                _ => {}
+            }
+            // Reject unrelated existing identities before waiting for a second
+            // writer-preferring fence. Reciprocal invalid clone requests must
+            // not hold each other's parent readers behind queued writers.
+            let digest =
+                crate::cloning::clone_attenuation(&drop_capabilities).and_then(|dropped| {
+                    crate::context::clone_request_digest(parent, &name, &dropped)
+                        .map_err(crate::KernelError::Context)
+                });
+            let digest = match digest {
+                Ok(digest) => digest,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            if let Err(error) = kernel
+                .context_manager
+                .completed_clone(parent, child, &digest)
+            {
+                return SyscallReply::Error {
+                    message: error.to_string(),
+                };
+            }
+            let _child_fence = barrier.read_owned().await;
+            let proof_valid = match child_ownership_proof {
+                Some(proof) => kernel
+                    .cluster_control
+                    .verify_agent_mutation_fence(
+                        &child.to_string(),
+                        &proof.cluster_id,
+                        &proof.owner_node_id,
+                        proof.authority_term,
+                        proof.authority_generation,
+                        proof.fencing_token,
+                        proof.proof_expires_at,
+                    )
+                    .map_err(|error| error.to_string()),
+                None => enforce_unfenced_agent_mutation(kernel, &child.to_string()),
+            };
+            if let Err(message) = proof_valid {
+                return SyscallReply::Error { message };
+            }
+            match kernel
+                .clone_agent(parent, child, name, drop_capabilities)
+                .await
+            {
+                Ok(result) => SyscallReply::AgentCloned { result },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
                 },
             }
         }
@@ -7298,6 +7423,20 @@ mod tests {
     }
 
     #[test]
+    fn primary_tool_policy_rejection_is_permanent_on_the_wire() {
+        let error = crate::ConnectorError::ToolIncompatiblePrimary(crate::ProviderErrorContext {
+            provider: "fixture".into(),
+            message: "operator rejects degraded tools".into(),
+            request_id: None,
+        });
+        assert!(!crate::connector::is_transient(&error));
+        assert_eq!(
+            WireErrorCode::classify(&crate::KernelError::Connector(error).to_string()),
+            (WireErrorCode::Provider, false)
+        );
+    }
+
+    #[test]
     fn partial_provider_stream_is_terminal_on_the_public_wire() {
         let message = crate::KernelError::Connector(crate::ConnectorError::PartialStream(
             "provider failed after publishing output".into(),
@@ -9696,6 +9835,13 @@ memory = ["remember this"]
         let checkpoint = uuid::Uuid::new_v4().to_string();
 
         let agent_calls = vec![
+            Syscall::CloneAgent {
+                agent_id: id.clone(),
+                child_agent_id: uuid::Uuid::new_v4().to_string(),
+                child_ownership_proof: None,
+                name: "authorization fixture child".into(),
+                drop_capabilities: vec![],
+            },
             Syscall::PauseAgent {
                 agent_id: id.clone(),
             },
@@ -10400,7 +10546,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 114);
+        assert_eq!(calls.len(), 115);
         assert_eq!(fixture_tags, schema_tags);
     }
 

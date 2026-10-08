@@ -74,6 +74,8 @@ pub enum ConfigLoadError {
     StorageEncryption { path: PathBuf, message: String },
     #[error("invalid cluster-Raft configuration in {path}: {message}")]
     ClusterRaft { path: PathBuf, message: String },
+    #[error("invalid embedding configuration in {path}: {message}")]
+    Embeddings { path: PathBuf, message: String },
 }
 
 /// Whole-database encryption policy for the kernel-owned SQLite store.
@@ -960,11 +962,28 @@ fn validate_cluster_fingerprint(value: &str, field: &str) -> Result<(), String> 
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HuggingFaceApiMode {
+    #[default]
+    TextGeneration,
+    ChatCompletions,
+}
+
 /// Application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub llm_provider: String,
     pub default_model: String,
+    /// Optional operator-owned embedding service. None keeps offline vectors.
+    #[serde(default)]
+    pub embeddings: Option<crate::memory_manager::HttpEmbeddingConfig>,
+    #[serde(default)]
+    pub provider_routing: HashMap<ProviderId, crate::connector::ProviderRoutingPolicy>,
+    #[serde(default)]
+    pub huggingface_api_mode: HuggingFaceApiMode,
+    #[serde(default)]
+    pub huggingface_base_url: Option<String>,
     pub api_keys: HashMap<ProviderId, String>,
     pub data_dir: PathBuf,
     #[serde(default)]
@@ -1243,6 +1262,10 @@ impl Default for Config {
         Self {
             llm_provider: "azure-openai".to_string(),
             default_model: "gpt-4o".to_string(),
+            embeddings: None,
+            provider_routing: HashMap::new(),
+            huggingface_api_mode: HuggingFaceApiMode::default(),
+            huggingface_base_url: None,
             api_keys: HashMap::new(),
             data_dir: default_data_dir(),
             setup_complete: false,
@@ -1473,6 +1496,14 @@ impl Config {
                 path: path.to_path_buf(),
                 message,
             })?;
+        if let Some(embedding) = &config.embeddings {
+            embedding
+                .validate()
+                .map_err(|error| ConfigLoadError::Embeddings {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
+                })?;
+        }
         Ok(config)
     }
 
@@ -1508,6 +1539,11 @@ impl Config {
                 format!("invalid cluster-Raft configuration: {error}"),
             )
         })?;
+        if let Some(embedding) = &self.embeddings {
+            embedding
+                .validate()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        }
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

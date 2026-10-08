@@ -1,0 +1,29 @@
+{
+  "corpus_items": 10000,
+  "embedding": {
+    "dimensions": 256,
+    "model": "blended-feature-hash",
+    "version": 2
+  },
+  "memory": {
+    "index_vector_bytes_estimate": 20480000,
+    "resident_kib_linux": 26936
+  },
+  "passed": true,
+  "queries": 100,
+  "recall_at_10": 1.0,
+  "schema_version": 2,
+  "thresholds": {
+    "ann_must_be_faster_than_exact": true,
+    "minimum_recall_at_10": 0.8,
+    "minimum_top1_agreement": 0.99
+  },
+  "timing": {
+    "ann_query_p95_us": 15228,
+    "build_ms": 2336,
+    "exact_query_p95_us": 17851,
+    "performance_passed": true
+  },
+  "top1_agreement": 1.0,
+  "top_k": 10
+}

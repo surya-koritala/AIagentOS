@@ -743,6 +743,12 @@ impl CgroupManager {
         }
     }
 
+    pub(crate) fn has_active_agent_tool_calls(&self, agent_id: AgentId) -> bool {
+        self.active_tool_calls_by_agent
+            .get(&agent_id)
+            .is_some_and(|active| *active > 0)
+    }
+
     fn acquire_tool_call_for_hierarchy(
         self: &Arc<Self>,
         hierarchy: Vec<Cgroup>,
@@ -827,6 +833,23 @@ impl CgroupManager {
     pub fn get(&self, id: CgroupId) -> Option<Cgroup> {
         let _tree = self.lock_tree().ok()?;
         self.groups.get(&id).map(|group| group.clone())
+    }
+
+    pub(crate) fn with_clone_limits<T>(
+        &self,
+        id: CgroupId,
+        expected: &CgroupLimits,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let _tree = self.lock_tree().map_err(|error| error.to_string())?;
+        let group = self
+            .groups
+            .get(&id)
+            .ok_or_else(|| "clone parent cgroup was removed".to_string())?;
+        if &group.limits != expected {
+            return Err("clone parent cgroup limits changed during creation".into());
+        }
+        Ok(commit())
     }
 
     /// Atomically replace one leaf's limits after proving current membership,

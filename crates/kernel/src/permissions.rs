@@ -137,6 +137,28 @@ impl PermissionManager {
         self.agent_profiles.remove(&agent_id);
     }
 
+    pub(crate) fn profile_for_agent(&self, agent: AgentId) -> Option<String> {
+        self.agent_profiles
+            .get(&agent)
+            .map(|profile| profile.value().clone())
+    }
+
+    pub(crate) fn with_clone_profile<T>(
+        &self,
+        agent: AgentId,
+        expected: &str,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let profile = self
+            .agent_profiles
+            .get(&agent)
+            .ok_or_else(|| "clone parent profile was revoked".to_string())?;
+        if profile.value() != expected {
+            return Err("clone parent profile changed during creation".into());
+        }
+        Ok(commit())
+    }
+
     fn register_predefined_profiles(&self) {
         // Read-only: only read operations allowed
         self.profiles.insert(

@@ -44,6 +44,30 @@ struct DeepseekSession {
     model: String,
 }
 
+impl DeepseekSession {
+    fn streaming_request(
+        &self,
+        messages: &[StandardMessage],
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> reqwest::RequestBuilder {
+        let body =
+            crate::streaming::openai_streaming_body(messages, tools, options, Some(&self.model));
+        let request = self
+            .client
+            .post(format!(
+                "{}/chat/completions",
+                self.base_url.trim_end_matches('/')
+            ))
+            .json(&body);
+        if self.api_key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.api_key)
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl LlmSession for DeepseekSession {
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
@@ -143,6 +167,7 @@ impl LlmSession for DeepseekSession {
                     })
                     .unwrap_or_default();
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content,
                     finish_reason: json["choices"][0]["finish_reason"]
                         .as_str()
@@ -159,6 +184,61 @@ impl LlmSession for DeepseekSession {
             Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
+    }
+
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.send_streaming_controlled(messages, tools, options, &cancellation)
+            .await
+    }
+
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        crate::streaming::send_openai_stream_controlled(
+            &self.provider_id,
+            self.streaming_request(&messages, tools, options),
+            options,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        crate::streaming::send_openai_stream_controlled(
+            &self.provider_id,
+            self.streaming_request(&messages, tools, options),
+            options,
+            cancellation,
+            Some(events),
+        )
+        .await
     }
 
     fn enforces_max_output_tokens(&self) -> bool {
@@ -187,6 +267,7 @@ impl LlmProviderAdapter for DeepseekAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
             prompt_cancellation: true,
@@ -221,6 +302,7 @@ impl LlmProviderAdapter for DeepseekAdapter {
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
         Some(StandardMessage {
+            provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
             content: value.get("content")?.as_str().unwrap_or("").to_string(),
             tool_call_id: None,

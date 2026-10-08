@@ -10,6 +10,47 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added explicitly configured Hugging Face chat-router requests with shared
+  native function, usage and SSE decoding. Legacy completions reject direct
+  native tools, retain the audited governed shim and mark usage estimated.
+  Dated upstream compatibility references and keyless CI fixtures cover both
+  modes; live qualification remains not run. Relates #355.
+
+- Added explicit native-tool policy for an incompatible primary provider.
+  Operators can reject before request/failover I/O or retain the default governed
+  plaintext shim with one per-session degradation audit and per-turn counters.
+  Prompt overhead is included in context and token admission. Relates #356.
+
+- Added Gemini native JSON-schema function declarations, ordered parallel calls
+  and paired results, with bounded durable assistant replay state and preserved
+  thought signatures. Checkpoints, cloning, restart, context admission and
+  failover protect this state. Malformed responses execute no tools; output
+  accounting includes thought tokens. Schema 11 prevents reader downgrade.
+  Deterministic fixtures pass; live qualification remains not run. Relates #354.
+
+- Added opt-in OpenAI-compatible/Ollama embedding transports, typed failures,
+  bounded request/response handling, configured boot selection, atomic model and
+  dimension repair, and a labelled-corpus comparison. Default offline vectors
+  stay unchanged. Rust embedding methods now return Result; wire fact schemas
+  remain unchanged. Relates #359.
+
+- Added a bounded 100k-fact context-manager qualification mode with cold/warm
+  latency, concurrent updates/queries, before/after retrieval quality, whole-store
+  integrity and peak RSS gates. Normal fact writes now reconcile retained indexes
+  incrementally; updates enforce UTF-8 byte limits atomically. A separate hosted
+  workflow retains exact-source synthetic scale evidence. Relates #358.
+
+- Retained per-agent semantic-memory indexes and shared deterministic LSH planes.
+  Facts use versioned binary embeddings with atomic JSON migration, repair checks,
+  durable mutation revisions, bounded cache eviction and erasure cleanup. LSH
+  candidate compression and partial selection preserve search results; the 10k
+  qualification also requires ANN p95 below exact search. Relates #357.
+- Added native bounded SSE streaming for OpenAI, Groq, DeepSeek and vLLM,
+  using Azure's shared byte-safe reader. Keyless nine-provider conformance
+  fixtures cover capability declarations, parallel tool argument assembly,
+  usage, cancellation, deadlines, wire ceilings and partial-output replay
+  suppression. Real-service qualification remains pending. Closes #351.
+
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,
   and SDK/agentctl surfaces. Durable KV admission now counts UTF-8 key/value

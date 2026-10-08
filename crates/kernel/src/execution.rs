@@ -140,10 +140,26 @@ pub struct UsageTelemetry {
     /// floating-point drift. Older checkpoints deserialize this as zero.
     #[serde(default)]
     pub charged_cost_micros: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub degraded_requests: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_native_tool_definitions: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shim_recovered_tool_calls: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl UsageTelemetry {
     fn record(&mut self, call: &ProviderCall) {
+        if let Some(record) = &call.tool_degradation {
+            self.degraded_requests = self.degraded_requests.saturating_add(1);
+            self.dropped_native_tool_definitions = self
+                .dropped_native_tool_definitions
+                .saturating_add(record.dropped_tool_count);
+        }
         self.input_tokens = self.input_tokens.saturating_add(call.usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(call.usage.output_tokens);
         self.cached_tokens = self.cached_tokens.saturating_add(call.usage.cached_tokens);
@@ -166,6 +182,7 @@ struct ProviderCall {
     attempts: u32,
     retries: u32,
     latency_ms: u64,
+    tool_degradation: Option<crate::connector::ProviderToolDegradation>,
 }
 
 /// The agent executor — drives the think→act→observe loop.
@@ -406,11 +423,15 @@ impl AgentExecutor {
         &mut self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<(), KernelError> {
+        self.session
+            .validate_tool_policy(tools)
+            .map_err(KernelError::Connector)?;
         let budget = self.context_budget_tokens;
         if budget == 0 {
             return Ok(());
         }
         let tool_tokens = Self::conservative_tool_tokens(tools);
+        let tool_tokens = tool_tokens.saturating_add(self.session.tool_prompt_overhead(tools));
         let original_message_tokens = self.estimate_prompt_tokens(&self.messages);
         let original_tokens = original_message_tokens.saturating_add(tool_tokens);
         if original_tokens <= budget {
@@ -435,13 +456,22 @@ impl AgentExecutor {
             .messages
             .iter()
             .rposition(|message| message.tool_calls.is_some());
+        // Signed native histories cannot be reconstructed from a prose spill
+        // reference. Keep the native suffix intact, including each call's tool
+        // results; pressure fails closed when that required state cannot fit.
+        let native_history_start = self
+            .messages
+            .iter()
+            .position(|message| message.provider_metadata.is_some());
         let pinned: Vec<bool> = (0..self.messages.len())
             .map(|index| {
                 let message = &self.messages[index];
                 let required_system = message.role == "system"
                     && !message.content.starts_with("[Durable context spill:")
                     && !message.content.starts_with("[Context spill:");
-                required_system || latest_tool_state.is_some_and(|start| index >= start)
+                required_system
+                    || latest_tool_state.is_some_and(|start| index >= start)
+                    || native_history_start.is_some_and(|start| index >= start)
             })
             .collect();
         let pinned_messages: Vec<_> = self
@@ -624,6 +654,18 @@ impl AgentExecutor {
         if let Ok(messages) = self.context_manager.load_conversation(conversation_id) {
             self.messages = messages;
         }
+        self
+    }
+
+    /// Seed a freshly created executor from history already verified and
+    /// resolved for its owning agent by the kernel context store.
+    pub(crate) fn with_restored_history(
+        mut self,
+        conversation_id: String,
+        messages: Vec<StandardMessage>,
+    ) -> Self {
+        self.conversation_id = conversation_id;
+        self.messages = messages;
         self
     }
 
@@ -940,18 +982,22 @@ impl AgentExecutor {
 
             // Function-calling shim: models without native structured
             // tool-calling return their tool requests as plaintext. Only when
-            // the response carries no native tool_calls do we scan the content
-            // for shim-encoded call(s) and recover them — the native FC path is
-            // untouched (this fallback only runs when it would otherwise end).
+            // the response carries neither native calls nor native replay
+            // metadata do we recover plaintext requests. Signed native text
+            // remains text, including examples that resemble shim syntax.
             let mut tool_calls = response.tool_calls.clone();
-            if tool_calls.is_empty() {
+            if tool_calls.is_empty() && response.provider_metadata.is_none() {
                 tool_calls = crate::function_calling::parse_tool_calls(&response.content);
+                usage.shim_recovered_tool_calls = usage
+                    .shim_recovered_tool_calls
+                    .saturating_add(u32::try_from(tool_calls.len()).unwrap_or(u32::MAX));
             }
 
             // If no tool calls (native or shim-recovered), we're done — return content
             if tool_calls.is_empty() {
-                self.messages
-                    .push(StandardMessage::assistant(&response.content));
+                let mut assistant_msg = StandardMessage::assistant(&response.content);
+                assistant_msg.provider_metadata = response.provider_metadata.clone();
+                self.messages.push(assistant_msg);
 
                 // Store as fact if response is substantial (>100 chars)
                 if response.content.len() > 100 {
@@ -978,6 +1024,7 @@ impl AgentExecutor {
             // results that follow are correctly paired with this turn.
             let mut assistant_msg = StandardMessage::assistant(&response.content);
             assistant_msg.tool_calls = Some(tool_calls.clone());
+            assistant_msg.provider_metadata = response.provider_metadata.clone();
             self.messages.push(assistant_msg);
 
             for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -1117,6 +1164,9 @@ impl AgentExecutor {
         &self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<ProviderCall, KernelError> {
+        self.session
+            .validate_tool_policy(tools)
+            .map_err(KernelError::Connector)?;
         if self.max_output_tokens_per_request > 0 && !self.session.enforces_max_output_tokens() {
             return Err(KernelError::Policy(format!(
                 "provider session {}/{} does not enforce the configured max_output_tokens_per_request={}; bounded token admission refuses to call it",
@@ -1129,7 +1179,8 @@ impl AgentExecutor {
         let clean_messages = self.clean_messages();
         let estimated_input_tokens = self
             .estimate_prompt_tokens(&clean_messages)
-            .saturating_add(Self::conservative_tool_tokens(tools));
+            .saturating_add(Self::conservative_tool_tokens(tools))
+            .saturating_add(self.session.tool_prompt_overhead(tools));
         let estimated_admission_tokens =
             estimated_input_tokens.saturating_add(self.max_output_tokens_per_request);
         let provider_attempt_budget = self.session.max_provider_attempts().max(1);
@@ -1414,6 +1465,7 @@ impl AgentExecutor {
                         attempts,
                         retries: attempts.saturating_sub(1),
                         latency_ms: provider_latency_ms,
+                        tool_degradation: self.session.last_tool_degradation(),
                     });
                 }
                 Err(e) => {
@@ -1577,6 +1629,7 @@ mod tests {
         ) -> Result<LlmResponse, ConnectorError> {
             *self.seen_tools.lock().unwrap() = tools.iter().map(|tool| tool.name.clone()).collect();
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "done".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 1,
@@ -1606,6 +1659,7 @@ mod tests {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count == 0 {
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "".into(),
                     finish_reason: Some("tool_calls".into()),
                     tokens_used: 20,
@@ -1618,6 +1672,7 @@ mod tests {
                 })
             } else {
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "The file contains: hello world".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 15,
@@ -1650,6 +1705,7 @@ mod tests {
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ConnectorError> {
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "".into(),
                 finish_reason: Some("tool_calls".into()),
                 tokens_used: 5,
@@ -1749,6 +1805,7 @@ mod tests {
         ) -> Result<LlmResponse, ConnectorError> {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.responses.get(index).cloned().unwrap_or(LlmResponse {
+                provider_metadata: None,
                 content: "done".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 1,
@@ -1764,6 +1821,7 @@ mod tests {
 
     fn tool_response(ids: &[&str]) -> LlmResponse {
         LlmResponse {
+            provider_metadata: None,
             content: String::new(),
             finish_reason: Some("tool_calls".into()),
             tokens_used: 1,
@@ -1781,6 +1839,7 @@ mod tests {
 
     fn content_response(content: &str) -> LlmResponse {
         LlmResponse {
+            provider_metadata: None,
             content: content.into(),
             finish_reason: Some("stop".into()),
             tokens_used: 1,
@@ -2059,6 +2118,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_replay_suffix_is_pinned_and_charged_by_context_admission() {
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(InfiniteToolSession {
+                id: "gemini".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM".into(),
+        );
+        let mut signed = StandardMessage::assistant("signed");
+        signed.provider_metadata = Some(
+            crate::connector::ProviderMessageMetadata::new(
+                "gemini".into(),
+                "fixture-model".into(),
+                serde_json::json!({"parts": [{"text": "signed",
+                "thoughtSignature": "x".repeat(2048)}], "tool_call_ids": []}),
+            )
+            .unwrap(),
+        );
+        executor.messages.push(signed);
+        executor.messages.push(StandardMessage::user("next turn"));
+        let original = executor.messages.clone();
+        executor.set_context_budget(512);
+        assert!(executor.estimate_prompt_tokens(&executor.messages) > 2048);
+        assert!(executor.compact_to_token_budget(&[]).await.is_err());
+        assert_eq!(executor.messages, original);
+    }
+
+    #[tokio::test]
     async fn context_pager_bounds_active_window_by_tokens() {
         let agent_id = uuid::Uuid::new_v4();
         let context = mock_context_manager();
@@ -2238,6 +2328,7 @@ mod tests {
             .messages
             .push(StandardMessage::system("REQUIRED POLICY"));
         executor.messages.push(StandardMessage {
+            provider_metadata: None,
             role: "assistant".into(),
             content: "earlier tool transaction".into(),
             tool_call_id: None,
@@ -2258,6 +2349,7 @@ mod tests {
             )));
         }
         executor.messages.push(StandardMessage {
+            provider_metadata: None,
             role: "assistant".into(),
             content: "calling tool".into(),
             tool_call_id: None,
@@ -2475,7 +2567,8 @@ mod tests {
             if count == 0 {
                 // Plaintext reply with a fenced shim call and NO native tool_calls.
                 Ok(LlmResponse {
-                    content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"path\": \"/tmp/test.txt\"}}\n```".into(),
+                    provider_metadata: None,
+content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"path\": \"/tmp/test.txt\"}}\n```".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 12,
                     usage: Default::default(),
@@ -2483,6 +2576,7 @@ mod tests {
                 })
             } else {
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "The file contains: hello world".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 8,
@@ -2812,6 +2906,7 @@ mod tests {
                 Err(ConnectorError::ConnectionFailed("server error".into()))
             } else {
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "recovered!".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 10,
@@ -2919,6 +3014,7 @@ mod tests {
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ConnectorError> {
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "done".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 2,
@@ -2957,6 +3053,7 @@ mod tests {
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ConnectorError> {
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "bounded".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 2,
@@ -3014,6 +3111,7 @@ mod tests {
                 ))
             } else {
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "done".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 7,
@@ -3590,6 +3688,7 @@ mod tests {
             if count == 0 {
                 // First call: return a bad tool call
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "".into(),
                     finish_reason: Some("tool_calls".into()),
                     tokens_used: 10,
@@ -3608,6 +3707,7 @@ mod tests {
                 assert!(!last_msg.content.contains("nonexistent_tool"));
                 assert!(last_msg.content.contains("read_file")); // suggests available tools
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "Sorry, let me try differently.".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 8,
@@ -3685,7 +3785,8 @@ mod tests {
             _tools: &[ToolDefinition],
         ) -> Result<LlmResponse, ConnectorError> {
             Ok(LlmResponse {
-                content: "This is a very long response that exceeds one hundred characters in length so it will be stored as a fact in long-term memory for future reference.".into(),
+                provider_metadata: None,
+content: "This is a very long response that exceeds one hundred characters in length so it will be stored as a fact in long-term memory for future reference.".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 30,
                 usage: Default::default(),
@@ -3745,6 +3846,7 @@ mod tests {
         ) -> Result<LlmResponse, ConnectorError> {
             self.msg_count.store(messages.len(), Ordering::SeqCst);
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "ok".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 5,
@@ -4036,6 +4138,17 @@ mod tests {
             arguments: serde_json::json!({"path": "/tmp/x"}),
         }]);
 
+        assistant.provider_metadata = Some(
+            crate::connector::ProviderMessageMetadata::new(
+                "gemini".into(),
+                "checkpoint-model".into(),
+                serde_json::json!({
+                    "parts": [{"functionCall": {"name": "read_file", "args": {"path": "/tmp/x"}},
+                        "thoughtSignature": "c2ln"}], "tool_call_ids": ["call_1"]
+                }),
+            )
+            .unwrap(),
+        );
         let checkpoint = GenerationCheckpoint {
             agent_id: uuid::Uuid::new_v4(),
             conversation_id: "conv-123".into(),

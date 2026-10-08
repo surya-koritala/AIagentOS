@@ -198,6 +198,16 @@ impl Default for SandboxManagerImpl {
 }
 
 impl SandboxManagerImpl {
+    pub(crate) fn sandbox_config(&self, id: SandboxId) -> Option<SandboxConfig> {
+        self.sandboxes.get(&id).map(|state| SandboxConfig {
+            workspace_dir: state.workspace_dir.clone(),
+            allowed_network_hosts: Some(state.allowed_network_hosts.iter().cloned().collect()),
+            isolation_level: state.isolation_level.clone(),
+            max_disk_usage_bytes: state.max_disk_usage_bytes,
+            max_memory_bytes: state.max_memory_bytes,
+            container_image: state.container_image.clone(),
+        })
+    }
     const MANAGED_MARKER: &'static str = ".aiagentos-managed";
 
     pub fn new() -> Self {
@@ -263,8 +273,13 @@ impl SandboxManagerImpl {
     }
 
     pub fn is_managed_config(config: &SandboxConfig) -> bool {
-        if !config.workspace_dir.starts_with(Self::managed_root())
-            || config.isolation_level != IsolationLevel::Filesystem
+        let reserved_root = std::fs::canonicalize(Self::managed_root()).ok();
+        let parent = config
+            .workspace_dir
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok());
+        if reserved_root.is_none()
+            || parent != reserved_root
             || !config
                 .workspace_dir
                 .file_name()

@@ -1103,7 +1103,8 @@ impl AgentConnectorImpl {
                             && sink.has_emitted()
                             && !matches!(
                                 result,
-                                Err(ConnectorError::Cancelled(_) | ConnectorError::ContentFiltered(_))
+                                Err(ConnectorError::Cancelled(_)
+                                    | ConnectorError::ContentFiltered(_))
                             )
                         {
                             return Err(ConnectorError::PartialStream(

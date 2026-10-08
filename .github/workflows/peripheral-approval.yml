@@ -33,6 +33,8 @@ jobs:
     name: Peripheral dialog and rendered accessibility
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PERIPHERAL_QA_DIR: ${{ runner.temp }}/peripheral-ui-qa
     defaults:
       run:
         working-directory: crates/tauri-app/ui
@@ -47,12 +49,18 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npx playwright install --with-deps chromium
+      - name: Retain UI source identity outside the checkout
+        run: |
+          mkdir -p "$PERIPHERAL_QA_DIR"
+          git rev-parse HEAD > "$PERIPHERAL_QA_DIR/checked-out-source.txt"
+          printf '%s\n' '${{ github.event.pull_request.head.sha || github.sha }}' > "$PERIPHERAL_QA_DIR/feature-source.txt"
       - run: npm run test:a11y
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: peripheral-ui-${{ github.sha }}
           path: |
+            ${{ runner.temp }}/peripheral-ui-qa
             crates/tauri-app/ui/test-results
             crates/tauri-app/ui/dist
           if-no-files-found: warn

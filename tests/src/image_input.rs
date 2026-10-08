@@ -176,7 +176,12 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
         .unwrap();
     assert_eq!(
         tui.message_client()
-            .send_message_content_stream("image-tui-stream", tui_agent.to_string(), content(), |_| {})
+            .send_message_content_stream(
+                "image-tui-stream",
+                tui_agent.to_string(),
+                content(),
+                |_| {}
+            )
             .await
             .unwrap()
             .content,

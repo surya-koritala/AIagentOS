@@ -38,7 +38,10 @@ def command(argv: list[str], *, cwd: Path | None = None) -> subprocess.Completed
 def observe(binary: Path, workspace: Path, operation: str, *args: str) -> dict:
     result = command([str(binary), operation, *args], cwd=workspace)
     if result.returncode:
-        return {"observed": False, "exit_code": result.returncode}
+        return {
+            "observed": False, "exit_code": result.returncode,
+            "diagnostic": result.stderr.decode("utf-8", "strict")[:4096],
+        }
     payload = json.loads(result.stdout)
     if not isinstance(payload, dict):
         raise ValueError("fixture response was not an object")
@@ -79,14 +82,25 @@ def run(output: Path) -> None:
             path.chmod(mode)
         (workspace / "link-public").symlink_to(public)
         (workspace / "link-private").symlink_to(private)
-        binary = root / "sandbox-probe"
+        bundle = root / "SandboxProbe.app"
+        executable_directory = bundle / "Contents/MacOS"
+        executable_directory.mkdir(parents=True)
+        binary = executable_directory / "sandbox-probe"
+        (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "dev.aiagentos.ci.sandboxprobe",
+            "CFBundleExecutable": "sandbox-probe",
+            "CFBundleName": "SandboxProbe",
+            "CFBundlePackageType": "APPL",
+            "CFBundleVersion": "1",
+            "LSBackgroundOnly": True,
+        }))
         built = command([
             "/usr/bin/clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
             str(ROOT / "scripts/fixtures/macos_app_sandbox_probe.c"), "-o", str(binary),
         ])
         if built.returncode:
             raise ValueError("probe compilation failed")
-        report["fixture_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        report["unsigned_fixture_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
         baseline = observe(binary, workspace, "read", str(public))
         private_baseline = observe(binary, workspace, "read", str(private))
         if baseline.get("allowed") is not True or private_baseline.get("allowed") is not True:
@@ -98,13 +112,14 @@ def run(output: Path) -> None:
         }))
         signed = command([
             "/usr/bin/codesign", "--force", "--sign", "-", "--identifier",
-            "dev.aiagentos.ci.sandboxprobe", "--entitlements", str(entitlements), str(binary),
+            "dev.aiagentos.ci.sandboxprobe", "--entitlements", str(entitlements), str(bundle),
         ])
         if signed.returncode:
             raise ValueError("disposable ad-hoc fixture signing failed")
-        verified = command(["/usr/bin/codesign", "--verify", "--strict", str(binary)])
+        verified = command(["/usr/bin/codesign", "--verify", "--strict", str(bundle)])
         if verified.returncode:
             raise ValueError("fixture code signature verification failed")
+        report["signed_fixture_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
         identity = observe(binary, workspace, "identity")
         report["observations"]["identity"] = identity
         if identity.get("observed"):

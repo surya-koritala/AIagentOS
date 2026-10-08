@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Distribution
+- Add native Linux and macOS arm64 release targets, architecture-bound desktop
+  updater assets, fail-closed platform documentation checks, and fresh-runner ARM
+  CLI installation evidence. Native desktop signing and public installer
+  qualification remain open (#344, #346).
+
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,
   and SDK/agentctl surfaces. Durable KV admission now counts UTF-8 key/value

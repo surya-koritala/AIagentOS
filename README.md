@@ -41,6 +41,11 @@
 > Use [CHANGELOG.md](CHANGELOG.md) to distinguish stable, candidate, and
 > unreleased behavior.
 
+See the [platform and installation evidence matrix](docs/SUPPORTED_PLATFORMS.md)
+for exact native targets, runtime dependencies, candidate asset names, and
+verification commands. The stable release currently has no downloadable binaries;
+native ARM CI evidence does not yet establish a public installer support promise.
+
 ## What is AI Agent OS?
 
 AI Agent OS is a user-space control plane and runtime for long-lived AI agents.

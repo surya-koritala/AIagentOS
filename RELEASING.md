@@ -81,6 +81,10 @@ desktop, distributed-control-plane, or independent-review gates.
 
 ## What a release must prove (the gate)
 
+The [supported platform and installation evidence matrix](docs/SUPPORTED_PLATFORMS.md)
+defines candidate OS floors, architectures, exact artifact names, dependencies,
+and native verification. Its CI drift check must pass before release qualification.
+
 Before tagging, manually dispatch `.github/workflows/release.yml` on the release
 branch. This qualification mode creates the complete signed evidence bundle but
 cannot publish a GitHub Release. A `v*` tag runs the same workflow and

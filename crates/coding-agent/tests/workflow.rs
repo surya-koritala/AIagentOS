@@ -191,7 +191,7 @@ impl LlmSession for FailingProposalProvider {
         assert!(options.max_output_tokens.is_some_and(|limit| limit >= 3));
         self.send_with_tools(messages, tools).await
     }
-    fn provider_id(&self) -> &str {
+    fn provider_id(&self) -> &String {
         &self.id
     }
     fn model_id(&self) -> &str {

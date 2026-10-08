@@ -723,11 +723,18 @@ struct DegradationSession {
 
 impl DegradationSession {
     fn new(agent_id: Option<AgentId>) -> Self {
-        Self { agent_id, reported: std::sync::atomic::AtomicBool::new(false), latest: RwLock::new(None) }
+        Self {
+            agent_id,
+            reported: std::sync::atomic::AtomicBool::new(false),
+            latest: RwLock::new(None),
+        }
     }
 
     fn latest(&self) -> Option<ProviderToolDegradation> {
-        self.latest.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.latest
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -856,35 +863,78 @@ impl AgentConnectorImpl {
         self.routing_policies.insert(provider.clone(), policy);
     }
 
-    pub fn set_degradation_audit_sink(&self, sink: Arc<dyn crate::observability::ObservabilityEngine>) {
-        *self.degradation_audit.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+    pub fn set_degradation_audit_sink(
+        &self,
+        sink: Arc<dyn crate::observability::ObservabilityEngine>,
+    ) {
+        *self
+            .degradation_audit
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
     }
 
-    pub fn validate_primary_tool_policy(&self, primary: &ProviderId, tools: &[ToolDefinition]) -> Result<(), ConnectorError> {
-        if !tools.is_empty() && self.routing_policy(primary).tool_incompatible_primary == ToolIncompatiblePrimaryPolicy::Reject
-            && self.providers.get(primary).is_some_and(|provider| !provider.capabilities().tool_calls) {
-            return Err(ConnectorError::ToolIncompatiblePrimary(crate::ProviderErrorContext {
-                provider: primary.clone(), message: "operator policy rejects a primary without native tool support".into(), request_id: None,
-            }));
+    pub fn validate_primary_tool_policy(
+        &self,
+        primary: &ProviderId,
+        tools: &[ToolDefinition],
+    ) -> Result<(), ConnectorError> {
+        if !tools.is_empty()
+            && self.routing_policy(primary).tool_incompatible_primary
+                == ToolIncompatiblePrimaryPolicy::Reject
+            && self
+                .providers
+                .get(primary)
+                .is_some_and(|provider| !provider.capabilities().tool_calls)
+        {
+            return Err(ConnectorError::ToolIncompatiblePrimary(
+                crate::ProviderErrorContext {
+                    provider: primary.clone(),
+                    message: "operator policy rejects a primary without native tool support".into(),
+                    request_id: None,
+                },
+            ));
         }
         Ok(())
     }
 
-    fn report_tool_degradation(&self, session: &DegradationSession, record: ProviderToolDegradation) {
-        *session.latest.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record.clone());
-        if session.reported.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    fn report_tool_degradation(
+        &self,
+        session: &DegradationSession,
+        record: ProviderToolDegradation,
+    ) {
+        *session
+            .latest
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record.clone());
+        if session
+            .reported
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         tracing::warn!(provider = %record.provider_id, model = %record.model_id,
             dropped_tool_count = record.dropped_tool_count,
             "primary provider lacks native tools; explicit degraded-shim policy applies");
         if let Some(agent_id) = session.agent_id {
-            let sink = self.degradation_audit.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let sink = self
+                .degradation_audit
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             if let Some(sink) = sink {
-                sink.log_action(agent_id, crate::observability::AgentAction {
-                    id: uuid::Uuid::new_v4(), action_type: "provider_tool_degradation".into(),
-                    description: serde_json::to_string(&record).unwrap_or_else(|_| "provider tool degradation".into()),
-                    resources_accessed: Vec::new(), reasoning: None, plan_context: None,
-                    timestamp: chrono::Utc::now(),
-                });
+                sink.log_action(
+                    agent_id,
+                    crate::observability::AgentAction {
+                        id: uuid::Uuid::new_v4(),
+                        action_type: "provider_tool_degradation".into(),
+                        description: serde_json::to_string(&record)
+                            .unwrap_or_else(|_| "provider tool degradation".into()),
+                        resources_accessed: Vec::new(),
+                        reasoning: None,
+                        plan_context: None,
+                        timestamp: chrono::Utc::now(),
+                    },
+                );
             }
         }
     }
@@ -1020,7 +1070,10 @@ impl AgentConnectorImpl {
         let routing_policy = self.routing_policy(primary);
         let ephemeral_session = DegradationSession::new(None);
         let degradation_session = controls.degradation_session.unwrap_or(&ephemeral_session);
-        *degradation_session.latest.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *degradation_session
+            .latest
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         if controls.cancellation.is_cancelled() {
             return Err(ConnectorError::cancelled(primary.clone(), None));
         }
@@ -1075,7 +1128,9 @@ impl AgentConnectorImpl {
                         options: controls.options,
                         cancellation: controls.cancellation,
                         events: controls.events.clone(),
-                        degraded_tools: provider_index == 0 && !tools.is_empty() && !adapter.capabilities().tool_calls,
+                        degraded_tools: provider_index == 0
+                            && !tools.is_empty()
+                            && !adapter.capabilities().tool_calls,
                         degradation_session,
                     },
                     &mut total_attempts,
@@ -1176,14 +1231,25 @@ impl AgentConnectorImpl {
 
             let mut shim_messages = Vec::new();
             let (messages, tools) = if request.degraded_tools {
-                self.report_tool_degradation(request.degradation_session, ProviderToolDegradation {
-                    provider_id: adapter.id().clone(), model_id: model_id.clone(),
-                    dropped_tool_count: u32::try_from(request.tools.len()).unwrap_or(u32::MAX),
-                });
+                self.report_tool_degradation(
+                    request.degradation_session,
+                    ProviderToolDegradation {
+                        provider_id: adapter.id().clone(),
+                        model_id: model_id.clone(),
+                        dropped_tool_count: u32::try_from(request.tools.len()).unwrap_or(u32::MAX),
+                    },
+                );
                 shim_messages.extend_from_slice(request.messages);
-                shim_messages.insert(0, StandardMessage::system(crate::function_calling::render_tools_prompt(request.tools)));
+                shim_messages.insert(
+                    0,
+                    StandardMessage::system(crate::function_calling::render_tools_prompt(
+                        request.tools,
+                    )),
+                );
                 (shim_messages.as_slice(), &[][..])
-            } else { (request.messages, request.tools) };
+            } else {
+                (request.messages, request.tools)
+            };
 
             let result = match request.mode {
                 SendMode::NonStreaming => {
@@ -1335,7 +1401,7 @@ impl LlmSession for ResilientSession {
                     observed_attempts: Some(&self.last_attempts),
                     max_attempts_per_provider: Some(1),
                     events: None,
-                degradation_session: Some(&self.degradation),
+                    degradation_session: Some(&self.degradation),
                 },
             )
             .await?;
@@ -1425,7 +1491,7 @@ impl LlmSession for ResilientSession {
                     observed_attempts: Some(&self.last_attempts),
                     max_attempts_per_provider: Some(1),
                     events: None,
-                degradation_session: Some(&self.degradation),
+                    degradation_session: Some(&self.degradation),
                 },
             )
             .await?;
@@ -1456,13 +1522,26 @@ impl LlmSession for ResilientSession {
     }
 
     fn tool_prompt_overhead(&self, tools: &[ToolDefinition]) -> u32 {
-        if tools.is_empty() || self.connector.providers.get(&self.primary).is_none_or(|provider| provider.capabilities().tool_calls) { return 0; }
+        if tools.is_empty()
+            || self
+                .connector
+                .providers
+                .get(&self.primary)
+                .is_none_or(|provider| provider.capabilities().tool_calls)
+        {
+            return 0;
+        }
         let message = StandardMessage::system(crate::function_calling::render_tools_prompt(tools));
-        serde_json::to_vec(&message).map_or(u32::MAX, |bytes| u32::try_from(bytes.len()).unwrap_or(u32::MAX).saturating_add(4))
+        serde_json::to_vec(&message).map_or(u32::MAX, |bytes| {
+            u32::try_from(bytes.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(4)
+        })
     }
 
     fn validate_tool_policy(&self, tools: &[ToolDefinition]) -> Result<(), ConnectorError> {
-        self.connector.validate_primary_tool_policy(&self.primary, tools)
+        self.connector
+            .validate_primary_tool_policy(&self.primary, tools)
     }
 
     fn last_attribution(&self) -> Option<(ProviderId, String)> {
@@ -2664,8 +2743,11 @@ mod tests {
     }
 
     fn policy_tools() -> Vec<ToolDefinition> {
-        vec![ToolDefinition { name: "lookup".into(), description: "bounded lookup".into(),
-            parameters: serde_json::json!({"type":"object","properties":{}}) }]
+        vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "bounded lookup".into(),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        }]
     }
 
     #[tokio::test]
@@ -2673,19 +2755,47 @@ mod tests {
         let connector = fast_connector();
         let primary_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let backup_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let mut primary = qualification_adapter("primary", ProviderType::Cloud, "primary-model", None, primary_attempts.clone());
+        let mut primary = qualification_adapter(
+            "primary",
+            ProviderType::Cloud,
+            "primary-model",
+            None,
+            primary_attempts.clone(),
+        );
         primary.capabilities.tool_calls = false;
         connector.register_provider(Arc::new(primary)).unwrap();
-        connector.register_provider(Arc::new(qualification_adapter("backup", ProviderType::Cloud, "backup-model", None, backup_attempts.clone()))).unwrap();
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "backup",
+                ProviderType::Cloud,
+                "backup-model",
+                None,
+                backup_attempts.clone(),
+            )))
+            .unwrap();
         connector.set_backup(&"primary".into(), &"backup".into());
-        connector.set_routing_policy(&"primary".into(), ProviderRoutingPolicy {
-            tool_incompatible_primary: ToolIncompatiblePrimaryPolicy::Reject, ..Default::default()
-        });
-        let error = connector.send_with_failover(&"primary".into(), vec![StandardMessage::user("private prompt")],
-            &policy_tools(), SendMode::NonStreaming).await.unwrap_err();
+        connector.set_routing_policy(
+            &"primary".into(),
+            ProviderRoutingPolicy {
+                tool_incompatible_primary: ToolIncompatiblePrimaryPolicy::Reject,
+                ..Default::default()
+            },
+        );
+        let error = connector
+            .send_with_failover(
+                &"primary".into(),
+                vec![StandardMessage::user("private prompt")],
+                &policy_tools(),
+                SendMode::NonStreaming,
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(error, ConnectorError::ToolIncompatiblePrimary(_)));
         assert!(!error.to_string().contains("private prompt"));
-        assert_eq!(primary_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            primary_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
         assert_eq!(backup_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -2695,15 +2805,27 @@ mod tests {
         let audit = Arc::new(crate::observability::ObservabilityEngineImpl::new());
         connector.set_degradation_audit_sink(audit.clone());
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let mut adapter = qualification_adapter("primary", ProviderType::Cloud, "fixture-model", None, calls.clone());
+        let mut adapter = qualification_adapter(
+            "primary",
+            ProviderType::Cloud,
+            "fixture-model",
+            None,
+            calls.clone(),
+        );
         adapter.capabilities.tool_calls = false;
         connector.register_provider(Arc::new(adapter)).unwrap();
         let owner = uuid::Uuid::new_v4();
-        let session = connector.connect_resilient(owner, &"primary".into()).await.unwrap();
+        let session = connector
+            .connect_resilient(owner, &"primary".into())
+            .await
+            .unwrap();
         let tools = policy_tools();
         assert!(session.tool_prompt_overhead(&tools) > 0);
         for _ in 0..3 {
-            session.send_with_tools(vec![StandardMessage::user("hello")], &tools).await.unwrap();
+            session
+                .send_with_tools(vec![StandardMessage::user("hello")], &tools)
+                .await
+                .unwrap();
             let record = session.last_tool_degradation().unwrap();
             assert_eq!(record.provider_id, "primary");
             assert_eq!(record.model_id, "fixture-model");
@@ -2711,13 +2833,26 @@ mod tests {
         }
         use crate::observability::ObservabilityEngine;
         let records = audit.get_activity_log(owner, None);
-        assert_eq!(records.iter().filter(|record| record.action_type == "provider_tool_degradation").count(), 1);
-        let record: ProviderToolDegradation = serde_json::from_str(&records[0].description).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.action_type == "provider_tool_degradation")
+                .count(),
+            1
+        );
+        let record: ProviderToolDegradation =
+            serde_json::from_str(&records[0].description).unwrap();
         assert_eq!(record.model_id, "fixture-model");
-        session.send(vec![StandardMessage::user("no tools")]).await.unwrap();
+        session
+            .send(vec![StandardMessage::user("no tools")])
+            .await
+            .unwrap();
         assert!(session.last_tool_degradation().is_none());
-        let health = connector.provider_health();
-        assert_eq!(health[0].routing_policy.tool_incompatible_primary, ToolIncompatiblePrimaryPolicy::DegradedShim);
+        let health = connector.list_providers();
+        assert_eq!(
+            health[0].routing_policy.tool_incompatible_primary,
+            ToolIncompatiblePrimaryPolicy::DegradedShim
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
@@ -2726,15 +2861,27 @@ mod tests {
         let connector = Arc::new(fast_connector());
         let audit = Arc::new(crate::observability::ObservabilityEngineImpl::new());
         connector.set_degradation_audit_sink(audit.clone());
-        connector.register_provider(Arc::new(qualification_adapter("native", ProviderType::Cloud,
-            "native-model", None, Arc::new(std::sync::atomic::AtomicU32::new(0))))).unwrap();
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "native",
+                ProviderType::Cloud,
+                "native-model",
+                None,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )))
+            .unwrap();
         let owner = uuid::Uuid::new_v4();
-        let session = connector.connect_resilient(owner, &"native".into()).await.unwrap();
-        session.send_with_tools(vec![StandardMessage::user("hello")], &policy_tools()).await.unwrap();
+        let session = connector
+            .connect_resilient(owner, &"native".into())
+            .await
+            .unwrap();
+        session
+            .send_with_tools(vec![StandardMessage::user("hello")], &policy_tools())
+            .await
+            .unwrap();
         assert!(session.last_tool_degradation().is_none());
         assert_eq!(session.tool_prompt_overhead(&policy_tools()), 0);
         use crate::observability::ObservabilityEngine;
         assert!(audit.get_activity_log(owner, None).is_empty());
     }
-
 }

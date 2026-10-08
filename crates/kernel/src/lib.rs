@@ -1460,7 +1460,9 @@ impl AgentKernelImpl {
         )?;
         kernel.backup_maintenance.configure(config.backup.clone())?;
         for (provider, policy) in &config.provider_routing {
-            kernel.connector.set_routing_policy(provider, policy.clone());
+            kernel
+                .connector
+                .set_routing_policy(provider, policy.clone());
         }
         if let Some(service_dir) = &config.service_dir {
             *kernel
@@ -5175,8 +5177,12 @@ impl AgentKernelImpl {
             .agent_manager
             .get_agent_provider(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
-        let tools = self.tool_registry.definitions_for_agent(&self.syscall_gate, agent_id);
-        self.connector.validate_primary_tool_policy(&provider_id, &tools).map_err(KernelError::Connector)?;
+        let tools = self
+            .tool_registry
+            .definitions_for_agent(&self.syscall_gate, agent_id);
+        self.connector
+            .validate_primary_tool_policy(&provider_id, &tools)
+            .map_err(KernelError::Connector)?;
         let restored_history = self.context_manager.latest_execution_history(agent_id)?;
         let session = self
             .connector
@@ -5259,9 +5265,18 @@ impl AgentKernelImpl {
                 .usage
                 .charged_cost_micros
                 .saturating_sub(baseline_usage.charged_cost_micros),
-            degraded_requests: output.usage.degraded_requests.saturating_sub(baseline_usage.degraded_requests),
-            dropped_native_tool_definitions: output.usage.dropped_native_tool_definitions.saturating_sub(baseline_usage.dropped_native_tool_definitions),
-            shim_recovered_tool_calls: output.usage.shim_recovered_tool_calls.saturating_sub(baseline_usage.shim_recovered_tool_calls),
+            degraded_requests: output
+                .usage
+                .degraded_requests
+                .saturating_sub(baseline_usage.degraded_requests),
+            dropped_native_tool_definitions: output
+                .usage
+                .dropped_native_tool_definitions
+                .saturating_sub(baseline_usage.dropped_native_tool_definitions),
+            shim_recovered_tool_calls: output
+                .usage
+                .shim_recovered_tool_calls
+                .saturating_sub(baseline_usage.shim_recovered_tool_calls),
         };
         self.agent_manager.record_activity(agent_id);
         ObservabilityEngine::record_metrics(

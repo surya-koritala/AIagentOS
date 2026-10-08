@@ -148,13 +148,17 @@ pub struct UsageTelemetry {
     pub shim_recovered_tool_calls: u32,
 }
 
-fn is_zero(value: &u32) -> bool { *value == 0 }
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
 
 impl UsageTelemetry {
     fn record(&mut self, call: &ProviderCall) {
         if let Some(record) = &call.tool_degradation {
             self.degraded_requests = self.degraded_requests.saturating_add(1);
-            self.dropped_native_tool_definitions = self.dropped_native_tool_definitions.saturating_add(record.dropped_tool_count);
+            self.dropped_native_tool_definitions = self
+                .dropped_native_tool_definitions
+                .saturating_add(record.dropped_tool_count);
         }
         self.input_tokens = self.input_tokens.saturating_add(call.usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(call.usage.output_tokens);
@@ -419,7 +423,9 @@ impl AgentExecutor {
         &mut self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<(), KernelError> {
-        self.session.validate_tool_policy(tools).map_err(KernelError::Connector)?;
+        self.session
+            .validate_tool_policy(tools)
+            .map_err(KernelError::Connector)?;
         let budget = self.context_budget_tokens;
         if budget == 0 {
             return Ok(());
@@ -982,7 +988,9 @@ impl AgentExecutor {
             let mut tool_calls = response.tool_calls.clone();
             if tool_calls.is_empty() && response.provider_metadata.is_none() {
                 tool_calls = crate::function_calling::parse_tool_calls(&response.content);
-                usage.shim_recovered_tool_calls = usage.shim_recovered_tool_calls.saturating_add(u32::try_from(tool_calls.len()).unwrap_or(u32::MAX));
+                usage.shim_recovered_tool_calls = usage
+                    .shim_recovered_tool_calls
+                    .saturating_add(u32::try_from(tool_calls.len()).unwrap_or(u32::MAX));
             }
 
             // If no tool calls (native or shim-recovered), we're done — return content
@@ -1156,7 +1164,9 @@ impl AgentExecutor {
         &self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<ProviderCall, KernelError> {
-        self.session.validate_tool_policy(tools).map_err(KernelError::Connector)?;
+        self.session
+            .validate_tool_policy(tools)
+            .map_err(KernelError::Connector)?;
         if self.max_output_tokens_per_request > 0 && !self.session.enforces_max_output_tokens() {
             return Err(KernelError::Policy(format!(
                 "provider session {}/{} does not enforce the configured max_output_tokens_per_request={}; bounded token admission refuses to call it",

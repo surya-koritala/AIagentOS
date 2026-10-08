@@ -7425,10 +7425,15 @@ mod tests {
     #[test]
     fn primary_tool_policy_rejection_is_permanent_on_the_wire() {
         let error = crate::ConnectorError::ToolIncompatiblePrimary(crate::ProviderErrorContext {
-            provider: "fixture".into(), message: "operator rejects degraded tools".into(), request_id: None,
+            provider: "fixture".into(),
+            message: "operator rejects degraded tools".into(),
+            request_id: None,
         });
         assert!(!crate::connector::is_transient(&error));
-        assert_eq!(WireErrorCode::classify(&crate::KernelError::Connector(error).to_string()), (WireErrorCode::Provider, false));
+        assert_eq!(
+            WireErrorCode::classify(&crate::KernelError::Connector(error).to_string()),
+            (WireErrorCode::Provider, false)
+        );
     }
 
     #[test]

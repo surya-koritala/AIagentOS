@@ -707,7 +707,11 @@ fn cached_cosine(query: &[f32], query_norm: f32, vector: &[f32], norm: f32) -> f
 }
 
 fn score_order(a: &(u64, f32), b: &(u64, f32)) -> std::cmp::Ordering {
-    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal),
+    }
 }
 
 /// Rank `(item, embedding)` pairs against a `query` embedding and return the top
@@ -792,6 +796,32 @@ impl MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undefined_cosine_scores_sort_last_with_stable_ties() {
+        // Finite vectors can still overflow the f32 norm/dot accumulators.
+        let query = [1.0; 32];
+        let mut indexes: Vec<Box<dyn VectorIndex>> = vec![
+            Box::new(BruteForceIndex::new()),
+            Box::new(LshIndex::with_dim(32)),
+        ];
+        for index in &mut indexes {
+            index.add(7, vec![f32::MAX; 32]);
+            index.add(2, query.to_vec());
+            index.add(99, vec![f32::MAX; 32]);
+            let first = index.search(&query, 3);
+            let second = index.search(&query, 3);
+            assert_eq!(
+                first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![2, 7, 99]
+            );
+            assert_eq!(
+                second.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![2, 7, 99]
+            );
+            assert_eq!(index.search(&query, 1)[0].0, 2);
+        }
+    }
 
     #[test]
     fn compressed_candidate_union_preserves_original_probe_and_overwrite_results() {

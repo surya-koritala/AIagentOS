@@ -33,12 +33,16 @@ fn main() {
     let client =
         tauri::async_runtime::block_on(DesktopClient::connect_embedded(Arc::clone(&kernel)))
             .expect("Failed to start authenticated desktop kernel client");
-    let peripheral_operator = kernel.attach_local_peripheral_operator()
+    let peripheral_operator = kernel
+        .attach_local_peripheral_operator()
         .expect("Failed to attach native peripheral operator");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(AppState { client, peripheral_operator: Some(peripheral_operator) })
+        .manage(AppState {
+            client,
+            peripheral_operator: Some(peripheral_operator),
+        })
         .manage(DesktopUpdateState::default())
         .invoke_handler(tauri::generate_handler![
             commands::create_agent,

@@ -917,28 +917,42 @@ impl AppState {
     }
 
     pub fn approve_peripheral_request(&self, request_id: &str) -> Result<(), String> {
-        self.local_peripheral_operator()?.approve(parse_peripheral_request(request_id)?)
+        self.local_peripheral_operator()?
+            .approve(parse_peripheral_request(request_id)?)
             .map_err(|_| "peripheral request cannot be approved".into())
     }
 
     pub fn deny_peripheral_request(&self, request_id: &str) -> Result<(), String> {
-        self.local_peripheral_operator()?.deny(parse_peripheral_request(request_id)?)
+        self.local_peripheral_operator()?
+            .deny(parse_peripheral_request(request_id)?)
             .map_err(|_| "peripheral request cannot be denied".into())
     }
 
-    pub fn revoke_peripheral_request(&self, request_id: &str) -> Result<DesktopPeripheralRevocation, String> {
-        let result = self.local_peripheral_operator()?.revoke(parse_peripheral_request(request_id)?)
+    pub fn revoke_peripheral_request(
+        &self,
+        request_id: &str,
+    ) -> Result<DesktopPeripheralRevocation, String> {
+        let result = self
+            .local_peripheral_operator()?
+            .revoke(parse_peripheral_request(request_id)?)
             .map_err(|_| "peripheral request cannot be revoked".to_string())?;
-        Ok(DesktopPeripheralRevocation { pending_grant_revoked: result.pending_grant_revoked, active_uses_cancelled: result.active_uses_cancelled })
+        Ok(DesktopPeripheralRevocation {
+            pending_grant_revoked: result.pending_grant_revoked,
+            active_uses_cancelled: result.active_uses_cancelled,
+        })
     }
 
     fn local_peripheral_operator(&self) -> Result<&kernel::LocalPeripheralOperator, String> {
-        self.peripheral_operator.as_ref().ok_or_else(|| "peripheral approval requires the embedded desktop kernel".into())
+        self.peripheral_operator
+            .as_ref()
+            .ok_or_else(|| "peripheral approval requires the embedded desktop kernel".into())
     }
 }
 
 fn parse_peripheral_request(request_id: &str) -> Result<uuid::Uuid, String> {
-    if request_id.len() != 36 { return Err("invalid peripheral request identity".into()); }
+    if request_id.len() != 36 {
+        return Err("invalid peripheral request identity".into());
+    }
     uuid::Uuid::parse_str(request_id).map_err(|_| "invalid peripheral request identity".into())
 }
 
@@ -946,8 +960,11 @@ fn parse_peripheral_request(request_id: &str) -> Result<uuid::Uuid, String> {
 /// navigation or auxiliary window. Development has the explicit configured
 /// localhost origin; production does not accept it.
 pub fn trusted_peripheral_window(label: &str, origin: &str) -> bool {
-    label == "main" && (matches!(origin, "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost")
-        || cfg!(debug_assertions) && origin == "http://localhost:1420")
+    label == "main"
+        && (matches!(
+            origin,
+            "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+        ) || cfg!(debug_assertions) && origin == "http://localhost:1420")
 }
 
 /// Process-local guard preventing concurrent native updater installations.

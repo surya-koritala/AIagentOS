@@ -1,7 +1,7 @@
 //! Process-local human approval handoff for exact peripheral contracts.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -73,7 +73,10 @@ impl Request {
 
     fn cancel(&self, gate: &SyscallGate, reason: PeripheralRequestStatus) {
         let mut status = self.status.lock().unwrap();
-        if matches!(*status, PeripheralRequestStatus::AwaitingApproval | PeripheralRequestStatus::Approved) {
+        if matches!(
+            *status,
+            PeripheralRequestStatus::AwaitingApproval | PeripheralRequestStatus::Approved
+        ) {
             gate.local_peripheral_contract(self.contract(), LocalPeripheralAction::Revoke);
             *status = reason;
             self.decision.send_replace(reason);
@@ -96,37 +99,67 @@ impl PeripheralRequests {
         identity: &str,
         registration: u64,
     ) -> Option<PendingPeripheralResume<'a>> {
-        if !self.attached.load(Ordering::SeqCst) || prepared.authorization.resource.len() > MAX_TARGET_BYTES
-            || name.len() > 128 || name.chars().any(char::is_control)
-            || gate.peripheral_registration(prepared.request.agent_id) != Some(registration) {
+        if !self.attached.load(Ordering::SeqCst)
+            || prepared.authorization.resource.len() > MAX_TARGET_BYTES
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+            || gate.peripheral_registration(prepared.request.agent_id) != Some(registration)
+        {
             return None;
         }
         let (decision, mut receiver) = watch::channel(PeripheralRequestStatus::AwaitingApproval);
         let request = Arc::new(Request {
-            id: uuid::Uuid::new_v4(), agent: prepared.request.agent_id,
-            registration, binding: prepared.binding_identity, tool: name.to_string(),
-            resource: prepared.authorization.resource.clone(), digest: prepared.approval_contract_digest.clone(),
-            activity: crate::resources::peripheral_activity_identity(name, &prepared.approval_contract_digest, identity),
+            id: uuid::Uuid::new_v4(),
+            agent: prepared.request.agent_id,
+            registration,
+            binding: prepared.binding_identity,
+            tool: name.to_string(),
+            resource: prepared.authorization.resource.clone(),
+            digest: prepared.approval_contract_digest.clone(),
+            activity: crate::resources::peripheral_activity_identity(
+                name,
+                &prepared.approval_contract_digest,
+                identity,
+            ),
             required: prepared.authorization.security.approval_policy,
-            status: Mutex::new(PeripheralRequestStatus::AwaitingApproval), decision,
+            status: Mutex::new(PeripheralRequestStatus::AwaitingApproval),
+            decision,
         });
         {
             let mut records = self.records.lock().unwrap();
-            if !self.attached.load(Ordering::SeqCst) { return None; }
+            if !self.attached.load(Ordering::SeqCst) {
+                return None;
+            }
             if records.len() == MAX_REQUESTS {
                 // Never evict a waiter, an unconsumed grant, or an active use.
                 if let Some(index) = records.iter().position(|record| {
                     *record.status.lock().unwrap() != PeripheralRequestStatus::AwaitingApproval
-                        && self.gate.local_peripheral_contract(record.contract(), LocalPeripheralAction::Inspect).is_none_or(|(pending, active)| !pending && active == 0)
-                }) { records.remove(index); } else { return None; }
+                        && self
+                            .gate
+                            .local_peripheral_contract(
+                                record.contract(),
+                                LocalPeripheralAction::Inspect,
+                            )
+                            .is_none_or(|(pending, active)| !pending && active == 0)
+                }) {
+                    records.remove(index);
+                } else {
+                    return None;
+                }
             }
             records.push(Arc::clone(&request));
         }
-        let waiting = PendingPeripheralResume { request: Arc::clone(&request), gate, admitted: false };
+        let waiting = PendingPeripheralResume {
+            request: Arc::clone(&request),
+            gate,
+            admitted: false,
+        };
         let result = tokio::time::timeout(APPROVAL_WAIT, receiver.changed()).await;
         let approved = result.is_ok_and(|result| result.is_ok())
             && *receiver.borrow() == PeripheralRequestStatus::Approved;
-        if approved { Some(waiting) } else {
+        if approved {
+            Some(waiting)
+        } else {
             request.cancel(gate, PeripheralRequestStatus::Expired);
             None
         }
@@ -140,7 +173,12 @@ impl PeripheralRequests {
     }
 
     fn find(&self, id: uuid::Uuid) -> Result<Arc<Request>, KernelError> {
-        self.records.lock().unwrap().iter().find(|record| record.id == id).cloned()
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|record| record.id == id)
+            .cloned()
             .ok_or_else(|| KernelError::Policy("peripheral request is unavailable".into()))
     }
 }
@@ -153,7 +191,10 @@ pub(crate) struct PendingPeripheralResume<'a> {
 
 impl Drop for PendingPeripheralResume<'_> {
     fn drop(&mut self) {
-        if !self.admitted { self.request.cancel(self.gate, PeripheralRequestStatus::Cancelled); }
+        if !self.admitted {
+            self.request
+                .cancel(self.gate, PeripheralRequestStatus::Cancelled);
+        }
     }
 }
 
@@ -166,10 +207,18 @@ pub struct LocalPeripheralOperator {
 
 impl LocalPeripheralOperator {
     pub(crate) fn attach(kernel: Arc<AgentKernelImpl>) -> Result<Self, KernelError> {
-        let requests = Arc::new(PeripheralRequests { gate: Arc::clone(&kernel.syscall_gate), records: Mutex::new(Vec::new()), attached: AtomicBool::new(true) });
+        let requests = Arc::new(PeripheralRequests {
+            gate: Arc::clone(&kernel.syscall_gate),
+            records: Mutex::new(Vec::new()),
+            attached: AtomicBool::new(true),
+        });
         {
             let mut local = kernel.tool_registry.local_peripheral.lock().unwrap();
-            if local.upgrade().is_some() { return Err(KernelError::Policy("local peripheral operator already attached".into())); }
+            if local.upgrade().is_some() {
+                return Err(KernelError::Policy(
+                    "local peripheral operator already attached".into(),
+                ));
+            }
             *local = Arc::downgrade(&requests);
         }
         Ok(Self { kernel, requests })
@@ -177,21 +226,51 @@ impl LocalPeripheralOperator {
 
     pub fn requests(&self) -> Vec<PeripheralOperatorRequest> {
         let agents = self.kernel.agent_manager.list_agents(None);
-        self.requests.records.lock().unwrap().iter().map(|record| {
-            let recorded_status = record.status.lock().unwrap();
-            let state = self.kernel.syscall_gate.local_peripheral_contract(record.contract(), LocalPeripheralAction::Inspect);
-            let (grant_pending, active_uses) = state.unwrap_or((false, 0));
-            let mut status = *recorded_status;
-            if state.is_none() { status = PeripheralRequestStatus::Cancelled; }
-            else if status == PeripheralRequestStatus::Approved && !grant_pending && active_uses == 0 { status = PeripheralRequestStatus::Finished; }
-            let agent_name = agents.iter().find(|agent| agent.id == record.agent).map(|agent| agent.name.as_str()).unwrap_or("Stopped agent");
-            PeripheralOperatorRequest {
-                request_id: record.id, agent_id: record.agent,
-                agent_name: agent_name.chars().filter(|character| !character.is_control()).take(128).collect(),
-                tool_name: record.tool.clone(), resource_identity: crate::resources::opaque_identity(record.resource.as_bytes()),
-                required_policy: record.required, status, grant_pending, active_uses,
-            }
-        }).collect()
+        self.requests
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                let recorded_status = record.status.lock().unwrap();
+                let state = self
+                    .kernel
+                    .syscall_gate
+                    .local_peripheral_contract(record.contract(), LocalPeripheralAction::Inspect);
+                let (grant_pending, active_uses) = state.unwrap_or((false, 0));
+                let mut status = *recorded_status;
+                if state.is_none() {
+                    status = PeripheralRequestStatus::Cancelled;
+                } else if status == PeripheralRequestStatus::Approved
+                    && !grant_pending
+                    && active_uses == 0
+                {
+                    status = PeripheralRequestStatus::Finished;
+                }
+                let agent_name = agents
+                    .iter()
+                    .find(|agent| agent.id == record.agent)
+                    .map(|agent| agent.name.as_str())
+                    .unwrap_or("Stopped agent");
+                PeripheralOperatorRequest {
+                    request_id: record.id,
+                    agent_id: record.agent,
+                    agent_name: agent_name
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .take(128)
+                        .collect(),
+                    tool_name: record.tool.clone(),
+                    resource_identity: crate::resources::opaque_identity(
+                        record.resource.as_bytes(),
+                    ),
+                    required_policy: record.required,
+                    status,
+                    grant_pending,
+                    active_uses,
+                }
+            })
+            .collect()
     }
 
     /// One human decision issues the existing single-use gate grant. The
@@ -199,11 +278,25 @@ impl LocalPeripheralOperator {
     pub fn approve(&self, id: uuid::Uuid) -> Result<(), KernelError> {
         let request = self.requests.find(id)?;
         let mut status = request.status.lock().unwrap();
-        if *status != PeripheralRequestStatus::AwaitingApproval { return Err(KernelError::Policy("peripheral request is no longer awaiting approval".into())); }
-        let granted = self.kernel.tool_registry.with_peripheral_binding(&request.tool, request.binding, || {
-            self.kernel.syscall_gate.local_peripheral_contract(request.contract(), LocalPeripheralAction::Approve)
-        }).flatten();
-        if granted.is_none() { return Err(KernelError::Policy("peripheral request authority changed".into())); }
+        if *status != PeripheralRequestStatus::AwaitingApproval {
+            return Err(KernelError::Policy(
+                "peripheral request is no longer awaiting approval".into(),
+            ));
+        }
+        let granted = self
+            .kernel
+            .tool_registry
+            .with_peripheral_binding(&request.tool, request.binding, || {
+                self.kernel
+                    .syscall_gate
+                    .local_peripheral_contract(request.contract(), LocalPeripheralAction::Approve)
+            })
+            .flatten();
+        if granted.is_none() {
+            return Err(KernelError::Policy(
+                "peripheral request authority changed".into(),
+            ));
+        }
         *status = PeripheralRequestStatus::Approved;
         request.decision.send_replace(*status);
         Ok(())
@@ -212,7 +305,11 @@ impl LocalPeripheralOperator {
     pub fn deny(&self, id: uuid::Uuid) -> Result<(), KernelError> {
         let request = self.requests.find(id)?;
         let mut status = request.status.lock().unwrap();
-        if *status != PeripheralRequestStatus::AwaitingApproval { return Err(KernelError::Policy("peripheral request is no longer awaiting approval".into())); }
+        if *status != PeripheralRequestStatus::AwaitingApproval {
+            return Err(KernelError::Policy(
+                "peripheral request is no longer awaiting approval".into(),
+            ));
+        }
         *status = PeripheralRequestStatus::Denied;
         request.decision.send_replace(*status);
         Ok(())
@@ -223,10 +320,17 @@ impl LocalPeripheralOperator {
     pub fn revoke(&self, id: uuid::Uuid) -> Result<PeripheralRevocation, KernelError> {
         let request = self.requests.find(id)?;
         let mut status = request.status.lock().unwrap();
-        let (pending_grant_revoked, active_uses_cancelled) = self.kernel.syscall_gate.local_peripheral_contract(request.contract(), LocalPeripheralAction::Revoke).unwrap_or((false, 0));
+        let (pending_grant_revoked, active_uses_cancelled) = self
+            .kernel
+            .syscall_gate
+            .local_peripheral_contract(request.contract(), LocalPeripheralAction::Revoke)
+            .unwrap_or((false, 0));
         *status = PeripheralRequestStatus::Revoked;
         request.decision.send_replace(*status);
-        Ok(PeripheralRevocation { pending_grant_revoked, active_uses_cancelled })
+        Ok(PeripheralRevocation {
+            pending_grant_revoked,
+            active_uses_cancelled,
+        })
     }
 }
 
@@ -234,6 +338,11 @@ impl Drop for LocalPeripheralOperator {
     fn drop(&mut self) {
         self.requests.attached.store(false, Ordering::SeqCst);
         let records = self.requests.records.lock().unwrap().clone();
-        for record in records { record.cancel(&self.kernel.syscall_gate, PeripheralRequestStatus::Cancelled); }
+        for record in records {
+            record.cancel(
+                &self.kernel.syscall_gate,
+                PeripheralRequestStatus::Cancelled,
+            );
+        }
     }
 }

@@ -1228,7 +1228,9 @@ impl SyscallGate {
 
     pub(crate) fn peripheral_registration(&self, kid: uuid::Uuid) -> Option<u64> {
         let _mutation = self.mutation_lock.lock().unwrap();
-        self.records.get(&kid).filter(|record| record.accepting_tool_calls)
+        self.records
+            .get(&kid)
+            .filter(|record| record.accepting_tool_calls)
             .map(|record| record.registration_revision)
     }
 
@@ -1246,17 +1248,32 @@ impl SyscallGate {
             return None;
         }
         let key = (
-            contract.agent_id, contract.registration, contract.tool_name.to_string(),
-            crate::resources::opaque_identity(contract.resource.as_bytes()), contract.contract.to_string(),
+            contract.agent_id,
+            contract.registration,
+            contract.tool_name.to_string(),
+            crate::resources::opaque_identity(contract.resource.as_bytes()),
+            contract.contract.to_string(),
         );
-        let tokens = self.peripheral_activity.iter().filter_map(|entry| {
-            let (agent, identity, _) = entry.key();
-            (*agent == contract.agent_id && identity == contract.activity).then(|| entry.value().clone())
-        }).collect::<Vec<_>>();
+        let tokens = self
+            .peripheral_activity
+            .iter()
+            .filter_map(|entry| {
+                let (agent, identity, _) = entry.key();
+                (*agent == contract.agent_id && identity == contract.activity)
+                    .then(|| entry.value().clone())
+            })
+            .collect::<Vec<_>>();
         match action {
-            LocalPeripheralAction::Inspect => Some((self.approvals.get(&key).is_some_and(|approval| (*approval).satisfies(contract.required)), tokens.len())),
+            LocalPeripheralAction::Inspect => Some((
+                self.approvals
+                    .get(&key)
+                    .is_some_and(|approval| (*approval).satisfies(contract.required)),
+                tokens.len(),
+            )),
             LocalPeripheralAction::Approve => {
-                if !record.accepting_tool_calls || contract.required == crate::tools::ApprovalPolicy::None {
+                if !record.accepting_tool_calls
+                    || contract.required == crate::tools::ApprovalPolicy::None
+                {
                     return None;
                 }
                 self.approvals.insert(key, contract.required);
@@ -1264,7 +1281,9 @@ impl SyscallGate {
             }
             LocalPeripheralAction::Revoke => {
                 let revoked = self.approvals.remove(&key).is_some();
-                for token in &tokens { token.cancel(); }
+                for token in &tokens {
+                    token.cancel();
+                }
                 Some((revoked, tokens.len()))
             }
         }
@@ -1527,9 +1546,14 @@ impl SyscallGate {
             )
             .await?;
         if let Some(expected) = expected_registration {
-            let observed = authorized.snapshot.as_ref().map(|snapshot| snapshot.registration_revision)
+            let observed = authorized
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.registration_revision)
                 .or_else(|| self.peripheral_registration(kid));
-            if observed != Some(expected) { return Err(GateDenial::AuthorizationStateChanged); }
+            if observed != Some(expected) {
+                return Err(GateDenial::AuthorizationStateChanged);
+            }
         }
         let guard = if self.unconfined {
             self.cgroups

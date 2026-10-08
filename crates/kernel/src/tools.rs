@@ -408,7 +408,8 @@ pub struct ToolRegistry {
     binding_ids: DashMap<String, uuid::Uuid>,
     /// Command templates for custom tools: name -> (command, args_template)
     command_templates: DashMap<String, (String, Vec<String>)>,
-    pub(crate) local_peripheral: std::sync::Mutex<std::sync::Weak<crate::peripheral_operator::PeripheralRequests>>,
+    pub(crate) local_peripheral:
+        std::sync::Mutex<std::sync::Weak<crate::peripheral_operator::PeripheralRequests>>,
 }
 
 impl Default for ToolRegistry {
@@ -1077,32 +1078,42 @@ impl ToolRegistry {
             .await;
         let admission = match admission {
             Err(crate::syscall_gate::GateDenial::ApprovalRequired { .. })
-                if prepared.request.resource_type == ResourceType::Peripheral => {
+                if prepared.request.resource_type == ResourceType::Peripheral =>
+            {
                 let requests = self.local_peripheral.lock().unwrap().upgrade();
                 if let (Some(requests), Some(registration)) = (requests, registration) {
-                    if let Some(mut approval) = requests.wait_for_approval(gate, name, &prepared, &request_identity, registration).await {
+                    if let Some(mut approval) = requests
+                        .wait_for_approval(gate, name, &prepared, &request_identity, registration)
+                        .await
+                    {
                         // The immutable request is admitted by the same gate again.
                         // No slot or provider task exists while a human decides.
-                        let result = gate.authorize_and_acquire_tool_call_declared_contract(
-                            agent_id, name, &prepared.authorization.resource,
-                            &prepared.authorization.security,
-                            crate::syscall_gate::GateAdmissionContract {
-                                approval_contract: &prepared.approval_contract_digest,
-                                request_identity: &request_identity,
-                                track_peripheral_activity: true,
-                                expected_registration: Some(registration),
-                            },
-                        ).await;
+                        let result = gate
+                            .authorize_and_acquire_tool_call_declared_contract(
+                                agent_id,
+                                name,
+                                &prepared.authorization.resource,
+                                &prepared.authorization.security,
+                                crate::syscall_gate::GateAdmissionContract {
+                                    approval_contract: &prepared.approval_contract_digest,
+                                    request_identity: &request_identity,
+                                    track_peripheral_activity: true,
+                                    expected_registration: Some(registration),
+                                },
+                            )
+                            .await;
                         approval.admitted = result.is_ok();
                         result
                     } else {
                         Err(crate::syscall_gate::GateDenial::ApprovalRequired {
-                            tool: name.to_string(), policy: prepared.authorization.security.approval_policy,
+                            tool: name.to_string(),
+                            policy: prepared.authorization.security.approval_policy,
                         })
                     }
                 } else {
                     Err(crate::syscall_gate::GateDenial::ApprovalRequired {
-                        tool: name.to_string(), policy: prepared.authorization.security.approval_policy,
+                        tool: name.to_string(),
+                        policy: prepared.authorization.security.approval_policy,
                     })
                 }
             }
@@ -1119,9 +1130,18 @@ impl ToolRegistry {
         }
     }
 
-    pub(crate) fn with_peripheral_binding<T>(&self, name: &str, binding: uuid::Uuid, action: impl FnOnce() -> T) -> Option<T> {
+    pub(crate) fn with_peripheral_binding<T>(
+        &self,
+        name: &str,
+        binding: uuid::Uuid,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
         let _publication = self.publication.read().ok()?;
-        if self.binding_ids.get(name).is_none_or(|current| *current != binding) {
+        if self
+            .binding_ids
+            .get(name)
+            .is_none_or(|current| *current != binding)
+        {
             return None;
         }
         Some(action())

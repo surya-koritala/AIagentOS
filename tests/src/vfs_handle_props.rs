@@ -311,7 +311,11 @@ async fn verify_sequence(sequence: Vec<(u8, usize, u8)>) {
     }
     for actor in &actors {
         assert_eq!(client.vfs_mounts(actor).await.unwrap().open_handles, 0);
+        client.stop_agent(actor).await.unwrap();
+        assert_eq!(client.agent_status(actor).await.unwrap(), "Stopped");
     }
+    client.stop_agent(&controller).await.unwrap();
+    assert_eq!(client.agent_status(&controller).await.unwrap(), "Stopped");
     client.close().await.unwrap();
     server_task.abort();
     let _ = server_task.await;

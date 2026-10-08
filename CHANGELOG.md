@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Add native Windows public-wire junction escape, live reparse replacement and
+  capability retirement fixtures, preserving native no-follow/share controls and
+  checking real outside data and directory release. Generated handle cases now
+  stop their final actors/controller through the SDK. Relates #392; broader
+  independent security/filesystem qualification remains open.
+
 - Added public-wire VFS acceptance proof pairing stale descriptor rejection with
   fresh real reads by the same restored owner, and verifying that authorized COW
   cloning inherits no live tool/workspace/memory/KV/IPC handles or attenuated

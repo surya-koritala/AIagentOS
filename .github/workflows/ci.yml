@@ -190,8 +190,6 @@ jobs:
   frontend:
     name: Frontend build and vulnerability gate
     runs-on: ubuntu-latest
-    env:
-      PERIPHERAL_QA_DIR: ${{ runner.temp }}/peripheral-ui-qa
     defaults:
       run:
         working-directory: crates/tauri-app/ui
@@ -215,6 +213,7 @@ jobs:
       - name: Rendered production UI accessibility regressions
         env:
           PERIPHERAL_FEATURE_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+          PERIPHERAL_QA_DIR: ${{ runner.temp }}/peripheral-ui-qa
         run: |
           mkdir -p "$PERIPHERAL_QA_DIR"
           git rev-parse HEAD > "$PERIPHERAL_QA_DIR/checked-out-source.txt"

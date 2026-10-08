@@ -489,10 +489,14 @@ impl ProviderTaskGuard {
         parameters: serde_json::Value,
         permit: OwnedSemaphorePermit,
         cancellation: CancellationToken,
+        peripheral: bool,
     ) -> Self {
         let provider_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
             let _permit = permit;
+            if peripheral && provider_cancellation.is_cancelled() {
+                return Err(ResourceError::OperationFailed("peripheral use revoked".into()));
+            }
             provider
                 .execute_controlled(&operation, &parameters, &provider_cancellation)
                 .await
@@ -1079,6 +1083,7 @@ impl ResourceBrokerImpl {
                     .take()
                     .expect("generic provider execution owns its admission permit"),
                 provider_cancellation,
+                request.resource_type == ResourceType::Peripheral,
             );
             match tokio::time::timeout(PROVIDER_EXECUTION_TIMEOUT, task.join()).await {
                 Ok(result) => {

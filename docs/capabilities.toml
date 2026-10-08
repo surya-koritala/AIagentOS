@@ -396,6 +396,8 @@ test_evidence = [
   "crates/kernel/src/lib.rs::tests::local_peripheral_waiters_are_bounded_and_cancel_with_their_call_or_host",
   "crates/kernel/src/lib.rs::tests::local_peripheral_approval_rechecks_binding_policy_and_agent_lifecycle",
   "crates/kernel/src/lib.rs::tests::local_peripheral_kill_cancels_active_and_waiting_requests_in_the_operator_view",
+  "crates/kernel/src/lib.rs::tests::local_peripheral_binding_revocation_fences_approved_retry_and_provider_dispatch",
+  "crates/kernel/src/lib.rs::tests::local_peripheral_concurrent_approve_and_unregister_remain_live_and_fail_closed",
   "crates/tauri-app/src/peripheral_tests.rs::desktop_peripheral_stub_transcript_proves_pending_active_exact_revocation_and_stop",
   "tests/src/capability_registry.rs::peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant",
   "crates/kernel/src/lib.rs::tests::builtin_network_provider_bounds_data_and_rejects_ambient_channels",

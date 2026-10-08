@@ -8413,6 +8413,14 @@ mod tests {
     async fn local_peripheral_approval_rechecks_binding_policy_and_agent_lifecycle() {
         let kernel = Arc::new(AgentKernelImpl::new().unwrap());
         register_revocable_camera(&kernel, Arc::new(tokio::sync::Notify::new()));
+        kernel.tool_registry.register(crate::tools::ToolBinding {
+            name: "capture_camera_scoped".into(), description: "CI explicitly capability-scoped camera".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {"device": {"type": "string"}}, "required": ["device"]}),
+            resource_type: crate::resources::ResourceType::Peripheral, operation: "capture_image".into(),
+            security: crate::tools::ToolSecurity::argument(crate::tools::SecurityAction::Read, "device")
+                .with_capability(crate::agent_struct::CapabilitySet::CAP_NET_ACCESS)
+                .with_approval(crate::tools::ApprovalPolicy::User).sandboxed(),
+        }).unwrap();
         let agent = kernel
             .create_agent_full(peripheral_test_config("fenced-camera"))
             .await
@@ -8433,7 +8441,8 @@ mod tests {
         let request = wait_local_peripheral_request(&operator, 1).await;
         kernel.tool_registry.unregister("capture_camera");
         assert!(operator.approve(request.request_id).is_err());
-        operator.deny(request.request_id).unwrap();
+        assert!(operator.deny(request.request_id).is_err());
+        assert_eq!(operator.requests()[0].status, PeripheralRequestStatus::Cancelled);
         assert!(waiting.await.unwrap().is_err());
 
         let caller = Arc::clone(&kernel);
@@ -8443,7 +8452,7 @@ mod tests {
                 .authorize_and_acquire_call(
                     &caller.syscall_gate,
                     agent.id,
-                    "capture_camera_alternate",
+                    "capture_camera_scoped",
                     &serde_json::json!({"device": "fenced-private-target"}),
                 )
                 .await
@@ -8453,7 +8462,7 @@ mod tests {
             .syscall_gate
             .set_capabilities(agent.id, crate::agent_struct::CapabilitySet::none());
         operator.approve(request.request_id).unwrap();
-        assert!(waiting.await.unwrap().is_err());
+        assert!(matches!(waiting.await.unwrap(), Err(crate::tools::ToolAuthorizationError::Denied(crate::syscall_gate::GateDenial::MissingCapability(crate::agent_struct::CapabilitySet::CAP_NET_ACCESS)))));
         assert!(!operator.requests()[1].grant_pending);
 
         kernel
@@ -8466,7 +8475,7 @@ mod tests {
                 .authorize_and_acquire_call(
                     &caller.syscall_gate,
                     agent.id,
-                    "capture_camera_alternate",
+                    "capture_camera_scoped",
                     &serde_json::json!({"device": "fenced-private-target"}),
                 )
                 .await
@@ -8533,6 +8542,143 @@ mod tests {
             == PeripheralRequestStatus::Cancelled
             && !request.grant_pending
             && request.active_uses == 0));
+    }
+
+    struct PeripheralCallbackCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::resources::ResourceProvider for PeripheralCallbackCounter {
+        fn resource_type(&self) -> crate::resources::ResourceType { crate::resources::ResourceType::Peripheral }
+        fn supported_operations(&self) -> Vec<String> { vec!["capture_image".into()] }
+        async fn execute(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
+            panic!("controlled callback required");
+        }
+        async fn execute_controlled(&self, _: &str, _: &serde_json::Value, _: &tokio_util::sync::CancellationToken) -> Result<serde_json::Value, ResourceError> {
+            // Deliberately counts entry before inspecting cancellation: the
+            // broker must refuse already-revoked admission before this callback.
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ResourceError::OperationFailed("peripheral use revoked".into()))
+        }
+    }
+
+    fn register_peripheral_race_binding(kernel: &AgentKernelImpl) {
+        kernel.tool_registry.register(crate::tools::ToolBinding {
+            name: "camera_race".into(), description: "CI peripheral registration fence".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {"device": {"type": "string"}}, "required": ["device"]}),
+            resource_type: crate::resources::ResourceType::Peripheral, operation: "capture_image".into(),
+            security: crate::tools::ToolSecurity::argument(crate::tools::SecurityAction::Read, "device")
+                .with_approval(crate::tools::ApprovalPolicy::User).sandboxed(),
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_peripheral_binding_revocation_fences_approved_retry_and_provider_dispatch() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        kernel.resource_broker.register_provider(Box::new(PeripheralCallbackCounter(Arc::clone(&callbacks)))).unwrap();
+        register_peripheral_race_binding(&kernel);
+        let agent = kernel.create_agent_full(peripheral_test_config("binding-race-camera")).await.unwrap();
+        let operator = kernel.attach_local_peripheral_operator().unwrap();
+        let caller = Arc::clone(&kernel);
+        let waiting = tokio::spawn(async move {
+            caller.tool_registry.authorize_and_acquire_call(&caller.syscall_gate, agent.id, "camera_race", &serde_json::json!({"device": "private-race-target"})).await
+        });
+        let request = wait_local_peripheral_request(&operator, 1).await;
+        operator.approve(request.request_id).unwrap();
+        assert!(operator.requests()[0].grant_pending);
+        // No await between approval and removal: revoke the unconsumed grant
+        // before the original waiter can repeat gate admission.
+        kernel.tool_registry.unregister("camera_race");
+        register_peripheral_race_binding(&kernel);
+        assert!(waiting.await.unwrap().is_err());
+        assert!(!operator.requests()[0].grant_pending);
+        assert_eq!(operator.requests()[0].status, PeripheralRequestStatus::Cancelled);
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let caller = Arc::clone(&kernel);
+        let admitted = tokio::spawn(async move {
+            caller.tool_registry.authorize_and_acquire_call(&caller.syscall_gate, agent.id, "camera_race", &serde_json::json!({"device": "private-race-target"})).await
+        });
+        let request = wait_local_peripheral_request(&operator, 2).await;
+        operator.approve(request.request_id).unwrap();
+        let (prepared, slot) = admitted.await.unwrap().unwrap();
+        assert_eq!(operator.requests()[1].active_uses, 1);
+        // Admission has issued its owned lease, but no provider callback has
+        // run. Removal cancels that exact lease before broker dispatch.
+        kernel.tool_registry.unregister("camera_race");
+        register_peripheral_race_binding(&kernel);
+        let response = kernel.resource_broker.execute(prepared.request).await.unwrap();
+        drop(slot);
+        assert!(!response.success);
+        assert_eq!(response.error, Some(ResourceError::OperationFailed("peripheral use revoked".into()).to_string()));
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!operator.requests()[1].grant_pending);
+        assert_eq!(operator.requests()[1].active_uses, 0);
+        assert!(operator.approve(request.request_id).is_err());
+
+        let caller = Arc::clone(&kernel);
+        let replacement = tokio::spawn(async move {
+            caller.tool_registry.authorize_and_acquire_call(&caller.syscall_gate, agent.id, "camera_race", &serde_json::json!({"device": "private-race-target"})).await
+        });
+        let replacement_request = wait_local_peripheral_request(&operator, 3).await;
+        operator.approve(replacement_request.request_id).unwrap();
+        let (prepared, slot) = replacement.await.unwrap().unwrap();
+        // An identical re-registration has a new binding contract. Revoking
+        // the stale record cannot remove its new grant or cancel its lease.
+        assert_eq!(operator.revoke(request.request_id).unwrap(), PeripheralRevocation { pending_grant_revoked: false, active_uses_cancelled: 0 });
+        assert_eq!(operator.requests()[2].active_uses, 1);
+        assert_eq!(operator.revoke(replacement_request.request_id).unwrap().active_uses_cancelled, 1);
+        let response = kernel.resource_broker.execute(prepared.request).await.unwrap();
+        drop(slot);
+        assert!(!response.success);
+        assert_eq!(response.error, Some(ResourceError::OperationFailed("peripheral use revoked".into()).to_string()));
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_peripheral_concurrent_approve_and_unregister_remain_live_and_fail_closed() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        kernel.resource_broker.register_provider(Box::new(PeripheralCallbackCounter(Arc::clone(&callbacks)))).unwrap();
+        let agent = kernel.create_agent_full(peripheral_test_config("concurrent-camera")).await.unwrap();
+        let operator = Arc::new(kernel.attach_local_peripheral_operator().unwrap());
+        for index in 0..16 {
+            register_peripheral_race_binding(&kernel);
+            let caller = Arc::clone(&kernel);
+            let admitted = tokio::spawn(async move {
+                caller.tool_registry.authorize_and_acquire_call(&caller.syscall_gate, agent.id, "camera_race", &serde_json::json!({"device": format!("private-race-{index}")})).await
+            });
+            let request = wait_local_peripheral_request(&operator, index + 1).await;
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (completed, received) = std::sync::mpsc::channel();
+            let approve_operator = Arc::clone(&operator);
+            let approve_barrier = Arc::clone(&barrier);
+            let approve_completed = completed.clone();
+            let approve = std::thread::spawn(move || {
+                approve_barrier.wait();
+                let _ = approve_operator.approve(request.request_id);
+                approve_completed.send(()).unwrap();
+            });
+            let unregister_kernel = Arc::clone(&kernel);
+            let unregister = std::thread::spawn(move || {
+                barrier.wait();
+                unregister_kernel.tool_registry.unregister("camera_race");
+                completed.send(()).unwrap();
+            });
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..2 { received.recv_timeout(std::time::Duration::from_secs(2)).expect("approve/unregister must not invert locks"); }
+            }).await.unwrap();
+            approve.join().unwrap();
+            unregister.join().unwrap();
+            if let Ok((prepared, slot)) = admitted.await.unwrap() {
+                let response = kernel.resource_broker.execute(prepared.request).await.unwrap();
+                drop(slot);
+                assert!(!response.success);
+                assert_eq!(response.error, Some(ResourceError::OperationFailed("peripheral use revoked".into()).to_string()));
+            }
+            assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(operator.requests().iter().all(|request| !request.grant_pending && request.active_uses == 0));
+        }
     }
 
     #[tokio::test]

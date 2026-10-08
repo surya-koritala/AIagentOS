@@ -171,6 +171,13 @@ impl PeripheralRequests {
         }
     }
 
+    pub(crate) fn cancel_binding(&self, binding: uuid::Uuid) {
+        let records = self.records.lock().unwrap().clone();
+        for record in records.iter().filter(|record| record.binding == binding) {
+            record.cancel(&self.gate, PeripheralRequestStatus::Cancelled);
+        }
+    }
+
     fn find(&self, id: uuid::Uuid) -> Result<Arc<Request>, KernelError> {
         self.records
             .lock()
@@ -224,12 +231,12 @@ impl LocalPeripheralOperator {
     }
 
     pub fn requests(&self) -> Vec<PeripheralOperatorRequest> {
-        self.requests
-            .records
-            .lock()
-            .unwrap()
-            .iter()
+        let records = self.requests.records.lock().unwrap().clone();
+        records.iter()
             .map(|record| {
+                if self.kernel.tool_registry.with_peripheral_binding(&record.tool, record.binding, || ()).is_none() {
+                    record.cancel(&self.kernel.syscall_gate, PeripheralRequestStatus::Cancelled);
+                }
                 let recorded_status = record.status.lock().unwrap();
                 let state = self
                     .kernel
@@ -270,29 +277,29 @@ impl LocalPeripheralOperator {
     /// original caller subsequently repeats canonical policy/slot admission.
     pub fn approve(&self, id: uuid::Uuid) -> Result<(), KernelError> {
         let request = self.requests.find(id)?;
-        let mut status = request.status.lock().unwrap();
-        if *status != PeripheralRequestStatus::AwaitingApproval {
-            return Err(KernelError::Policy(
-                "peripheral request is no longer awaiting approval".into(),
-            ));
-        }
-        let granted = self
+        // Publication -> request -> gate matches unregister's cancellation
+        // order. No registry lock survives the async admission retry.
+        self
             .kernel
             .tool_registry
             .with_peripheral_binding(&request.tool, request.binding, || {
+                let mut status = request.status.lock().unwrap();
+                if *status != PeripheralRequestStatus::AwaitingApproval {
+                    return Err(KernelError::Policy(
+                        "peripheral request is no longer awaiting approval".into(),
+                    ));
+                }
                 self.kernel
                     .syscall_gate
                     .local_peripheral_contract(request.contract(), LocalPeripheralAction::Approve)
+                    .ok_or_else(|| KernelError::Policy("peripheral request authority changed".into()))?;
+                *status = PeripheralRequestStatus::Approved;
+                request.decision.send_replace(*status);
+                Ok(())
             })
-            .flatten();
-        if granted.is_none() {
-            return Err(KernelError::Policy(
+            .ok_or_else(|| KernelError::Policy(
                 "peripheral request authority changed".into(),
-            ));
-        }
-        *status = PeripheralRequestStatus::Approved;
-        request.decision.send_replace(*status);
-        Ok(())
+            ))?
     }
 
     pub fn deny(&self, id: uuid::Uuid) -> Result<(), KernelError> {

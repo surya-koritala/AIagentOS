@@ -669,7 +669,12 @@ impl ToolRegistry {
 
     fn unregister_locked(&self, name: &str) {
         self.tools.remove(name);
-        self.binding_ids.remove(name);
+        if let Some((_, binding)) = self.binding_ids.remove(name) {
+            let requests = self.local_peripheral.lock().unwrap().upgrade();
+            if let Some(requests) = requests {
+                requests.cancel_binding(binding);
+            }
+        }
         self.command_templates.remove(name);
     }
 
@@ -954,13 +959,22 @@ impl ToolRegistry {
                 "tool '{name}' authorization target does not match provider target"
             ));
         }
-        let approval_contract = serde_json::to_vec(&serde_json::json!({
+        let binding_identity = *self.binding_ids.get(name).ok_or(TOOL_NOT_FOUND_ERROR)?;
+        let mut approval_contract = serde_json::json!({
             "version": 1,
             "security": &authorization.security,
             "resource_type": &request.resource_type,
             "operation": &request.operation,
             "parameters": &request.parameters,
-        }))
+        });
+        if request.resource_type == ResourceType::Peripheral {
+            // A replacement of the same named peripheral declaration is a new
+            // authority lifetime, even when its arguments/security are equal.
+            approval_contract.as_object_mut().expect("contract is an object").insert(
+                "binding_identity".into(), serde_json::json!(binding_identity),
+            );
+        }
+        let approval_contract = serde_json::to_vec(&approval_contract)
         .map_err(|error| format!("tool '{name}' contract serialization failed: {error}"))?;
         let digest = ring::digest::digest(&ring::digest::SHA256, &approval_contract);
         let mut approval_contract_digest = String::with_capacity(7 + digest.as_ref().len() * 2);
@@ -974,7 +988,7 @@ impl ToolRegistry {
             authorization,
             request,
             approval_contract_digest,
-            binding_identity: *self.binding_ids.get(name).ok_or(TOOL_NOT_FOUND_ERROR)?,
+            binding_identity,
         })
     }
 

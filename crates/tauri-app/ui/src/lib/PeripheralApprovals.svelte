@@ -37,6 +37,19 @@
     approvalDialog?.showModal();
   }
 
+  function trapReviewFocus(event) {
+    if (event.key !== 'Tab' || !approvalDialog) return;
+    const controls = Array.from(approvalDialog.querySelectorAll('button')).filter(button => !button.disabled);
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (!first || !last) { event.preventDefault(); return; }
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault(); first.focus();
+    }
+  }
+
   async function decide(command, requestId) {
     if (deciding || !connected) return;
     deciding = true;
@@ -94,7 +107,7 @@
 </section>
 
 {#if selected}
-  <dialog bind:this={approvalDialog} aria-labelledby="peripheral-review-title" on:close={() => { selected = null; }}>
+  <dialog bind:this={approvalDialog} aria-labelledby="peripheral-review-title" on:keydown={trapReviewFocus} on:close={() => { selected = null; }}>
     <h2 id="peripheral-review-title">Approve peripheral request</h2>
     <p>Agent: {selected.agent_name}</p>
     <p>Tool: {selected.tool_name}</p>

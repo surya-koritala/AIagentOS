@@ -9,6 +9,7 @@ on:
       - 'crates/kernel/src/peripheral_operator.rs'
       - 'crates/kernel/src/tools.rs'
       - 'crates/kernel/src/syscall_gate.rs'
+      - 'crates/kernel/src/resources.rs'
       - 'crates/kernel/src/lib.rs'
       - 'crates/kernel/src/agent.rs'
       - 'crates/tauri-app/**'

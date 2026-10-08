@@ -1,7 +1,9 @@
-//! Abrupt-process evidence for ephemeral descriptors and committed VFS data.
-//! The pending-write case stops before staging, not at a power-loss boundary.
+//! Abrupt-process evidence for ephemeral descriptors and atomic VFS writes.
+//! Cut points cover a synced stage and completed rename before acknowledgement.
+//! Process termination does not exercise physical power loss.
 
 use super::workspace::{WorkspaceKind, WorkspaceOpenRequest, WorkspaceRight};
+use crate::sandbox::{SandboxManager, WriteCrashBoundary, WRITE_CRASH_EXIT_CODE};
 use crate::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer, WireErrorCode};
 use crate::{AgentConfig, AgentKernelImpl, AgentState, IsolationLevel, Priority, SandboxConfig};
 use base64::Engine;
@@ -92,6 +94,27 @@ async fn crash(mut child: Child) {
         !status.success(),
         "the child must die without graceful teardown"
     );
+}
+
+fn report_ready(ready: &Ready) {
+    println!("{READY_PREFIX}{}", serde_json::to_string(ready).unwrap());
+    std::io::stdout().flush().unwrap();
+}
+
+async fn wait_write_boundary(mut child: Child) {
+    let status = tokio::time::timeout(Duration::from_secs(15), child.wait())
+        .await
+        .expect("write child did not exit at the armed boundary")
+        .unwrap();
+    assert_eq!(status.code(), Some(WRITE_CRASH_EXIT_CODE));
+}
+
+fn staged_files(root: &Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(root.join("workspace"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with(".aiagentos-write-"))
+        .collect()
 }
 
 /// Invoked in a fresh OS process by the acceptance test below. Normal suite
@@ -196,7 +219,24 @@ async fn vfs_crash_child_process() {
                 .unwrap(),
             SyscallReply::ToolResult { .. }
         ));
-        if mode == "committed-write" {
+        if matches!(mode.as_str(), "after-stage-sync" | "after-rename") {
+            let sandbox = kernel.sandbox_manager.get_sandbox_for_agent(agent).unwrap();
+            let boundary = if mode == "after-stage-sync" {
+                WriteCrashBoundary::AfterStageSync
+            } else {
+                WriteCrashBoundary::AfterRename
+            };
+            kernel.sandbox_manager.crash_next_write_for_test(sandbox, boundary);
+            // The parent owns the handle identities before the syscall reaches
+            // its cut point; exit code 73 proves the actual boundary was reached.
+            report_ready(&ready);
+            let reply = client.call(Syscall::VfsWriteWorkspace {
+                agent_id: ready.agent.clone(),
+                handle: ready.workspace.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(REPLACEMENT),
+            }).await;
+            panic!("armed write boundary did not terminate the child: {reply:?}");
+        } else if mode == "committed-write" {
             assert!(matches!(client.call(Syscall::VfsWriteWorkspace {
                 agent_id: ready.agent.clone(), handle: ready.workspace.clone(),
                 data_base64: base64::engine::general_purpose::STANDARD.encode(REPLACEMENT),
@@ -226,20 +266,31 @@ async fn vfs_crash_child_process() {
             .expect("the public VFS operation was not admitted into its controlled worker");
         }
     }
-    println!("{READY_PREFIX}{}", serde_json::to_string(&ready).unwrap());
-    std::io::stdout().flush().unwrap();
+    report_ready(&ready);
     std::future::pending::<()>().await;
 }
 
 #[tokio::test]
 async fn abrupt_process_crash_revokes_handles_and_reopens_committed_vfs_data() {
-    for mode in ["pending-open", "pending-write", "committed-write"] {
+    for mode in ["pending-open", "pending-write", "after-stage-sync", "after-rename", "committed-write"] {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("workspace")).unwrap();
         std::fs::write(root.path().join("workspace/proof.bin"), ORIGINAL).unwrap();
+        #[cfg(unix)]
+        let original_permissions = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(root.path().join("workspace/proof.bin"))
+                .unwrap()
+                .permissions()
+                .mode() & 0o777
+        };
         let (child, old) = start_child(root.path(), mode).await;
-        crash(child).await;
-        let expected = if mode == "committed-write" {
+        if matches!(mode, "after-stage-sync" | "after-rename") {
+            wait_write_boundary(child).await;
+        } else {
+            crash(child).await;
+        }
+        let expected = if matches!(mode, "after-rename" | "committed-write") {
             REPLACEMENT
         } else {
             ORIGINAL
@@ -249,14 +300,37 @@ async fn abrupt_process_crash_revokes_handles_and_reopens_committed_vfs_data() {
             expected
         );
         assert!(!root.path().join("workspace/pending.bin").exists());
+        let stages = staged_files(root.path());
+        if mode == "after-stage-sync" {
+            assert_eq!(stages.len(), 1, "cut point must leave the synced uncommitted stage");
+            assert_eq!(std::fs::read(&stages[0]).unwrap(), REPLACEMENT);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(&stages[0]).unwrap().permissions().mode() & 0o777, original_permissions);
+            }
+        } else {
+            assert!(stages.is_empty());
+        }
         assert_eq!(
             std::fs::read_dir(root.path().join("workspace"))
                 .unwrap()
                 .count(),
-            1
+            1 + stages.len()
         );
 
         let (recovered, fresh) = start_child(root.path(), "recover").await;
+        let retained_stages = staged_files(root.path());
+        assert!(retained_stages.iter().all(|path| stages.contains(path)), "recovery must not create additional staging files");
+        for path in &retained_stages {
+            assert_eq!(std::fs::read(path).unwrap(), REPLACEMENT);
+        }
+        println!("VFS_WRITE_CRASH {}", serde_json::json!({
+            "boundary": mode,
+            "stage_files_before_restart": stages.len(),
+            "stage_files_after_restart": retained_stages.len(),
+            "power_loss_exercised": false,
+        }));
         assert_eq!(fresh.agent, old.agent);
         let mut client = connect(fresh.address).await;
         for request in [

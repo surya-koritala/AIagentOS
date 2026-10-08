@@ -44,6 +44,16 @@ workspace, and removed on failure or cancellation before commit. Opening with
 `allow_missing` and write rights binds a prospective file entry; it creates no
 file until a write commits.
 
+Process-crash acceptance uses the public VFS write syscall in dedicated child
+processes. Test-only hooks terminate a child after the staged file is synced
+and after replacement is renamed, before the syscall can acknowledge success.
+Restart must preserve the old bytes before rename and the complete replacement
+after rename; old descriptors remain invalid and fresh authorized reads must
+succeed. A crash before rename can leave a complete staging file. Recovery
+records any retained stage without treating it as a committed entry or promising
+automatic cleanup. These process-exit checks do not establish physical
+power-loss durability, including directory-sync behavior on Windows.
+
 Directory listing retains the sandbox's deterministic, typed 4,096-entry bound.
 `stat` returns file/directory kind, size, and the host readonly bit. The readonly
 bit is metadata, not a promise that policy permits writing.

@@ -5102,6 +5102,7 @@ impl AgentKernelImpl {
             .agent_manager
             .get_agent_provider(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
+        let restored_history = self.context_manager.latest_execution_history(agent_id)?;
         let session = self
             .connector
             .connect_resilient(agent_id, &provider_id)
@@ -5116,6 +5117,9 @@ impl AgentKernelImpl {
             self.syscall_gate.clone(),
             "You are a helpful AI assistant. Use the available tools to help the user.".into(),
         );
+        if let Some((conversation_id, messages)) = restored_history {
+            executor = executor.with_restored_history(conversation_id, messages);
+        }
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
         executor.set_context_budget(self.context_budget_tokens);

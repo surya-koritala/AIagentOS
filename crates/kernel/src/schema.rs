@@ -12,8 +12,10 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 8;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
+// Older readers cannot resolve immutable prefixes from private branch tails.
+const MIN_READER_SCHEMA_VERSION: i64 = 8;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
@@ -23,6 +25,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, "add-destination-agent-mutation-fences"),
     (6, "add-durable-cluster-raft-storage"),
     (7, "bind-destination-fences-to-authority-terms-and-expiry"),
+    (8, "share-immutable-execution-history-prefixes"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +41,9 @@ const REQUIRED_TABLES: &[&str] = &[
     "facts",
     "conversations",
     "conversations_fts",
+    "execution_context_snapshots",
+    "conversation_snapshot_refs",
+    "execution_snapshot_fts",
     "usage_log",
     "agent_kv",
     "context_spills",
@@ -338,7 +344,7 @@ pub(crate) fn complete_migration(
             params![
                 APPLICATION_ID,
                 CURRENT_SCHEMA_VERSION,
-                MIN_READABLE_SCHEMA_VERSION,
+                MIN_READER_SCHEMA_VERSION,
                 uuid::Uuid::new_v4().to_string(),
                 &now
             ],
@@ -381,7 +387,7 @@ pub(crate) fn verify(connection: &Connection) -> Result<(), ContextError> {
     ) != (
         APPLICATION_ID,
         CURRENT_SCHEMA_VERSION,
-        MIN_READABLE_SCHEMA_VERSION,
+        MIN_READER_SCHEMA_VERSION,
     ) {
         return Err(storage_error(format!(
             "schema metadata is inconsistent: application_id={}, schema_version={}, \

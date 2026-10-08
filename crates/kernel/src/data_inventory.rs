@@ -141,6 +141,33 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "erase subject rows; shared quota ledger remains"
     ),
     sqlite_entry!(
+        "execution_context_snapshots",
+        "tenant and referencing conversation branches",
+        "tenant_id",
+        "confidential shared execution history",
+        "while reachable from at least one conversation branch",
+        "not encrypted; owner-only database file permissions",
+        "collect after the last reachable branch is erased; erase with tenant"
+    ),
+    sqlite_entry!(
+        "conversation_snapshot_refs",
+        "agent and tenant",
+        "tenant_id and conversations.agent_id",
+        "confidential execution-history ownership references",
+        "until conversation, agent or tenant erasure",
+        "not encrypted; owner-only database file permissions",
+        "erase with conversation, agent or tenant"
+    ),
+    sqlite_entry!(
+        "execution_snapshot_fts",
+        "tenant and referencing conversation branches",
+        "execution_context_snapshots.tenant_id via snapshot_id",
+        "confidential searchable shared execution history",
+        "while its immutable snapshot is reachable",
+        "not encrypted; owner-only database file permissions",
+        "erase with unreachable execution snapshot or tenant"
+    ),
+    sqlite_entry!(
         "agent_kv",
         "agent",
         "agents.tenant_id via agent_id",

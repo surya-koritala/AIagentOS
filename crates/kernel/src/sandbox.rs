@@ -2297,7 +2297,8 @@ mod tests {
     #[cfg(windows)]
     fn matching_native_file_handles(path: &Path) -> std::io::Result<Vec<(usize, u32, u32)>> {
         use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
         use windows_sys::Wdk::System::Threading::{
             NtQueryInformationProcess, ProcessHandleInformation,
         };
@@ -2385,15 +2386,21 @@ mod tests {
         };
         let mut matching = Vec::new();
         for entry in entries {
-            // A concurrent test may have closed/reused a snapshot handle. The
-            // Win32 queries fail normally; no ownership is taken or close made.
-            if entry.value == target.as_raw_handle()
-                || unsafe { GetFileType(entry.value) } != FILE_TYPE_DISK
-            {
+            if entry.value == target.as_raw_handle() {
                 continue;
             }
+            // The snapshot number can be closed/reused by another test. Pin
+            // the current object with a non-inheritable duplicate before both
+            // queries; close only this duplicate through OwnedHandle.
+            let mut duplicate = std::ptr::null_mut();
+            if unsafe { DuplicateHandle(
+                GetCurrentProcess(), entry.value, GetCurrentProcess(),
+                &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS,
+            ) } == 0 { continue; }
+            let owned = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+            if unsafe { GetFileType(owned.as_raw_handle()) } != FILE_TYPE_DISK { continue; }
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-            if unsafe { GetFileInformationByHandle(entry.value, &mut info) } == 0 {
+            if unsafe { GetFileInformationByHandle(owned.as_raw_handle(), &mut info) } == 0 {
                 continue;
             }
             if identity(&info) == identity(&target_info) {

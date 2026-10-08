@@ -369,7 +369,20 @@ fn normalize_sql(sql: &str) -> String {
 }
 
 fn verify_canonical_triggers(connection: &Connection) -> Result<(), ContextError> {
-    let expected = expected_trigger_definitions()
+    let mut definitions = expected_trigger_definitions();
+    let schema_version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| {
+            integrity_error(format!("cannot inspect trigger schema version: {error}"))
+        })?;
+    if schema_version >= 10 {
+        definitions.extend(
+            crate::context::fact_index::TRIGGERS
+                .iter()
+                .map(|(name, sql)| ((*name).to_string(), "facts", (*sql).to_string())),
+        );
+    }
+    let expected = definitions
         .into_iter()
         .map(|(name, table, sql)| (name, (table, normalize_sql(&sql))))
         .collect::<BTreeMap<_, _>>();

@@ -50,6 +50,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "workspace_vfs",
     "namespace_mounts",
     "data_vfs",
+    "durable_cloning",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -361,6 +362,16 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "list_agents",
         fields: &[],
+    },
+    Variant {
+        tag: "clone_agent",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("child_agent_id", S),
+            Field::optional("child_ownership_proof", ON),
+            Field::required("name", S),
+            Field::optional("drop_capabilities", A),
+        ],
     },
     Variant {
         tag: "pause_agent",
@@ -977,6 +988,9 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("agent_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000001".into())
                     }
+                    ("child_agent_id", JsonKind::String) => {
+                        Value::String("00000000-0000-0000-0000-000000000005".into())
+                    }
                     ("owner_node_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000004".into())
                     }
@@ -1108,6 +1122,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "agent_created",
         fields: &[Field::required("id", S)],
+    },
+    Variant {
+        tag: "agent_cloned",
+        fields: &[Field::required("result", O)],
     },
     Variant {
         tag: "agents",
@@ -1798,8 +1816,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 96);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 127);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 128);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

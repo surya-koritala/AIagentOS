@@ -9,7 +9,7 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenant TENANT_ID] \
-         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|clone|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] tenant-create NAME\n\
@@ -47,6 +47,7 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] vfs-list AGENT_ID DIRECTORY_HANDLE\n\
            agentctl [SERVER OPTIONS] vfs-stat AGENT_ID HANDLE\n\
            agentctl [SERVER OPTIONS] create NAME TASK [PROVIDER [PROFILE [PRIORITY]]]\n\
+           agentctl [SERVER OPTIONS] clone PARENT_ID CHILD_UUID NAME [CAPABILITY_DROP_CSV]\n\
            agentctl [SERVER OPTIONS] message AGENT_ID MESSAGE\n\
            agentctl [SERVER OPTIONS] stream REQUEST_ID AGENT_ID MESSAGE\n\
            agentctl [SERVER OPTIONS] cancel REQUEST_ID AGENT_ID\n\
@@ -1061,6 +1062,28 @@ async fn run_online(
                 .await
                 .unwrap_or_else(|error| fail(error));
             print_json(&serde_json::json!({ "id": id }), "created agent");
+            return;
+        }
+        "clone" => {
+            let parent = args.next().unwrap_or_else(|| usage());
+            let child = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<kernel::AgentId>()
+                .unwrap_or_else(|_| usage());
+            let name = args.next().unwrap_or_else(|| usage());
+            let dropped = args
+                .next()
+                .map(|value| value.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
+            if args.next().is_some() {
+                usage();
+            }
+            let result = client
+                .clone_agent(parent, child, name, dropped)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&result, "cloned agent");
             return;
         }
         "list" => {

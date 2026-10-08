@@ -43,6 +43,7 @@ impl LlmSession for PausableSession {
             std::future::pending::<()>().await;
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "TUI checkpoint resume complete".into(),
             finish_reason: Some("stop".into()),
             tokens_used: 5,

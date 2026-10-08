@@ -24,6 +24,39 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   and mutations emit actor/target audit events. Keyless CI drives shipped
   binaries through multi-tenant isolation, permission/quota denials, credential
   revocation, and process restart. Relates #329 and #330.
+### Persistence
+- Add protected current-user Windows DACLs at private file/directory creation,
+  handle-based ownership and reparse rejection, write-through storage publication,
+  and native permission/durability CI regressions. Physical power-loss and final
+  production qualification remain open (#337).
+- Share atomic owner-only local operator persistence with configuration, including
+  Unix permission tightening before replacement bytes and stable local owner
+  identity, without adding wire or tool authority (#337, #338).
+
+- Added Gemini native JSON-schema function declarations, ordered parallel calls
+  and paired results, with bounded durable assistant replay state and preserved
+  thought signatures. Checkpoints, cloning, restart, context admission and
+  failover protect this state. Malformed responses execute no tools; output
+  accounting includes thought tokens. Schema 11 prevents reader downgrade.
+  Deterministic fixtures pass; live qualification remains not run. Relates #354.
+
+- Added opt-in OpenAI-compatible/Ollama embedding transports, typed failures,
+  bounded request/response handling, configured boot selection, atomic model and
+  dimension repair, and a labelled-corpus comparison. Default offline vectors
+  stay unchanged. Rust embedding methods now return Result; wire fact schemas
+  remain unchanged. Relates #359.
+
+- Added a bounded 100k-fact context-manager qualification mode with cold/warm
+  latency, concurrent updates/queries, before/after retrieval quality, whole-store
+  integrity and peak RSS gates. Normal fact writes now reconcile retained indexes
+  incrementally; updates enforce UTF-8 byte limits atomically. A separate hosted
+  workflow retains exact-source synthetic scale evidence. Relates #358.
+
+- Retained per-agent semantic-memory indexes and shared deterministic LSH planes.
+  Facts use versioned binary embeddings with atomic JSON migration, repair checks,
+  durable mutation revisions, bounded cache eviction and erasure cleanup. LSH
+  candidate compression and partial selection preserve search results; the 10k
+  qualification also requires ANN p95 below exact search. Relates #357.
 
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,

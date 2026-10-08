@@ -13,6 +13,7 @@
   - [Scheduler Contract](./scheduler.md)
   - [Durable Checkpoints](./checkpoints.md)
   - [Context Pressure](./context-pressure.md)
+  - [Durable Execution History](./durable-execution-history.md)
   - [Operations API](./operations-api.md)
   - [Production Observability](./observability.md)
   - [Protected Qualification Infrastructure](./protected-qualification-infrastructure.md)

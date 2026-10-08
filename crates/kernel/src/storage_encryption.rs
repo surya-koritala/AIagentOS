@@ -254,14 +254,20 @@ pub fn generate_storage_encryption_key_file(key_id: &str, path: &Path) -> Result
 
 /// Load and validate one bounded owner-only key document.
 pub fn load_storage_encryption_key(path: &Path) -> Result<StorageEncryptionKey, ContextError> {
+    #[cfg(not(windows))]
     let mut options = OpenOptions::new();
+    #[cfg(not(windows))]
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
-    let file = options.open(path).map_err(|error| {
+    #[cfg(not(windows))]
+    let opened = options.open(path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::open_read(path, true);
+    let file = opened.map_err(|error| {
         storage_error(format!(
             "failed to open storage key {} as a regular non-symlink file: {error}",
             path.display()
@@ -415,7 +421,7 @@ pub fn encrypt_existing_database(
         ));
     }
 
-    fs::rename(database_path, &rollback).map_err(|error| {
+    rename_durable(database_path, &rollback).map_err(|error| {
         storage_error(format!(
             "failed to preserve plaintext database during migration: {error}"
         ))
@@ -423,7 +429,7 @@ pub fn encrypt_existing_database(
     #[cfg(test)]
     abort_encryption_migration_after_rollback_for_test();
     let publish = (|| {
-        fs::rename(&stage, database_path).map_err(|error| {
+        rename_durable(&stage, database_path).map_err(|error| {
             storage_error(format!(
                 "failed to publish encrypted database {}: {error}",
                 database_path.display()
@@ -441,7 +447,7 @@ pub fn encrypt_existing_database(
     })();
     if let Err(error) = publish {
         let _ = fs::remove_file(database_path);
-        if let Err(rollback_error) = fs::rename(&rollback, database_path) {
+        if let Err(rollback_error) = rename_durable(&rollback, database_path) {
             stage_guard.disarm();
             journal_guard.disarm();
             return Err(storage_error(format!(
@@ -617,7 +623,7 @@ pub fn recover_interrupted_encryption_migration(
             ))
         })?;
         require_matching_migration_identity("encrypted staging database", &staged, &expected)?;
-        fs::rename(&stage, database_path).map_err(|error| {
+        rename_durable(&stage, database_path).map_err(|error| {
             storage_error(format!(
                 "failed to publish verified interrupted encryption stage {}: {error}",
                 stage.display()
@@ -644,7 +650,7 @@ pub fn recover_interrupted_encryption_migration(
         ));
     }
 
-    fs::rename(&rollback, database_path).map_err(|error| {
+    rename_durable(&rollback, database_path).map_err(|error| {
         storage_error(format!(
             "failed to restore verified plaintext rollback {}: {error}",
             rollback.display()
@@ -859,14 +865,20 @@ fn load_encryption_migration_journal(
     database_path: &Path,
     journal_path: &Path,
 ) -> Result<EncryptionMigrationJournal, ContextError> {
+    #[cfg(not(windows))]
     let mut options = OpenOptions::new();
+    #[cfg(not(windows))]
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
-    let file = options.open(journal_path).map_err(|error| {
+    #[cfg(not(windows))]
+    let opened = options.open(journal_path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::open_read(journal_path, true);
+    let file = opened.map_err(|error| {
         storage_error(format!(
             "failed to open encryption migration journal {}: {error}",
             journal_path.display()
@@ -1133,9 +1145,17 @@ fn set_owner_only_database(path: &Path) -> Result<(), ContextError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_owner_only_database(path: &Path) -> Result<(), ContextError> {
+    crate::windows_private_fs::protect_path(path, false)
+        .map_err(|error| storage_error(format!("failed to protect encrypted database: {error}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_owner_only_database(_path: &Path) -> Result<(), ContextError> {
-    Ok(())
+    Err(storage_error(
+        "owner-only database protection is unsupported on this platform",
+    ))
 }
 
 fn validate_key_id(key_id: &str) -> Result<(), ContextError> {
@@ -1182,12 +1202,6 @@ fn hex_digit(value: u8) -> Option<u8> {
     }
 }
 
-#[cfg(unix)]
-fn create_owner_only_new_file(path: &Path) -> Result<File, ContextError> {
-    create_owner_only_new_file_for(path, "storage key")
-}
-
-#[cfg(not(unix))]
 fn create_owner_only_new_file(path: &Path) -> Result<File, ContextError> {
     create_owner_only_new_file_for(path, "storage key")
 }
@@ -1208,18 +1222,21 @@ fn create_owner_only_new_file_for(path: &Path, label: &str) -> Result<File, Cont
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn create_owner_only_new_file_for(path: &Path, label: &str) -> Result<File, ContextError> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            storage_error(format!(
-                "failed to create {label} {} without overwrite: {error}",
-                path.display()
-            ))
-        })
+    crate::windows_private_fs::create_new_file(path).map_err(|error| {
+        storage_error(format!(
+            "failed to create {label} {} without overwrite: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_owner_only_new_file_for(_path: &Path, _label: &str) -> Result<File, ContextError> {
+    Err(storage_error(
+        "private file creation is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1240,9 +1257,20 @@ fn verify_owner_only(path: &Path, metadata: &fs::Metadata) -> Result<(), Context
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_owner_only(path: &Path, _metadata: &fs::Metadata) -> Result<(), ContextError> {
+    crate::windows_private_fs::verify_path(path, false).map_err(|error| {
+        storage_error(format!(
+            "storage key must have current-owner-only permissions: {error}"
+        ))
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn verify_owner_only(_path: &Path, _metadata: &fs::Metadata) -> Result<(), ContextError> {
-    Ok(())
+    Err(storage_error(
+        "private file verification is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1260,9 +1288,44 @@ fn sync_parent(path: &Path) -> Result<(), ContextError> {
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_parent(path: &Path) -> Result<(), ContextError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    crate::windows_private_fs::sync_directory(parent)
+        .map_err(|error| storage_error(format!("failed to sync storage key parent: {error}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_parent(_path: &Path) -> Result<(), ContextError> {
-    Ok(())
+    Err(storage_error(
+        "directory durability is unsupported on this platform",
+    ))
+}
+
+#[cfg(test)]
+fn create_private_directory_all(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::windows_private_fs::ensure_directory(path.as_ref())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+fn rename_durable(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
+    }
 }
 
 fn storage_error(message: impl Into<String>) -> ContextError {
@@ -1288,7 +1351,7 @@ mod tests {
                 "agentos-storage-encryption-{}",
                 uuid::Uuid::new_v4()
             ));
-            fs::create_dir_all(&path).unwrap();
+            create_private_directory_all(&path).unwrap();
             Self(path)
         }
     }
@@ -1323,6 +1386,13 @@ mod tests {
         let key_path = root.0.join("storage-key.json");
         generate_storage_encryption_key_file("release-2026.1", &key_path).unwrap();
         assert!(generate_storage_encryption_key_file("other", &key_path).is_err());
+        #[cfg(windows)]
+        {
+            crate::windows_private_fs::verify_path(&key_path, false).unwrap();
+            let linked = root.0.join("storage-key-link.json");
+            std::os::windows::fs::symlink_file(&key_path, &linked).unwrap();
+            assert!(load_storage_encryption_key(&linked).is_err());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::{symlink, PermissionsExt};

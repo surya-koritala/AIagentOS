@@ -182,6 +182,102 @@ pub struct StandardMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Opaque native assistant parts required to replay a provider conversation.
+    /// This state is durable and belongs to the exact provider and model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<ProviderMessageMetadata>,
+}
+
+/// Bounded provider replay state. It grants no tool authority and must never be
+/// treated as an instruction, credential, or executable tool result.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(try_from = "ProviderMessageMetadataWire")]
+pub struct ProviderMessageMetadata {
+    provider_id: ProviderId,
+    model_id: String,
+    payload: serde_json::Value,
+}
+
+impl std::fmt::Debug for ProviderMessageMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderMessageMetadata")
+            .field("provider_id", &self.provider_id)
+            .field("model_id", &self.model_id)
+            .field("payload", &"<opaque>")
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct ProviderMessageMetadataWire {
+    provider_id: ProviderId,
+    model_id: String,
+    payload: serde_json::Value,
+}
+
+impl ProviderMessageMetadata {
+    pub const MAX_BYTES: usize = 256 * 1024;
+
+    pub fn new(
+        provider_id: ProviderId,
+        model_id: String,
+        payload: serde_json::Value,
+    ) -> Result<Self, ConnectorError> {
+        let valid_id =
+            |id: &str| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control);
+        if !valid_id(&provider_id)
+            || !valid_id(&model_id)
+            || !payload.is_object()
+            || serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > Self::MAX_BYTES)
+        {
+            return Err(ConnectorError::ProtocolError(
+                "invalid or oversized provider replay metadata".into(),
+            ));
+        }
+        Ok(Self {
+            provider_id,
+            model_id,
+            payload,
+        })
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    pub fn payload(&self) -> &serde_json::Value {
+        &self.payload
+    }
+}
+
+impl TryFrom<ProviderMessageMetadataWire> for ProviderMessageMetadata {
+    type Error = ConnectorError;
+
+    fn try_from(value: ProviderMessageMetadataWire) -> Result<Self, Self::Error> {
+        Self::new(value.provider_id, value.model_id, value.payload)
+    }
+}
+
+/// Refuse routing durable native assistant state to a different provider/model.
+/// Dropping this state silently would break the conversation's native protocol.
+pub fn validate_provider_history(
+    messages: &[StandardMessage],
+    provider: &str,
+    model: &str,
+) -> Result<(), ConnectorError> {
+    if messages
+        .iter()
+        .filter_map(|message| message.provider_metadata.as_ref())
+        .any(|metadata| metadata.provider_id() != provider || metadata.model_id() != model)
+    {
+        return Err(ConnectorError::ProtocolError(
+            "provider replay history is incompatible with the selected provider or model".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl StandardMessage {
@@ -191,6 +287,7 @@ impl StandardMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            provider_metadata: None,
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -199,6 +296,7 @@ impl StandardMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            provider_metadata: None,
         }
     }
     pub fn system(content: impl Into<String>) -> Self {
@@ -207,6 +305,7 @@ impl StandardMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            provider_metadata: None,
         }
     }
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -215,6 +314,7 @@ impl StandardMessage {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
+            provider_metadata: None,
         }
     }
 }
@@ -274,6 +374,8 @@ pub struct LlmResponse {
     pub usage: LlmUsage,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<ProviderMessageMetadata>,
 }
 
 /// Provider-originated deltas forwarded to the executor's bounded stream.
@@ -366,6 +468,7 @@ pub trait LlmSession: Send + Sync {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        validate_provider_history(&messages, self.provider_id(), self.model_id())?;
         let provider_id = self.provider_id().clone();
         let send = self.send_with_options(messages, tools, options);
         tokio::pin!(send);
@@ -476,6 +579,7 @@ pub trait LlmSession: Send + Sync {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        validate_provider_history(&messages, self.provider_id(), self.model_id())?;
         let provider_id = self.provider_id().clone();
         let send = self.send_streaming_with_options(messages, tools, options);
         tokio::pin!(send);
@@ -970,6 +1074,7 @@ impl AgentConnectorImpl {
                 ));
             }
             let model_id = session.model_id().to_string();
+            validate_provider_history(request.messages, adapter.id(), &model_id)?;
 
             let result = match request.mode {
                 SendMode::NonStreaming => {
@@ -1355,6 +1460,7 @@ mod tests {
             _messages: Vec<StandardMessage>,
         ) -> Result<LlmResponse, ConnectorError> {
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "response".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 10,
@@ -1448,6 +1554,7 @@ mod tests {
                 }
             } else {
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: format!("ok from {}", self.provider_id),
                     finish_reason: Some("stop".into()),
                     tokens_used: 7,
@@ -1489,6 +1596,7 @@ mod tests {
             self.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "complete".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 1,
@@ -1524,6 +1632,7 @@ mod tests {
                 ))
             } else {
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content: "complete".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 1,
@@ -1610,6 +1719,7 @@ mod tests {
                 return Err(error.clone());
             }
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: format!("ok from {}", self.provider_id),
                 finish_reason: Some("stop".into()),
                 tokens_used: 7,
@@ -2325,5 +2435,101 @@ mod tests {
             .unwrap();
         let providers = connector.list_providers();
         assert_eq!(providers.len(), 2);
+    }
+
+    #[test]
+    fn provider_replay_metadata_round_trips_with_bounds_and_debug_redaction() {
+        let metadata = ProviderMessageMetadata::new(
+            "gemini".into(),
+            "fixture-model".into(),
+            serde_json::json!({"parts": [{"text": "ok", "thoughtSignature": "opaque-secret"}],
+                "tool_call_ids": []}),
+        )
+        .unwrap();
+        let mut message = StandardMessage::assistant("ok");
+        message.provider_metadata = Some(metadata.clone());
+        let encoded = serde_json::to_vec(&message).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<StandardMessage>(&encoded).unwrap(),
+            message
+        );
+        assert!(!format!("{metadata:?}").contains("opaque-secret"));
+        assert!(validate_provider_history(&[message.clone()], "gemini", "fixture-model").is_ok());
+        assert!(validate_provider_history(&[message.clone()], "other", "fixture-model").is_err());
+        assert!(validate_provider_history(&[message], "gemini", "other-model").is_err());
+        let legacy: StandardMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": "legacy", "tool_calls": null, "tool_call_id": null
+        }))
+        .unwrap();
+        assert!(legacy.provider_metadata.is_none());
+        for payload in [
+            serde_json::json!([]),
+            serde_json::json!({"x": "🦀".repeat(70_000)}),
+        ] {
+            assert!(
+                ProviderMessageMetadata::new("gemini".into(), "model".into(), payload.clone())
+                    .is_err()
+            );
+            assert!(
+                serde_json::from_value::<ProviderMessageMetadata>(serde_json::json!({
+                    "provider_id": "gemini", "model_id": "model", "payload": payload
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            ProviderMessageMetadata::new("".into(), "model".into(), serde_json::json!({})).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_replay_history_does_not_reach_an_incompatible_backup() {
+        let connector = fast_connector();
+        let primary_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let backup_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "primary",
+                ProviderType::Cloud,
+                "primary-model",
+                Some(ConnectorError::service_unavailable(
+                    "primary".into(),
+                    "fixture",
+                    None,
+                )),
+                primary_attempts.clone(),
+            )))
+            .unwrap();
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "backup",
+                ProviderType::Cloud,
+                "backup-model",
+                None,
+                backup_attempts.clone(),
+            )))
+            .unwrap();
+        connector.set_backup(&"primary".into(), &"backup".into());
+        let mut history = StandardMessage::assistant("previous native output");
+        history.provider_metadata = Some(
+            ProviderMessageMetadata::new(
+                "primary".into(),
+                "primary-model".into(),
+                serde_json::json!({"parts": [{"text": "previous native output"}]}),
+            )
+            .unwrap(),
+        );
+        let error = connector
+            .send_with_failover(
+                &"primary".into(),
+                vec![history],
+                &[],
+                SendMode::NonStreaming,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConnectorError::ProtocolError(_)));
+        assert!(primary_attempts.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(backup_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

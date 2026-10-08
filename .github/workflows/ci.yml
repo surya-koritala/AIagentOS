@@ -60,6 +60,8 @@ jobs:
         run: mdbook build docs
       - name: All-feature compilation
         run: cargo build --workspace --exclude tauri-app --all-features --locked
+      - name: All-feature provider protocol fixtures
+        run: cargo test -p adapters --all-features --locked
       - name: Off-by-default Wasm module system
         run: |
           cargo test -p kernel --features wasm --locked modules::
@@ -135,6 +137,8 @@ jobs:
           # Restore always; only main writes. Otherwise every PR job mints a
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Gemini governed history and restart fixtures
+        run: cargo test -p integration-tests gemini_history --locked -- --nocapture
       - name: Deterministic unit and integration tests
         run: cargo test --workspace --exclude tauri-app --locked
 

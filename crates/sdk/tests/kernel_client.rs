@@ -42,6 +42,7 @@ impl LlmSession for StreamTestSession {
             std::future::pending::<()>().await;
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "streamed reply".into(),
             finish_reason: Some("stop".into()),
             tokens_used: 3,
@@ -82,6 +83,7 @@ impl LlmSession for StreamTestSession {
             }
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: if self.event_count == 0 {
                 "streamed reply".into()
             } else {

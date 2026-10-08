@@ -1,0 +1,15 @@
+{
+  "source_head": "4afe08b12b410df9c298d07776188e9a17e1406c",
+  "tested_merge": "35bc5ad0c2b4f85e25bb26dbf362de3dee139927",
+  "base": "9aeaaee1923836ea7bf1b9344f794ff718f1b9ee",
+  "run_id": 37772086443,
+  "job_id": 113293880259,
+  "artifact_id": 11547899166,
+  "job_conclusion": "success",
+  "platform": "Ubuntu24.04 x86_64 GitHub-hosted",
+  "rust_toolchain": "1.97.1",
+  "build_profile": "dev",
+  "evidence_class": "synthetic-context-scale",
+  "production_claim_allowed": false,
+  "provider_api_calls": 0
+}

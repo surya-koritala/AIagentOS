@@ -1,0 +1,134 @@
+name: Windows private storage ownership
+
+on:
+  pull_request:
+    branches: [main, 'codex/**']
+    paths:
+      - 'crates/kernel/src/windows_private_fs.rs'
+      - 'crates/kernel/src/storage.rs'
+      - 'crates/kernel/src/storage_encryption.rs'
+      - 'crates/kernel/src/remote_backup.rs'
+      - 'crates/kernel/src/config.rs'
+      - 'crates/kernel/src/context.rs'
+      - 'crates/kernel/Cargo.toml'
+      - '.github/workflows/windows-storage.yml'
+      - 'scripts/*windows_storage*'
+      - 'scripts/tests/*windows_storage*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-storage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: Private storage formatting contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Prepare diagnostic formatting patch in CI
+        run: |
+          cargo fmt --all
+          git diff --binary > windows-storage-rustfmt.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-storage-format-patch
+          path: windows-storage-rustfmt.patch
+          if-no-files-found: error
+      - name: Formatting differences remain a failed gate
+        run: git diff --exit-code
+
+  native-tests:
+    name: Private storage regressions (${{ matrix.os }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Bash resolves its own incomplete MSYS Perl before Strawberry Perl.
+      # Vendored SQLCipher/OpenSSL must use the native Windows distribution.
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: false
+      - name: Compile exact source and reject native warnings
+        run: cargo clippy -p kernel --all-targets --locked -- -D warnings
+      - name: Record actual compiled test inventory
+        run: |
+          mkdir -p reports
+          cargo test -p kernel --lib --locked -- --list > "reports/${{ runner.os }}-tests.txt"
+          git rev-parse HEAD > reports/source-commit.txt
+      - name: Execute every storage permission and durability module
+        run: |
+          for module in storage storage_encryption config remote_backup; do
+            cargo test -p kernel --lib --locked "${module}::" -- --test-threads=1 > "reports/${module}.log" 2>&1
+          done
+      - name: Execute native DACL, ownership, reparse, replacement, and crash regressions
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test -p kernel --lib --locked windows_private_fs::
+          -- --test-threads=1 --nocapture > reports/native-windows.log 2>&1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-storage-${{ runner.os }}
+          path: reports/*
+          if-no-files-found: error
+
+  parity:
+    name: Windows storage proving-test parity
+    needs: native-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: windows-storage-*
+          path: reports
+      - name: Reject a missing, compiled-out, or smaller Windows proving suite
+        run: >-
+          python3 scripts/verify_windows_storage_coverage.py
+          --unix reports/windows-storage-Linux/Linux-tests.txt
+          --windows reports/windows-storage-Windows/Windows-tests.txt
+          --output reports/windows-storage-parity.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-storage-parity
+          path: reports/windows-storage-parity.json
+          if-no-files-found: error
+
+  required:
+    name: Required Windows private storage
+    if: always()
+    needs: [format, native-tests, parity]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject failed or skipped security/durability evidence
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: test "$(jq -r '[.[] | .result == "success"] | all' <<< "$NEEDS_JSON")" = "true"

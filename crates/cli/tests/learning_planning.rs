@@ -38,7 +38,7 @@ struct Fixture {
 }
 
 fn response(text: &str) -> LlmResponse {
-    LlmResponse { content: text.into(), finish_reason: Some("stop".into()), tokens_used: 12, usage: LlmUsage::reported(8, 4, 0), tool_calls: Vec::new() }
+    LlmResponse { content: text.into(), finish_reason: Some("stop".into()), tokens_used: 12, usage: LlmUsage::reported(8, 4, 0), tool_calls: Vec::new(), provider_metadata: None }
 }
 
 #[async_trait]

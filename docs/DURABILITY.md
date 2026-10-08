@@ -22,27 +22,56 @@ are not yet complete.
 
 ## Platform scope
 
-Every owner-only permission guarantee and every directory-entry sync described
-below is implemented on Unix only. On Windows the corresponding helpers in
-`crates/kernel/src/storage.rs`, `crates/kernel/src/storage_encryption.rs`, and
-`crates/kernel/src/remote_backup.rs` return `Ok(())` unchanged: files and
-directories inherit the parent ACL instead of receiving an owner-only DACL, a
-group- or world-readable storage key is accepted rather than rejected,
-`O_NOFOLLOW` is unavailable so a symlink to a regular key or manifest file
-satisfies the regular-file check, and the atomic same-directory renames used for
-publication are not followed by a directory sync — so a crash after a rename can
-lose it. `write_owner_only` in `crates/kernel/src/config.rs` and
-`create_owner_only_new_file_for` still create and write their file on Windows;
-only the mode is lost.
+Unix private files use mode 0600 and private directories use mode 0700. Windows
+uses `windows_private_fs`: the current process's `TokenUser` SID owns a protected
+DACL containing one `FILE_ALL_ACCESS` ACE. Private directory ACEs inherit to
+children while the protected DACL prevents permissive ancestors from adding
+trustees. `CREATE_NEW` and `CreateDirectoryW` receive their security descriptor
+at creation; key and configuration bytes are never written before the descriptor
+is attached. An existing object's owner must match this process's exact
+`TokenUser` or its OS-selected `TokenOwner`; elevated Windows tokens can select
+an owner group by default. That owner is preserved while the DACL is narrowed
+to one current-`TokenUser` ACE. No arbitrary group or foreign user/SYSTEM owner
+is accepted, and production code never takes ownership or requests restoration
+privileges. New private objects explicitly receive `TokenUser` ownership.
 
-The regressions proving these controls are `#[cfg(unix)]`, so the passing
-`windows-latest` CI leg is compiled-out behavior rather than Windows evidence.
-Explicit `symlink_metadata` checks on backup roots, published directories,
-restore destinations, and sidecars, create-without-overwrite on key material,
-and every SQLite transactional, integrity, WAL, and `synchronous=FULL` guarantee
-in this document are platform-independent and do apply. Windows permission and
-durable-rename enforcement is tracked by
+Windows reads inspect the opened handle with `FILE_FLAG_OPEN_REPARSE_POINT`,
+reject reparse objects and reparse ancestors, and validate private-key ownership
+and the actual DACL before reading bytes. Local canonical drive paths are
+accepted; device namespaces, alternate data streams, and remote-share storage
+are outside this implementation's supported private-storage path contract.
+Private configuration replacement stages a new owner-only file, flushes it,
+and publishes it with a same-directory write-through move. SQLite's main file
+is protected before opening and its private parent restricts sidecar creation.
+
+Trusted in-process operator persistence uses
+`config::write_owner_only_atomic(path, contents)`, shared by configuration and
+local operator stores. It supplies no new wire or tool authority. Callers bound
+and validate payloads and hold any required mutation lock; publication errors
+must be reconciled by rereading. Unix replacement also stages a new mode-0600
+file, tightens any existing current-user-owned file before new bytes, verifies
+the target identity again, renames, and syncs the parent. Windows uses the same
+protected-DACL writer described above. `config::local_operator_identity` derives
+a stable effective UID or a hash of the current TokenUser SID; it is an OS
+operator identity, not a tenant or remote authentication principal.
+
+Windows publication and rollback moves use `MoveFileExW` with
+`MOVEFILE_WRITE_THROUGH`; cross-volume copy/delete fallback is prohibited.
+Directory sync explicitly opens a directory with `FILE_FLAG_BACKUP_SEMANTICS`
+and attempts `FlushFileBuffers`. Where the filesystem rejects directory flushes,
+it creates an owner-only metadata marker, flushes its file handle, and performs a
+same-directory write-through rename before removing the marker. Marker creation,
+flush, and rename errors fail the operation. This fallback performs metadata I/O;
+it is not an unconditional successful stub. Process-exit publication/recovery,
+ACL, ownership, reparse, and cleanup regressions run in Windows CI. These tests
+do not establish physical power-loss, controller-cache, device-loss, network
+filesystem, or independently reviewed production qualification under
 [#123](https://github.com/surya-koritala/AIagentOS/issues/123).
+
+The Windows storage workflow executes the four storage/configuration modules
+and the native Win32 regressions, retains their logs, and rejects missing proving
+tests or a Windows module inventory smaller than its Unix counterpart. Existing
+SQLite transactional, integrity, WAL, and `synchronous=FULL` checks remain intact.
 
 ## Database identity and version
 

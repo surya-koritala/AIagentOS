@@ -36,7 +36,7 @@ projections are separately checked against the same raw snapshot. Feature
 breadth, accessibility, and signed desktop distribution remain release criteria
 rather than implied parity.
 
-`agentctl` exposes the public runtime path without bypasses: `create`,
+`agentctl` exposes the public runtime path without bypasses: `create`, `clone`,
 `message`, `stream`, `cancel`, `checkpoints`, `checkpoint-resume`,
 `checkpoint-delete`, `capabilities`, `providers`, `metrics`, and `protocol`
 map directly to `KernelClient`. A tenant API key therefore scopes creation,
@@ -161,9 +161,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 127 current syscalls and rejects either a missing schema operation or an
-undocumented extra. Deterministic golden request arrays cover all 96 v1
-operations and all 127 v2 operations. Domain payload examples and
+all 128 current syscalls and rejects either a missing schema operation or an
+undocumented extra. Deterministic golden request arrays cover all 97 v1
+operations and all 128 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -731,11 +731,11 @@ distributed kernel.
 Versioned fixtures:
 
 - `protocol/v1/error.json`
-- `protocol/v1/requests.json` (all 61 v1 operations)
+- `protocol/v1/requests.json` (all 84 v1 operations)
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 92 v2 operations)
+- `protocol/v2/requests.json` (all 115 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

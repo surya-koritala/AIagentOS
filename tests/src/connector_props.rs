@@ -17,6 +17,7 @@ fn arb_standard_message() -> impl Strategy<Value = StandardMessage> {
         "[a-zA-Z0-9 .,!?]{5,100}",
     )
         .prop_map(|(role, content)| StandardMessage {
+            provider_metadata: None,
             role: role.to_string(),
             content,
             tool_call_id: None,
@@ -134,6 +135,7 @@ mod hardening {
                 };
             }
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: format!("ok:{}", self.id),
                 finish_reason: Some("stop".into()),
                 tokens_used: 3,

@@ -143,6 +143,7 @@ impl LlmSession for DeepseekSession {
                     })
                     .unwrap_or_default();
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content,
                     finish_reason: json["choices"][0]["finish_reason"]
                         .as_str()
@@ -221,6 +222,7 @@ impl LlmProviderAdapter for DeepseekAdapter {
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
         Some(StandardMessage {
+            provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
             content: value.get("content")?.as_str().unwrap_or("").to_string(),
             tool_call_id: None,

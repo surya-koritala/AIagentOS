@@ -53,10 +53,12 @@ async fn signed_parallel_tool_turn_and_final_text_replay_after_kernel_restart() 
     let file = root.join("fixture.txt");
     std::fs::write(&file, "owned fixture contents").unwrap();
     let db = root.join("store.db");
+    // Capability-relative targets are portable. Windows canonical host paths
+    // carry device prefixes that the kernel deliberately rejects as input.
     let native_parts = json!([
-        {"functionCall": {"name": "read_file", "args": {"path": file.to_string_lossy()}},
+        {"functionCall": {"name": "read_file", "args": {"path": "fixture.txt"}},
          "thoughtSignature": "c2lnbmVkLWNhdGVnb3J5"},
-        {"functionCall": {"name": "read_file", "args": {"path": file.to_string_lossy()}}}
+        {"functionCall": {"name": "read_file", "args": {"path": "fixture.txt"}}}
     ]);
     Mock::given(method("POST"))
         .and(path("/v1beta/models/fixture-native-model:generateContent"))
@@ -144,7 +146,7 @@ async fn malformed_native_round_never_executes_its_earlier_valid_write() {
     let file = root.join("fixture.txt");
     std::fs::write(&file, "original").unwrap();
     Mock::given(method("POST")).respond_with(response(json!([
-        {"functionCall": {"name": "write_file", "args": {"path": file.to_string_lossy(), "content": "changed"}}},
+        {"functionCall": {"name": "write_file", "args": {"path": "fixture.txt", "content": "changed"}}},
         {"functionCall": {"name": "write_file", "args": "invalid arguments"}}
     ]))).expect(1).mount(&server).await;
     let kernel = AgentKernelImpl::new().unwrap();
@@ -165,7 +167,7 @@ async fn signed_native_text_containing_a_tool_example_is_only_text() {
     let file = root.join("fixture.txt");
     std::fs::write(&file, "original").unwrap();
     let example = json!({"tool": "write_file", "arguments": {
-        "path": file.to_string_lossy(), "content": "changed"
+        "path": "fixture.txt", "content": "changed"
     }})
     .to_string();
     Mock::given(method("POST"))

@@ -32,7 +32,7 @@ Both architectures produced the same control results:
 | Controlled outside public/private file reads and outside writes | Denied with `EPERM` |
 | Symlink and `..` reads of those outside fixtures | Denied with `EPERM` |
 | Controlled loopback connection | Denied with `EPERM`; listener accepted no connection |
-| Raw socket descriptor creation | Allowed; connection denial is not socket-creation denial |
+| TCP socket descriptor creation (`AF_INET`/`SOCK_STREAM`) | Allowed; connection denial is not socket-creation denial; raw-IP sockets were not tested |
 | Runtime temporary-file write outside the workspace | Allowed |
 | Fork followed by `setsid` | Allowed; the child can leave the original process group |
 | Undeclared `/usr/bin/true` execution | Allowed |

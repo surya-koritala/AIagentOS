@@ -178,8 +178,12 @@ are described in [memory retrieval](MEMORY_RETRIEVAL.md). The
 [2026-10-08 Linux fixture](../benchmarks/retrieval/2026-10-08-linux-10k/README.md)
 passed with recall/top-one agreement 1.0 and ANN p95 15.228 ms versus exact
 17.851 ms; it measures index searches and excludes database warming.
-Sustained 100k+ latency
-and soak goals remain part of
+The [2026-10-08 100k context fixture](../benchmarks/retrieval/2026-10-08-linux-100k/README.md)
+passes the actual API under 60 seconds of concurrent updates and queries: cold
+16.035 seconds, warm p95 135.619 ms, concurrent-read p95 839.088 ms and process
+peak RSS 398,667,776 bytes. Recall/top-one are 1.0 before and after mutation;
+189 reads/189 writes preserve all facts and the foreign sentinel. These are
+synthetic runner-specific results. Target deployment and 24-hour soak goals remain
 [issue #125](https://github.com/surya-koritala/AIagentOS/issues/125).
 
 ## Protected evidence workflows

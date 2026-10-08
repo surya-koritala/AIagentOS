@@ -1,0 +1,114 @@
+{
+  "corpus_items": 100000,
+  "embedding": {
+    "dimensions": 256,
+    "model": "blended-feature-hash",
+    "version": 2
+  },
+  "evidence_class": "synthetic-context-scale",
+  "failed_checks": [],
+  "integrity": {
+    "actual_distinct_facts": 100000,
+    "actual_rows": 100000,
+    "content_or_metadata_mismatches": 0,
+    "duplicate_ids": 0,
+    "expected_facts": 100000,
+    "foreign_fact_unchanged": true,
+    "missing_facts": 0,
+    "passed": true,
+    "unexpected_facts": 0
+  },
+  "isolation_passed": true,
+  "latency": {
+    "cold_query_ms": 16035,
+    "post_mutation": {
+      "max_us": 265469,
+      "p50_us": 111501,
+      "p95_us": 142871,
+      "p99_us": 214061,
+      "samples": 100
+    },
+    "sustained_read": {
+      "max_us": 937069,
+      "p50_us": 603677,
+      "p95_us": 839088,
+      "p99_us": 926674,
+      "samples": 189
+    },
+    "sustained_write": {
+      "max_us": 984869,
+      "p50_us": 417987,
+      "p95_us": 895003,
+      "p99_us": 965354,
+      "samples": 189
+    },
+    "warm": {
+      "max_us": 210313,
+      "p50_us": 111987,
+      "p95_us": 135619,
+      "p99_us": 196676,
+      "samples": 100
+    }
+  },
+  "memory": {
+    "measurement": "getrusage process-lifetime peak; includes preparation and exact oracle",
+    "peak_rss_bytes": 398667776
+  },
+  "mode": "production-context",
+  "passed": true,
+  "preparation": {
+    "offline_fixture_ms": 17051,
+    "reopen_and_json_migration_ms": 15322
+  },
+  "production_claim_allowed": false,
+  "provider_api_calls": 0,
+  "quality": {
+    "queries": 100,
+    "recall_at_10": 1.0,
+    "top1_agreement": 1.0
+  },
+  "quality_post_mutation": {
+    "queries": 100,
+    "recall_at_10": 1.0,
+    "top1_agreement": 1.0
+  },
+  "queries": 100,
+  "scale_qualification_passed": true,
+  "schema_version": 3,
+  "source": {
+    "architecture": "x86_64",
+    "build_profile": "dev",
+    "commit": "35bc5ad0c2b4f85e25bb26dbf362de3dee139927",
+    "dirty": false,
+    "os": "linux"
+  },
+  "storage_limits": {
+    "global_bytes": 1073741824,
+    "per_agent_bytes": 536870912,
+    "per_tenant_bytes": 805306368
+  },
+  "thresholds": {
+    "max_cold_query_ms": 60000,
+    "max_peak_rss_bytes": 1073741824,
+    "max_sustained_p95_us": 1000000,
+    "max_warm_p95_us": 500000,
+    "minimum_full_reads": 128,
+    "minimum_full_seconds": 60,
+    "minimum_full_writes": 20,
+    "minimum_recall_at_10": 0.8,
+    "minimum_top1_agreement": 0.99
+  },
+  "traffic": {
+    "diagnostics": [],
+    "distinct_updated_facts": 189,
+    "elapsed_seconds": 60.446190751,
+    "errors": 0,
+    "read_interval_ms": 25,
+    "readers": 2,
+    "reads": 189,
+    "requested_seconds": 60,
+    "write_interval_ms": 100,
+    "writers": 2,
+    "writes": 189
+  }
+}

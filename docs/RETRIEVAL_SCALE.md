@@ -68,4 +68,6 @@ relevant PR changes. It does not join the existing 10k required-release-gates
 job. Each run retains JSON and exact source identity for 30 days, requires a
 clean Linux checkout and explicitly checks that production claims remain false.
 The report's development-profile timings describe that runner and this corpus.
-Actual retained 100k results must pass before the capability's scale gap is removed.
+The [retained Linux 100k run](../benchmarks/retrieval/2026-10-08-linux-100k/README.md)
+passed all scale gates. The capability's fixture-scale gap is fulfilled; deployment
+SLO and 24-hour soak requirements remain separate in #125.

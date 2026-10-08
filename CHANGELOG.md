@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a bounded 100k-fact context-manager qualification mode with cold/warm
+  latency, concurrent updates/queries, before/after retrieval quality, whole-store
+  integrity and peak RSS gates. Normal fact writes now reconcile retained indexes
+  incrementally; updates enforce UTF-8 byte limits atomically. A separate hosted
+  workflow retains exact-source synthetic scale evidence. Relates #358.
+
 - Retained per-agent semantic-memory indexes and shared deterministic LSH planes.
   Facts use versioned binary embeddings with atomic JSON migration, repair checks,
   durable mutation revisions, bounded cache eviction and erasure cleanup. LSH

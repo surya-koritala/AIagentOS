@@ -3,6 +3,9 @@
 //! Compares the production LSH index against exact cosine search over the same
 //! corpus. CI fails closed when top-k recall or top-1 agreement regresses.
 
+#[path = "memory_qualification/production.rs"]
+mod production;
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -64,6 +67,14 @@ fn resident_memory_kib() -> Option<u64> {
 fn main() {
     let items = env_usize("MEMORY_BENCH_ITEMS", DEFAULT_ITEMS);
     let queries = env_usize("MEMORY_BENCH_QUERIES", DEFAULT_QUERIES).min(items);
+    if items >= 100_000 || std::env::var("MEMORY_BENCH_MODE").is_ok_and(|mode| mode == "production")
+    {
+        if let Err(error) = production::run(items, queries) {
+            eprintln!("production memory qualification failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let embedder = BlendedEmbedder::default();
     let mut exact = BruteForceIndex::new();
     let mut approximate = LshIndex::with_dim(EMBED_DIM);

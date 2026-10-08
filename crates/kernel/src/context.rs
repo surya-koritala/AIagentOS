@@ -4162,6 +4162,7 @@ impl ContextManager for SqliteContextManager {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let previous_generation = fact_index::generation(&transaction, agent_id)?;
         // Persistence owns the embedding: caller-supplied vectors are not
         // trusted because they may have the wrong model, dimension, or tenant.
         let embedding = self.embedder.embed(&fact.content);
@@ -4185,7 +4186,6 @@ impl ContextManager for SqliteContextManager {
             .query_row(
                 "SELECT agent_id,
                         LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0)
-                        + LENGTH(embedding_model) + LENGTH(content_hash)
                  FROM facts WHERE id = ?1",
                 params![fact.id.to_string()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
@@ -4201,12 +4201,7 @@ impl ContextManager for SqliteContextManager {
             ));
         }
         let replaced_bytes = existing.map_or(0, |(_, bytes)| bytes.max(0) as u64);
-        let incoming_bytes = fact
-            .content
-            .len()
-            .saturating_add(embedding_blob.len())
-            .saturating_add(embedding_model.len())
-            .saturating_add(content_hash.len()) as u64;
+        let incoming_bytes = fact.content.len().saturating_add(embedding_blob.len()) as u64;
         self.enforce_context_storage_locked(
             &transaction,
             agent_id,
@@ -4237,6 +4232,7 @@ impl ContextManager for SqliteContextManager {
                 ],
             )
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        self.sync_cached_fact(&transaction, agent_id, previous_generation, fact.id)?;
         transaction
             .commit()
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
@@ -4665,7 +4661,7 @@ impl SqliteContextManager {
                 &format!("WITH shared_spill_bytes AS ({}), context_bytes(agent_id, byte_count) AS (
                     SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM contexts
                     UNION ALL
-                    SELECT agent_id, LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0) FROM facts
+                    SELECT agent_id, SUM(LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0)) FROM facts GROUP BY agent_id
                     UNION ALL
                     SELECT c.agent_id, LENGTH(CAST(c.messages_json AS BLOB)) + COALESCE(s.logical_bytes - 2, 0)
                         + CASE WHEN s.message_count > 0 AND json_array_length(c.messages_json) > 0 THEN 1 ELSE 0 END
@@ -4720,6 +4716,9 @@ impl SqliteContextManager {
             .read()
             .map(|limits| *limits)
             .unwrap_or_default();
+        if limits.per_agent_bytes == 0 && limits.per_tenant_bytes == 0 && limits.global_bytes == 0 {
+            return Ok(());
+        }
         let usage = Self::context_storage_usage_locked(conn, agent_id, tenant_id)?;
         for (scope, used, limit) in [
             ("agent", usage.agent_bytes, limits.per_agent_bytes),
@@ -7186,11 +7185,27 @@ impl SqliteContextManager {
     ) -> Result<bool, ContextError> {
         let embedding = self.embedder.embed(content);
         let embedding_blob = fact_index::encode(&embedding)?;
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| ContextError::StorageError("SQLite mutex poisoned".into()))?;
-        let updated = conn
+        let mut conn = self.locked_conn();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let replaced_bytes = transaction.query_row(
+            "SELECT LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)),0) + COALESCE(LENGTH(embedding_blob),0) FROM facts WHERE id=?1 AND agent_id=?2",
+            params![fact_id.to_string(),agent_id.to_string()],|row|row.get::<_,i64>(0)
+        ).optional().map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let Some(replaced_bytes) = replaced_bytes else {
+            return Ok(false);
+        };
+        let tenant = Self::agent_tenant_locked(&transaction, agent_id)?;
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant,
+            content.len().saturating_add(embedding_blob.len()) as u64,
+            replaced_bytes.max(0) as u64,
+        )?;
+        let previous_generation = fact_index::generation(&transaction, agent_id)?;
+        let updated = transaction
             .execute(
                 "UPDATE facts
                  SET content = ?1, last_accessed_at = ?2, embedding_json = NULL, embedding_blob = ?3,
@@ -7209,6 +7224,10 @@ impl SqliteContextManager {
                     agent_id.to_string(),
                 ],
             )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        self.sync_cached_fact(&transaction, agent_id, previous_generation, fact_id)?;
+        transaction
+            .commit()
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         Ok(updated == 1)
     }

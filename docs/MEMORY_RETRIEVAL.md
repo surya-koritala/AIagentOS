@@ -15,8 +15,9 @@ order followed by row insertion order. LSH previously relied on unordered
 hash-set traversal for ties; it now honors its deterministic insertion contract.
 
 SQL triggers maintain each agent's durable revision for inserts, updates,
-deletes, repairs, reindexing and access metadata. A changed revision forces the
-next query to warm authoritative rows again. The query's own access updates
+deletes, repairs, reindexing and access metadata. Normal stores/updates reconcile
+one cached fact and vector inside their transaction. Unknown revision changes or
+full reindexing force the next query to warm authoritative rows again. The query's own access updates
 advance its cached revision without another reload. Trigger definitions are
 checked exactly at restart alongside the existing accounting trigger checks.
 
@@ -47,4 +48,5 @@ indexes on the same corpus. At the default 10,000 items/100 planted queries,
 recall@10 must be at least 0.80, top-one agreement at least 0.99, and ANN p95
 must be below exact p95. Timings are specific to that host/build and measure
 index searches; they exclude database warming and are not a deployment SLO.
-Sustained 100k-fact and soak qualification remain tracked in #125.
+The [100k context fixture](RETRIEVAL_SCALE.md) adds concurrent API traffic and
+peak-memory checks. Actual deployment and 24-hour soak qualification remain #125.

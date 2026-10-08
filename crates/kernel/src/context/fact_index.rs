@@ -115,6 +115,7 @@ struct CachedFacts {
     generation: i64,
     index: Box<dyn VectorIndex>,
     facts: Vec<IndexedFact>,
+    positions: HashMap<uuid::Uuid, usize>,
     bytes: usize,
     used: u64,
 }
@@ -187,7 +188,7 @@ impl SqliteContextManager {
                 .is_none_or(|entry| entry.generation != current_generation)
             {
                 cache.remove(agent);
-                let facts = self.load_index_facts(&transaction, agent)?;
+                let facts = self.load_index_facts(&transaction, agent, None)?;
                 #[cfg(test)]
                 {
                     cache.warm_rows += facts.len();
@@ -215,6 +216,11 @@ impl SqliteContextManager {
                 let entry = CachedFacts {
                     generation: generation(&transaction, agent)?,
                     index,
+                    positions: facts
+                        .iter()
+                        .enumerate()
+                        .map(|(position, indexed)| (indexed.fact.id, position))
+                        .collect(),
                     facts,
                     bytes,
                     used: serial,
@@ -262,29 +268,105 @@ impl SqliteContextManager {
         outcome
     }
 
+    /// Reconcile a normal committed-intent write while the store transaction
+    /// owns the connection. An intervening external revision still invalidates
+    /// the whole entry. A failed commit has a different durable generation and
+    /// therefore cannot expose the staged cache state on a later query.
+    pub(super) fn sync_cached_fact(
+        &self,
+        conn: &Connection,
+        agent: AgentId,
+        previous_generation: i64,
+        fact_id: uuid::Uuid,
+    ) -> Result<(), ContextError> {
+        let mut cache = self
+            .fact_cache
+            .lock()
+            .map_err(|_| failed("fact cache lock poisoned"))?;
+        let Some(mut entry) = cache.agents.remove(&agent) else {
+            return Ok(());
+        };
+        if entry.generation != previous_generation {
+            return Ok(());
+        }
+        let mut changed = self.load_index_facts(conn, agent, Some(fact_id))?;
+        let Some(changed) = changed.pop() else {
+            return Err(failed("written fact vanished before cache synchronization"));
+        };
+        let position = entry
+            .positions
+            .get(&fact_id)
+            .copied()
+            .unwrap_or(entry.facts.len());
+        if position == entry.facts.len() && entry.facts.len() == 64 {
+            // Transition from exact to ANN; the small store warms once next time.
+            return Ok(());
+        }
+        let vector = changed
+            .fact
+            .embedding
+            .as_ref()
+            .expect("validated changed embedding");
+        if let Some(old) = entry.facts.get(position) {
+            entry.bytes = entry.bytes.saturating_sub(
+                old.fact.content.len() + old.fact.embedding.as_ref().map_or(0, |v| v.len() * 8),
+            );
+        } else {
+            entry.bytes = entry.bytes.saturating_add(1024);
+        }
+        entry.bytes = entry
+            .bytes
+            .saturating_add(changed.fact.content.len())
+            .saturating_add(vector.len() * 8);
+        entry.index.add(position as u64, vector.clone());
+        if position == entry.facts.len() {
+            entry.positions.insert(fact_id, position);
+            entry.facts.push(changed);
+        } else {
+            entry.facts[position] = changed;
+        }
+        entry.generation = generation(conn, agent)?;
+        cache.serial = cache.serial.wrapping_add(1);
+        entry.used = cache.serial;
+        // Publish applies the same combined-byte and agent-count LRU bounds.
+        drop(cache.publish(agent, entry));
+        Ok(())
+    }
+
     fn load_index_facts(
         &self,
         conn: &Connection,
         agent: AgentId,
+        fact_id: Option<uuid::Uuid>,
     ) -> Result<Vec<IndexedFact>, ContextError> {
-        let mut statement=conn.prepare("SELECT id,content,category,created_at,last_accessed_at,embedding_blob,embedding_json,embedding_model,embedding_version,embedding_dim,content_hash,rowid FROM facts WHERE agent_id=?1 ORDER BY last_accessed_at DESC,rowid ASC").map_err(failed)?;
+        // Keep point refreshes on the primary-key path; a nullable OR predicate
+        // would force a scan of the entire agent store for every update.
+        let filter = if fact_id.is_some() {
+            "AND id = ?2"
+        } else {
+            "AND ?2 IS NULL"
+        };
+        let mut statement=conn.prepare(&format!("SELECT id,content,category,created_at,last_accessed_at,embedding_blob,embedding_json,embedding_model,embedding_version,embedding_dim,content_hash,rowid FROM facts WHERE agent_id=?1 {filter} ORDER BY last_accessed_at DESC,rowid ASC")).map_err(failed)?;
         let rows = statement
-            .query_map([agent.to_string()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, i64>(11)?,
-                ))
-            })
+            .query_map(
+                params![agent.to_string(), fact_id.map(|id| id.to_string())],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                },
+            )
             .map_err(failed)?;
         let mut facts = Vec::new();
         for row in rows {
@@ -338,7 +420,7 @@ impl SqliteContextManager {
         Ok(facts)
     }
 }
-fn generation(conn: &Connection, agent: AgentId) -> Result<i64, ContextError> {
+pub(super) fn generation(conn: &Connection, agent: AgentId) -> Result<i64, ContextError> {
     conn.query_row(
         "SELECT generation FROM fact_index_generations WHERE agent_id=?1",
         [agent.to_string()],
@@ -832,5 +914,146 @@ mod tests {
                 .content,
             "secret for tenant-b"
         );
+    }
+    #[tokio::test]
+    async fn normal_updates_and_inserts_refresh_one_row_without_rewarming() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        for id in 1..=80 {
+            manager
+                .store_fact(owner, fact(id, &format!("service incident {id}")))
+                .await
+                .unwrap();
+        }
+        manager.query_memory(owner, "incident").await.unwrap();
+        let before = manager.fact_cache.lock().unwrap().warm_rows;
+        assert!(manager
+            .update_fact(owner, uuid::Uuid::from_u128(3), "unique violet remediation")
+            .unwrap());
+        assert_eq!(
+            manager
+                .query_memory(owner, "unique violet remediation")
+                .await
+                .unwrap()[0]
+                .id,
+            uuid::Uuid::from_u128(3)
+        );
+        manager
+            .store_fact(owner, fact(81, "unique cobalt repair"))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .query_memory(owner, "unique cobalt repair")
+                .await
+                .unwrap()[0]
+                .id,
+            uuid::Uuid::from_u128(81)
+        );
+        manager
+            .store_fact(owner, fact(3, "replacement gold repair"))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .query_memory(owner, "replacement gold repair")
+                .await
+                .unwrap()[0]
+                .content,
+            "replacement gold repair"
+        );
+        assert_eq!(
+            manager.fact_cache.lock().unwrap().warm_rows,
+            before,
+            "ordinary writes must not reload the whole store"
+        );
+        assert_eq!(
+            manager
+                .locked_conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM facts WHERE agent_id=?1",
+                    [owner.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            81
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_refresh_does_not_hide_intervening_authoritative_changes() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        manager.store_fact(owner, fact(1, "first")).await.unwrap();
+        manager.store_fact(owner, fact(2, "second")).await.unwrap();
+        manager.query_memory(owner, "first").await.unwrap();
+        manager
+            .locked_conn()
+            .execute(
+                "UPDATE facts SET content='external important marker' WHERE id=?1",
+                [uuid::Uuid::from_u128(1).to_string()],
+            )
+            .unwrap();
+        manager
+            .update_fact(owner, uuid::Uuid::from_u128(2), "ordinary update")
+            .unwrap();
+        assert_eq!(
+            manager
+                .query_memory(owner, "external important marker")
+                .await
+                .unwrap()[0]
+                .content,
+            "external important marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_commit_cannot_publish_staged_cached_fact_content() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        manager
+            .store_fact(owner, fact(1, "original"))
+            .await
+            .unwrap();
+        manager.query_memory(owner, "original").await.unwrap();
+        manager.locked_conn().execute_batch("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_guard(id INTEGER, FOREIGN KEY(id) REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER reject_fact_commit AFTER UPDATE ON facts WHEN NEW.content='blocked' BEGIN INSERT INTO commit_guard VALUES(1); END;").unwrap();
+        assert!(manager
+            .update_fact(owner, uuid::Uuid::from_u128(1), "blocked")
+            .is_err());
+        let result = manager.query_memory(owner, "original").await.unwrap();
+        assert_eq!(result[0].content, "original");
+        assert_eq!(
+            result[0].embedding.as_ref().unwrap(),
+            &manager.embedder.embed("original")
+        );
+    }
+
+    #[tokio::test]
+    async fn fact_replacements_and_updates_enforce_utf8_logical_byte_limits() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        let limit = encode(&manager.embedder.embed("seed")).unwrap().len() as u64 + 4;
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: limit,
+                per_tenant_bytes: limit,
+                global_bytes: limit,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+        manager.store_fact(owner, fact(1, "seed")).await.unwrap();
+        manager.query_memory(owner, "seed").await.unwrap();
+        assert!(manager
+            .update_fact(owner, uuid::Uuid::from_u128(1), &"🌲".repeat(50))
+            .is_err());
+        assert_eq!(
+            manager.query_memory(owner, "seed").await.unwrap()[0].content,
+            "seed"
+        );
+        assert!(manager
+            .update_fact(owner, uuid::Uuid::from_u128(1), "tiny")
+            .unwrap());
+        manager.store_fact(owner, fact(1, "seed")).await.unwrap();
+        assert!(manager.store_fact(owner, fact(2, "x")).await.is_err());
     }
 }

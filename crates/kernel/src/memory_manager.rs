@@ -349,6 +349,7 @@ pub trait VectorIndex: Send + Sync {
 #[derive(Debug, Default, Clone)]
 pub struct BruteForceIndex {
     entries: Vec<(u64, Vec<f32>, f32)>,
+    positions: std::collections::HashMap<u64, usize>,
 }
 
 impl BruteForceIndex {
@@ -356,6 +357,7 @@ impl BruteForceIndex {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            positions: std::collections::HashMap::new(),
         }
     }
 }
@@ -363,10 +365,11 @@ impl BruteForceIndex {
 impl VectorIndex for BruteForceIndex {
     fn add(&mut self, id: u64, vec: Vec<f32>) {
         let norm = vector_norm(&vec);
-        if let Some(slot) = self.entries.iter_mut().find(|(eid, _, _)| *eid == id) {
-            slot.1 = vec;
-            slot.2 = norm;
+        if let Some(position) = self.positions.get(&id).copied() {
+            self.entries[position].1 = vec;
+            self.entries[position].2 = norm;
         } else {
+            self.positions.insert(id, self.entries.len());
             self.entries.push((id, vec, norm));
         }
     }

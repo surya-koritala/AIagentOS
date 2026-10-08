@@ -79,37 +79,6 @@ fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a 
         .map(String::as_str)
         .ok_or_else(|| Error::Contract(format!("{name} is required")))
 }
-fn fixture_spec() -> TaskSpec {
-    TaskSpec {
-        instruction: "Fix bounded_prefix to return the maximal borrowed UTF-8 prefix within a byte budget, preserving its signature and all integration tests.".into(),
-        files: vec!["Cargo.toml".into(), "Cargo.lock".into(), "src/lib.rs".into(), "tests/utf8_budget.rs".into()],
-        editable: vec!["src/lib.rs".into()], test_target: "utf8_budget".into(), max_branches: 2,
-        max_steps: 1024, deadline_seconds: 600, max_usd: 0.01, max_output_tokens: 2048,
-    }
-}
-fn fixture_files() -> BTreeMap<String, String> {
-    [
-        (
-            "Cargo.toml",
-            include_str!("../../../fixtures/coding-agent/utf8-budget/Cargo.toml"),
-        ),
-        (
-            "Cargo.lock",
-            include_str!("../../../fixtures/coding-agent/utf8-budget/Cargo.lock"),
-        ),
-        (
-            "src/lib.rs",
-            include_str!("../../../fixtures/coding-agent/utf8-budget/src/lib.rs"),
-        ),
-        (
-            "tests/utf8_budget.rs",
-            include_str!("../../../fixtures/coding-agent/utf8-budget/tests/utf8_budget.rs"),
-        ),
-    ]
-    .into_iter()
-    .map(|(path, text)| (path.into(), text.into()))
-    .collect()
-}
 fn agent_config(name: &str) -> AgentConfig {
     AgentConfig {
         name: name.into(),
@@ -226,7 +195,7 @@ async fn execute(args: Vec<String>) -> Result<(), Error> {
         let image = required(&values, "--image")?.to_string();
         kernel::docker_sandbox::validate_digest_image(&image).map_err(Error::Contract)?;
         let spec = if mode == "fixture" {
-            fixture_spec()
+            coding_agent::fixture::spec()
         } else {
             serde_json::from_str(&bounded_config(Path::new(required(
                 &values,
@@ -378,7 +347,7 @@ async fn execute(args: Vec<String>) -> Result<(), Error> {
             // Check the actual rootless/pinned backend before incurring provider cost.
             probe(&kernel, &mut io.control, journal.parent).await?;
             journal.files = if mode == "fixture" {
-                fixture_files()
+                coding_agent::fixture::files()
             } else {
                 let repo = std::fs::canonicalize(required(&values, "--repo")?)
                     .map_err(|_| Error::Contract("repository directory unavailable".into()))?;

@@ -1,5 +1,6 @@
 //! Bounded repository maintenance through the public kernel client.
 
+pub mod fixture;
 pub mod io;
 pub mod provider;
 pub mod types;

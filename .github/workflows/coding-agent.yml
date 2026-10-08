@@ -134,6 +134,12 @@ jobs:
           target/debug/agent-code resume --data-dir "$RUNNER_TEMP/coding-fixture" > target/coding-evidence/replayed-report.json
           test "$(jq .provider_tokens target/coding-evidence/completed.json)" = "$(jq .provider_tokens target/coding-evidence/replayed-report.json)"
           test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
+      - name: Compare the same fixture with sequential and contained direct attempts
+        run: |
+          cargo run -p os-benchmark --bin coding-comparison --locked -- --image "$CODING_RUST_IMAGE" \
+            > target/coding-evidence/comparison.json 2> target/coding-evidence/comparison-events.jsonl
+          jq -e '.evidence_class == "deterministic_fixture" and .provider_api_calls == 0 and .containment_in_every_strategy == true and (.results | length == 3) and all(.results[]; .completed == true and .attempts == 2)' target/coding-evidence/comparison.json
+          test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
       - name: Retain actual fixture outcomes
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -17,6 +17,14 @@ fn drops() -> Vec<String> {
     vec!["CAP_NET_ACCESS".into()]
 }
 
+pub fn preparation_prompt(j: &Journal) -> Result<String, Error> {
+    let corpus = j.files.iter().map(|(path, content)| serde_json::json!({"path":path,"sha256":hash(content.as_bytes()),"content":content})).collect::<Vec<_>>();
+    Ok(format!("Prepare coding task: {}\nRepository snapshot: {}\nRead this data only. Acknowledge preparation with exactly {{\"edits\":[]}}; do not call tools or change files. Next requests will ask for source edits.", j.spec.instruction, serde_json::to_string(&corpus)?))
+}
+pub fn candidate_prompt(index: u32, editable: &[String]) -> String {
+    format!("candidate={index}\nPropose a different fix for the prepared task. Return only JSON {{\"edits\":[{{\"path\":\"...\",\"expected_sha256\":\"...\",\"replacement\":\"...\"}}]}}. Allowed editable paths: {editable:?}. No tools, test edits, dependency changes, deletes, credentials or remote writes.")
+}
+
 pub fn register_test_tool(kernel: &AgentKernelImpl, target: &str) -> Result<(), Error> {
     kernel.tool_registry.register_command_tool(ToolBinding {
         name: TEST_TOOL.into(), description: "Run the explicitly permitted offline, locked Rust test target".into(),
@@ -269,9 +277,13 @@ async fn candidate(
     }
     if branch.phase == Phase::Proposing {
         protected(io, j, &branch).await?;
-        let output = model(io, branch.id, &branch.request_id, format!(
-            "candidate={}\nPropose a different fix for the prepared task. Return only JSON {{\"edits\":[{{\"path\":\"...\",\"expected_sha256\":\"...\",\"replacement\":\"...\"}}]}}. Allowed editable paths: {:?}. No tools, test edits, dependency changes, deletes, credentials or remote writes.",
-            branch.index, j.spec.editable)).await?;
+        let output = model(
+            io,
+            branch.id,
+            &branch.request_id,
+            candidate_prompt(branch.index, &j.spec.editable),
+        )
+        .await?;
         j.provider_tokens += output.tokens as u64;
         let proposal = Proposal::parse(&output.content)?;
         proposal.validate(&j.spec, &j.files)?;
@@ -381,9 +393,13 @@ pub async fn run_job(
         }
         j.status = "preparing_context".into();
         io.persist(j).await?;
-        let corpus = j.files.iter().map(|(path, content)| serde_json::json!({"path":path,"sha256":hash(content.as_bytes()),"content":content})).collect::<Vec<_>>();
-        let output = model(io, j.parent, &format!("coding-{}-base", j.id), format!(
-            "Prepare coding task: {}\nRepository snapshot: {}\nRead this data only. Acknowledge preparation with exactly {{\"edits\":[]}}; do not call tools or change files. Next requests will ask for source edits.", j.spec.instruction, serde_json::to_string(&corpus)?)).await?;
+        let output = model(
+            io,
+            j.parent,
+            &format!("coding-{}-base", j.id),
+            preparation_prompt(j)?,
+        )
+        .await?;
         if !Proposal::parse(&output.content)?.edits.is_empty() {
             return Err(Error::Contract("baseline must not propose effects".into()));
         }

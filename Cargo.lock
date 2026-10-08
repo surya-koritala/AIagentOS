@@ -4787,6 +4787,7 @@ dependencies = [
  "agent-sdk",
  "async-trait",
  "chrono",
+ "coding-agent",
  "kernel",
  "libc",
  "rusqlite",

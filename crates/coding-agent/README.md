@@ -116,3 +116,24 @@ fixtures, separate from real-provider outcomes and production qualification.
 Reviewed real-provider tasks, same-agent comparisons, invoice/cost evidence,
 clean-host downloadable package verification and independent review remain
 required by #394/#127. This source package does not establish those missing gates.
+
+The operator-only `coding-comparison` harness compares this same fixture with
+COW branching, sequential attempts in one governed agent, and a direct contained
+baseline. All strategies use the same task, prompts, proposal decoder, source
+preimages, protected test input and immutable test image. The direct baseline
+omits the kernel's agent/gate/journal path but retains the rootless process
+boundary; it is not a product execution mode. The harness reports single-run
+timings and synthetic fixture token counters, not real-model performance or bills.
+
+```bash
+cargo run -p os-benchmark --bin coding-comparison --locked -- \
+  --image "$CODING_RUST_IMAGE"
+```
+
+The fixture workflow also builds a canonical five-binary candidate archive and
+downloads it onto a separate Ubuntu 22.04 runner without a source checkout.
+The install check validates its SHA-256, exact binary versions and quick-start
+help before running the isolated task and two fresh-process resumes. Candidate
+artifacts are downloadable from that workflow's run. They remain development
+candidates; this check does not replace signed-release publication or the
+independent qualification gates.

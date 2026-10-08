@@ -140,10 +140,22 @@ pub struct UsageTelemetry {
     /// floating-point drift. Older checkpoints deserialize this as zero.
     #[serde(default)]
     pub charged_cost_micros: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub degraded_requests: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_native_tool_definitions: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shim_recovered_tool_calls: u32,
 }
+
+fn is_zero(value: &u32) -> bool { *value == 0 }
 
 impl UsageTelemetry {
     fn record(&mut self, call: &ProviderCall) {
+        if let Some(record) = &call.tool_degradation {
+            self.degraded_requests = self.degraded_requests.saturating_add(1);
+            self.dropped_native_tool_definitions = self.dropped_native_tool_definitions.saturating_add(record.dropped_tool_count);
+        }
         self.input_tokens = self.input_tokens.saturating_add(call.usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(call.usage.output_tokens);
         self.cached_tokens = self.cached_tokens.saturating_add(call.usage.cached_tokens);
@@ -166,6 +178,7 @@ struct ProviderCall {
     attempts: u32,
     retries: u32,
     latency_ms: u64,
+    tool_degradation: Option<crate::connector::ProviderToolDegradation>,
 }
 
 /// The agent executor — drives the think→act→observe loop.
@@ -406,11 +419,13 @@ impl AgentExecutor {
         &mut self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<(), KernelError> {
+        self.session.validate_tool_policy(tools).map_err(KernelError::Connector)?;
         let budget = self.context_budget_tokens;
         if budget == 0 {
             return Ok(());
         }
         let tool_tokens = Self::conservative_tool_tokens(tools);
+        let tool_tokens = tool_tokens.saturating_add(self.session.tool_prompt_overhead(tools));
         let original_message_tokens = self.estimate_prompt_tokens(&self.messages);
         let original_tokens = original_message_tokens.saturating_add(tool_tokens);
         if original_tokens <= budget {
@@ -967,6 +982,7 @@ impl AgentExecutor {
             let mut tool_calls = response.tool_calls.clone();
             if tool_calls.is_empty() && response.provider_metadata.is_none() {
                 tool_calls = crate::function_calling::parse_tool_calls(&response.content);
+                usage.shim_recovered_tool_calls = usage.shim_recovered_tool_calls.saturating_add(u32::try_from(tool_calls.len()).unwrap_or(u32::MAX));
             }
 
             // If no tool calls (native or shim-recovered), we're done — return content
@@ -1140,6 +1156,7 @@ impl AgentExecutor {
         &self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<ProviderCall, KernelError> {
+        self.session.validate_tool_policy(tools).map_err(KernelError::Connector)?;
         if self.max_output_tokens_per_request > 0 && !self.session.enforces_max_output_tokens() {
             return Err(KernelError::Policy(format!(
                 "provider session {}/{} does not enforce the configured max_output_tokens_per_request={}; bounded token admission refuses to call it",
@@ -1152,7 +1169,8 @@ impl AgentExecutor {
         let clean_messages = self.clean_messages();
         let estimated_input_tokens = self
             .estimate_prompt_tokens(&clean_messages)
-            .saturating_add(Self::conservative_tool_tokens(tools));
+            .saturating_add(Self::conservative_tool_tokens(tools))
+            .saturating_add(self.session.tool_prompt_overhead(tools));
         let estimated_admission_tokens =
             estimated_input_tokens.saturating_add(self.max_output_tokens_per_request);
         let provider_attempt_budget = self.session.max_provider_attempts().max(1);
@@ -1437,6 +1455,7 @@ impl AgentExecutor {
                         attempts,
                         retries: attempts.saturating_sub(1),
                         latency_ms: provider_latency_ms,
+                        tool_degradation: self.session.last_tool_degradation(),
                     });
                 }
                 Err(e) => {

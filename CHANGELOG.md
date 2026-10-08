@@ -10,6 +10,11 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added explicit native-tool policy for an incompatible primary provider.
+  Operators can reject before request/failover I/O or retain the default governed
+  plaintext shim with one per-session degradation audit and per-turn counters.
+  Prompt overhead is included in context and token admission. Relates #356.
+
 - Added Gemini native JSON-schema function declarations, ordered parallel calls
   and paired results, with bounded durable assistant replay state and preserved
   thought signatures. Checkpoints, cloning, restart, context admission and

@@ -1138,6 +1138,8 @@ impl WireErrorCode {
             (Self::AuthenticationFailed, false)
         } else if message.contains("authorization denied") {
             (Self::AuthorizationDenied, false)
+        } else if message.contains("primary provider tool incompatibility") {
+            (Self::Provider, false)
         } else if message.contains("bad request") {
             (Self::InvalidRequest, false)
         } else if message.contains("invalid agent id") || message.contains("invalid ") {
@@ -7418,6 +7420,15 @@ mod tests {
                 "{error:?} produced {message:?}"
             );
         }
+    }
+
+    #[test]
+    fn primary_tool_policy_rejection_is_permanent_on_the_wire() {
+        let error = crate::ConnectorError::ToolIncompatiblePrimary(crate::ProviderErrorContext {
+            provider: "fixture".into(), message: "operator rejects degraded tools".into(), request_id: None,
+        });
+        assert!(!crate::connector::is_transient(&error));
+        assert_eq!(WireErrorCode::classify(&crate::KernelError::Connector(error).to_string()), (WireErrorCode::Provider, false));
     }
 
     #[test]

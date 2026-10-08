@@ -970,6 +970,8 @@ pub struct Config {
     /// Optional operator-owned embedding service. None keeps offline vectors.
     #[serde(default)]
     pub embeddings: Option<crate::memory_manager::HttpEmbeddingConfig>,
+    #[serde(default)]
+    pub provider_routing: HashMap<ProviderId, crate::connector::ProviderRoutingPolicy>,
     pub api_keys: HashMap<ProviderId, String>,
     pub data_dir: PathBuf,
     #[serde(default)]
@@ -1249,6 +1251,7 @@ impl Default for Config {
             llm_provider: "azure-openai".to_string(),
             default_model: "gpt-4o".to_string(),
             embeddings: None,
+            provider_routing: HashMap::new(),
             api_keys: HashMap::new(),
             data_dir: default_data_dir(),
             setup_complete: false,

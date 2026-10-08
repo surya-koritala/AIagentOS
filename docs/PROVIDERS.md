@@ -66,6 +66,29 @@ reserves its worst-case failover request/token count before provider I/O and
 reconciles the exact attempts after success, failure, or cancellation. A later
 retry round requires a new durable admission.
 
+A tool-incompatible primary uses an explicit policy. The compatibility default
+is `degraded-shim`: native definitions are omitted, the same declarations are
+rendered as a plaintext tool protocol, and every recovered call still passes the
+normal gate. The connector warns and records provider/model/dropped-definition
+count once per logical session in the agent's bounded activity log. Turn usage
+reports `degraded_requests`, `dropped_native_tool_definitions` and
+`shim_recovered_tool_calls`; zero fields are omitted for older wire/checkpoint
+compatibility. Audit retention remains the normal bounded observability policy.
+
+An operator can require native support at boot:
+
+```toml
+[provider_routing.huggingface]
+tool_incompatible_primary = "reject"
+```
+
+`reject` returns `ToolIncompatiblePrimary` before provider request or failover I/O;
+it is permanent on the wire. Empty tool sets are accepted, and native primaries
+produce no degradation event. Provider views expose this routing policy. The
+rendered protocol's serialized bytes are reserved alongside the original prompt
+and declarations before context/token admission. This is fixture-tested behavior;
+real model quality remains not run.
+
 Failover is compatibility-checked before any backup receives a prompt:
 
 - a request carrying native tools never routes to an adapter without tool

@@ -459,6 +459,9 @@ pub enum ConnectorError {
     #[error("Provider rejected request: {0:?}")]
     InvalidRequest(ProviderErrorContext),
 
+    #[error("Primary provider tool incompatibility: {0:?}")]
+    ToolIncompatiblePrimary(ProviderErrorContext),
+
     #[error("Provider content filter blocked request: {0:?}")]
     ContentFiltered(ProviderErrorContext),
 
@@ -556,6 +559,7 @@ impl ConnectorError {
             | Self::Authorization(context)
             | Self::ServiceUnavailable(context)
             | Self::InvalidRequest(context)
+            | Self::ToolIncompatiblePrimary(context)
             | Self::ContentFiltered(context)
             | Self::Timeout(context)
             | Self::Cancelled(context) => context.request_id.as_deref(),
@@ -1455,6 +1459,9 @@ impl AgentKernelImpl {
             Some(storage_lease),
         )?;
         kernel.backup_maintenance.configure(config.backup.clone())?;
+        for (provider, policy) in &config.provider_routing {
+            kernel.connector.set_routing_policy(provider, policy.clone());
+        }
         if let Some(service_dir) = &config.service_dir {
             *kernel
                 .service_directory
@@ -1578,6 +1585,8 @@ impl AgentKernelImpl {
         // decisions (and denials) are recorded in the agent activity log.
         let observability = Arc::new(ObservabilityEngineImpl::new());
         syscall_gate.set_audit_sink(observability.clone());
+        let connector = Arc::new(AgentConnectorImpl::new());
+        connector.set_degradation_audit_sink(observability.clone());
         // Cumulative USD spend ceiling (inert unless price + ceiling configured).
         // Rehydrate exact fixed-point charges before any agent can be admitted;
         // resetting a configured lifetime ceiling on restart would fail open.
@@ -1641,7 +1650,7 @@ impl AgentKernelImpl {
             sandbox_manager,
             ipc,
             observability,
-            connector: Arc::new(AgentConnectorImpl::new()),
+            connector,
             resource_broker,
             tool_registry,
             tool_vfs: crate::vfs::ToolVfs::default(),
@@ -5166,6 +5175,8 @@ impl AgentKernelImpl {
             .agent_manager
             .get_agent_provider(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
+        let tools = self.tool_registry.definitions_for_agent(&self.syscall_gate, agent_id);
+        self.connector.validate_primary_tool_policy(&provider_id, &tools).map_err(KernelError::Connector)?;
         let restored_history = self.context_manager.latest_execution_history(agent_id)?;
         let session = self
             .connector
@@ -5248,6 +5259,9 @@ impl AgentKernelImpl {
                 .usage
                 .charged_cost_micros
                 .saturating_sub(baseline_usage.charged_cost_micros),
+            degraded_requests: output.usage.degraded_requests.saturating_sub(baseline_usage.degraded_requests),
+            dropped_native_tool_definitions: output.usage.dropped_native_tool_definitions.saturating_sub(baseline_usage.dropped_native_tool_definitions),
+            shim_recovered_tool_calls: output.usage.shim_recovered_tool_calls.saturating_sub(baseline_usage.shim_recovered_tool_calls),
         };
         self.agent_manager.record_activity(agent_id);
         ObservabilityEngine::record_metrics(

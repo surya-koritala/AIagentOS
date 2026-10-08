@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added bounded native Anthropic Messages and Gemini SSE streams with shared
+  byte framing, cancellation, usage and tool assembly. Signed thinking and
+  Gemini streamed Content boundaries survive durable history; schema 12 refuses
+  readers that would flatten signatures. Keyless conformance and restart
+  fixtures run on CI; real-service qualification remains pending. Relates #352.
+
 - Added native bounded SSE streaming for OpenAI, Groq, DeepSeek and vLLM,
   using Azure's shared byte-safe reader. Keyless nine-provider conformance
   fixtures cover capability declarations, parallel tool argument assembly,

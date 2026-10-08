@@ -25,10 +25,10 @@ plaintext tool shim is separate.
 |---|---:|---:|---:|---:|---:|---:|---|---|
 | Azure OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Deployment + configured API version | **Not run** |
 | OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Configured model; OpenAI v1 family | **Not run** |
-| Anthropic | Yes | No; bounded non-streaming fallback | Yes / yes | Input, output, cache-read | Yes / yes | Not in the standard message contract | Configured model; Messages API family | **Not run** |
+| Anthropic | Yes | Yes, SSE | Yes / yes | Input, output, cache-read | Yes / yes | Not in the standard message contract | Configured model; Messages API family | **Not run** |
 | Groq | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | DeepSeek | Yes | Yes, SSE | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| Gemini | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
+| Gemini | Yes | Yes, SSE | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
 | vLLM | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
@@ -58,7 +58,7 @@ redaction.
 
 ### Native streaming conformance
 
-Azure OpenAI, OpenAI, Groq, DeepSeek and vLLM use one SSE reader. It retains
+Azure OpenAI, OpenAI, Groq, DeepSeek and vLLM use one SSE reader. Anthropic Messages and Gemini streamGenerateContent share its byte framing, wire ceilings, cancellation and bounded event sink through their typed decoders. It retains
 UTF-8 across HTTP chunks, accepts SSE line endings and comments, reassembles
 parallel function arguments by index, and preserves final prompt, completion
 and cached usage (including DeepSeek cache-hit fields). The entire response,
@@ -67,7 +67,7 @@ and identities are bounded; malformed arguments, sparse indexes and duplicate
 identities fail before any tool execution. A truncated stream is an error.
 
 The reusable fixture checks all nine network adapters independently of their
-capability flags: native adapters publish multiple text deltas; compatibility
+capability flags: seven native adapters publish multiple text deltas; compatibility
 adapters publish one completed delta. Concatenated text must equal the terminal
 response. A paused chunked HTTP fixture proves delivery before completion and
 split UTF-8 handling. Cancellation and deadlines cover channel backpressure;
@@ -75,6 +75,34 @@ visible-output failures suppress connector retry and failover. These tests run
 in `provider-streaming.yml` and the platform/workspace CI suites without keys,
 model downloads or live requests. They qualify the protocol implementation;
 real provider evidence remains **Not run**.
+
+### Anthropic and Gemini typed streams
+
+Anthropic accumulates text, JSON tool fragments, cumulative output usage and
+signed thinking blocks. Native calls become available only after the message
+stops and all blocks close; fragments never execute. Its history compiler pairs
+parallel tool results and replays complete signed blocks through later turns.
+
+Gemini uses `streamGenerateContent?alt=sse` with `x-goog-api-key` in the header.
+It preserves every streamed Content entry and exact part ordering, including a
+late signature on empty text. Thought text is retained privately rather than
+published as a text delta. The opaque replay payload retains chunk-part counts
+and is capped at 256 KiB, 2048 chunks and 4096 parts; each chunk is at most 64
+parts and terminal native calls are limited to 64. Schema/min-reader 12 prevents
+older adapters from flattening even short signed histories. Usage includes
+thought tokens; a blocking final finish reason returns a typed filter error.
+
+Both protocols share the 8 MiB wire ceiling and enforce a 1 MiB event ceiling.
+Clean EOF after complete text events can return that text with no finish reason.
+EOF within a wire event, unfinished tool calls, transport failures, malformed
+JSON and oversized replay state fail. Visible failures retain retry/failover
+suppression; cancellation and deadlines cover event-sink backpressure.
+
+These rules follow the [Anthropic streaming contract](https://platform.claude.com/docs/en/build-with-claude/streaming)
+and [Gemini GenerateContent signature contract](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures).
+The [official SDK history accumulator](https://github.com/googleapis/python-genai/blob/main/google/genai/chats.py)
+retains streamed model Content entries separately. Keyless CI fixtures qualify
+this implementation; protected real-service qualification remains **Not run**.
 
 ### Retry, circuit breaking, and failover
 

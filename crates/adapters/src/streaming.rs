@@ -337,7 +337,7 @@ impl StreamState {
 
 /// Byte framing preserves split UTF-8 and accepts LF, CRLF, CR and comments.
 #[derive(Default)]
-struct SseDecoder {
+pub(crate) struct SseDecoder {
     line: Vec<u8>,
     data: Vec<u8>,
     has_data: bool,
@@ -345,7 +345,7 @@ struct SseDecoder {
 }
 
 impl SseDecoder {
-    fn byte(&mut self, byte: u8) -> Option<Vec<u8>> {
+    pub(crate) fn byte(&mut self, byte: u8) -> Option<Vec<u8>> {
         if self.skip_lf {
             self.skip_lf = false;
             if byte == b'\n' {
@@ -374,6 +374,96 @@ impl SseDecoder {
         }
         self.line.clear();
         None
+    }
+}
+
+/// Provider-specific state consumes complete JSON events from common framing.
+pub(crate) trait NativeSseProtocol: Send {
+    fn event(&mut self, json: Value) -> Result<Vec<String>, ConnectorError>;
+    fn complete(&self) -> bool;
+    fn finish(self) -> Result<LlmResponse, ConnectorError>;
+}
+
+/// Reuse byte framing, aggregate ceilings, cancellation and sink backpressure
+/// for protocols whose event JSON differs from Chat Completions.
+pub(crate) async fn send_native_sse_controlled<D: NativeSseProtocol>(
+    provider: &str,
+    request: reqwest::RequestBuilder,
+    mut state: D,
+    options: LlmRequestOptions,
+    cancellation: &tokio_util::sync::CancellationToken,
+    events: Option<ProviderEventSink>,
+) -> Result<LlmResponse, ConnectorError> {
+    let send = async {
+        let response = request
+            .send()
+            .await
+            .map_err(|error| crate::transport_error(provider, error))?;
+        if !response.status().is_success() {
+            return Err(crate::provider_http_error(provider, response).await);
+        }
+        if response.content_length().is_some_and(|size| size > MAX_OPENAI_STREAM_BYTES as u64) {
+            return Err(protocol("response exceeded the 8 MiB wire ceiling"));
+        }
+        let mut bytes = response.bytes_stream();
+        let mut total = 0_usize;
+        let mut decoder = SseDecoder::default();
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk.map_err(|_| {
+                ConnectorError::StreamError("native SSE transport failed".into())
+            })?;
+            total = total.saturating_add(chunk.len());
+            if total > MAX_OPENAI_STREAM_BYTES {
+                return Err(protocol("response exceeded the 8 MiB wire ceiling"));
+            }
+            for byte in chunk {
+                if let Some(data) = decoder.byte(byte) {
+                    let json: Value = serde_json::from_slice(&data)
+                        .map_err(|_| protocol("malformed native SSE JSON"))?;
+                    for text in state.event(json)? {
+                        if !text.is_empty() {
+                            if let Some(sink) = &events {
+                                sink.emit(ProviderStreamEvent::TextDelta(text)).await;
+                            }
+                        }
+                    }
+                    if state.complete() {
+                        return state.finish();
+                    }
+                }
+                if decoder.line.len().saturating_add(decoder.data.len()) > 1024 * 1024 {
+                    return Err(protocol("native SSE event exceeded the 1 MiB ceiling"));
+                }
+            }
+        }
+        // An unfinished line/event is a broken wire frame, not a clean EOF.
+        if !decoder.line.is_empty() || decoder.has_data {
+            return Err(ConnectorError::StreamError("native SSE ended inside an event".into()));
+        }
+        state.finish()
+    };
+    tokio::pin!(send);
+    match options.timeout {
+        Some(timeout) => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    Err(ConnectorError::cancelled(provider.to_string(), None))
+                }
+                result = tokio::time::timeout(timeout, &mut send) => {
+                    result.unwrap_or_else(|_| {
+                        Err(ConnectorError::timeout(provider.to_string(), "native stream attempt exceeded its deadline", None))
+                    })
+                }
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(ConnectorError::cancelled(provider.to_string(), None)),
+                result = &mut send => result,
+            }
+        }
     }
 }
 

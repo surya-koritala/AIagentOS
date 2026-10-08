@@ -45,6 +45,58 @@ fn register(kernel: &AgentKernelImpl, server: &MockServer) {
 }
 
 #[tokio::test]
+async fn streamed_native_signed_boundaries_survive_governed_tools_and_restart() {
+    let server = MockServer::start().await;
+    let root = std::env::temp_dir().join(format!("agentos-streamed-native-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap(); let root = std::fs::canonicalize(root).unwrap();
+    std::fs::write(root.join("fixture.txt"), "owned streaming fixture").unwrap();
+    let db = root.join("store.db");
+    let first = json!({"functionCall": {"name": "read_file", "args": {"path": "fixture.txt"}}, "thoughtSignature": "c2lnMQ=="});
+    let second = json!({"functionCall": {"name": "read_file", "args": {"path": "fixture.txt"}}, "thoughtSignature": "c2lnMg=="});
+    let chunks = [
+        json!({"candidates": [{"content": {"role": "model", "parts": [first.clone()]}}]}),
+        json!({"candidates": [{"content": {"role": "model", "parts": [second.clone()]}, "finishReason": "STOP"}]}),
+    ];
+    let native = chunks.iter().map(|chunk| format!("data: {chunk}\n\n")).collect::<String>();
+    Mock::given(method("POST")).and(path("/v1beta/models/fixture-native-model:streamGenerateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(native)).up_to_n_times(1).with_priority(1).mount(&server).await;
+    let final_chunks = [json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "verified "}]}}]}),
+        json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "fixture"}]}}]}),
+        json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "", "thoughtSignature": "c2lnLWZpbmFs"}]}, "finishReason": "STOP"}]})];
+    Mock::given(method("POST")).and(path("/v1beta/models/fixture-native-model:streamGenerateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(final_chunks.iter().map(|chunk| format!("data: {chunk}\n\n")).collect::<String>()))
+        .with_priority(2).mount(&server).await;
+    let id = {
+        let kernel = AgentKernelImpl::with_db_path(&db).unwrap(); register(&kernel, &server);
+        let agent = kernel.create_agent_full(config(&root)).await.unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let send = kernel.send_message_stream(agent.id, "read the fixture", "streamed-native-request", sender);
+        let drain = async { while receiver.recv().await.is_some() {} };
+        let (output, ()) = tokio::join!(send, drain); let output = output.unwrap();
+        assert_eq!(output.content, "verified fixture"); assert_eq!(output.tool_calls_made, 2);
+        agent.id
+    };
+    let requests = server.received_requests().await.unwrap(); assert_eq!(requests.len(), 2);
+    let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let contents = body["contents"].as_array().unwrap();
+    assert!(contents.windows(2).any(|entries| entries[0] == json!({"role": "model", "parts": [first.clone()]}) && entries[1] == json!({"role": "model", "parts": [second.clone()]})));
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let versions: (i64, i64) = connection.query_row("SELECT schema_version, min_reader_schema_version FROM storage_meta WHERE singleton = 1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(versions, (12, 12), "readers that flatten short signed chunks must be excluded"); drop(connection);
+    server.reset().await;
+    Mock::given(method("POST")).respond_with(response(json!([{"text": "continued"}]))).expect(1).mount(&server).await;
+    {
+        let kernel = AgentKernelImpl::with_db_path(&db).unwrap(); register(&kernel, &server);
+        assert_eq!(kernel.send_message(id, "continue saved stream").await.unwrap().content, "continued");
+    }
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap(); let contents = body["contents"].as_array().unwrap();
+    for chunk in final_chunks { assert!(contents.iter().any(|entry| *entry == chunk["candidates"][0]["content"])); }
+    assert!(contents.windows(2).any(|entries| entries[0]["parts"] == json!([first.clone()]) && entries[1]["parts"] == json!([second.clone()])));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn signed_parallel_tool_turn_and_final_text_replay_after_kernel_restart() {
     let server = MockServer::start().await;
     let root = std::env::temp_dir().join(format!("agentos-gemini-{}", uuid::Uuid::new_v4()));

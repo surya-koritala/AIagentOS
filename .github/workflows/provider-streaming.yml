@@ -2,7 +2,7 @@ name: Provider streaming conformance
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'codex/**']
     paths:
       - 'crates/adapters/**'
       - 'crates/kernel/src/connector.rs'
@@ -37,6 +37,8 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           save-if: false
+      - name: Early streamed history through the governed executor
+        run: cargo test -p integration-tests streamed_native --locked
       - name: All adapter and native-stream contracts without provider credentials
         run: cargo test -p adapters --all-features --locked
       - name: Formatting gate and CI repair artifact

@@ -457,7 +457,7 @@ pub struct LifecycleResult {
 }
 
 /// Snapshot of the syscall gate's enforcement counters.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct GateStats {
     pub allowed: u64,
     pub denied_capability: u64,
@@ -469,12 +469,29 @@ pub struct GateStats {
     pub audited: u64,
 }
 
+impl From<kernel::syscall_gate::GateStats> for GateStats {
+    fn from(stats: kernel::syscall_gate::GateStats) -> Self {
+        Self {
+            allowed: stats.allowed,
+            denied_capability: stats.denied_capability,
+            denied_mac: stats.denied_mac,
+            denied_approval: stats.denied_approval,
+            denied_cgroup: stats.denied_cgroup,
+            denied_namespace: stats.denied_namespace,
+            denied_unknown: stats.denied_unknown,
+            audited: stats.audited,
+        }
+    }
+}
+
 /// One agent's gate-enforced process identity and granted namespaces.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AgentEnforcementInfo {
     pub pid: u64,
     pub capabilities: Vec<String>,
     pub namespaces: Vec<u64>,
+    /// Process-local decisions; reset on restart. Older servers default to zero.
+    pub gate_decisions: GateStats,
 }
 
 /// A kernel node's load/health snapshot (reply to `node_info`).
@@ -1810,13 +1827,26 @@ impl KernelClient {
                 pid,
                 capabilities,
                 namespaces,
+                gate_decisions,
             } => Ok(AgentEnforcementInfo {
                 pid,
                 capabilities,
                 namespaces,
+                gate_decisions: gate_decisions.into(),
             }),
             other => Err(unexpected("AgentInfo", &other)),
         }
+    }
+
+    /// Read one owned agent's gate decisions with ReadOnly tenant authority.
+    /// Counters are process-local and reset on restart. Compatible older
+    /// servers omit them and return zero; inspect `agent_gate_statistics` in
+    /// the protocol feature list to distinguish unsupported exposure.
+    pub async fn agent_gate_stats(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<GateStats, SdkError> {
+        Ok(self.agent_info(agent_id).await?.gate_decisions)
     }
 
     /// Negotiate the wire protocol with the server.

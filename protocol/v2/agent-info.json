@@ -1,0 +1,1 @@
+{"status":"agent_info","pid":7,"capabilities":["CAP_NET_ACCESS"],"namespaces":[1],"gate_decisions":{"allowed":1,"denied_capability":2,"denied_mac":3,"denied_approval":4,"denied_cgroup":5,"denied_unknown":6,"denied_namespace":7,"audited":1}}

@@ -1863,6 +1863,15 @@ impl SyscallGate {
             .unwrap_or_default()
     }
 
+    /// Registry declaration rejection happens before policy admission. Count
+    /// that terminal verdict without exposing declaration or resource details.
+    pub(crate) fn record_invalid_tool_declaration(&self, agent_id: uuid::Uuid) {
+        self.denied_unknown.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut stats) = self.agent_stats.get_mut(&agent_id) {
+            stats.denied_unknown = stats.denied_unknown.saturating_add(1);
+        }
+    }
+
     /// Sum only the supplied identities, used for tenant-safe operations
     /// snapshots. Saturation keeps diagnostics total even after extreme uptime.
     pub fn aggregate_agent_stats(

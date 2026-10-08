@@ -68,7 +68,8 @@ pub use crate::wire_io::STREAM_EVENT_BUFFER_CAPACITY;
 /// The `Syscall`/`SyscallReply` schema is versioned independently of the crate
 /// release: bump this whenever a wire-breaking change lands (a removed/renamed
 /// variant or field, or a changed serialization). Additive, backward-compatible
-/// changes (a new optional syscall) do **not** bump it. A client negotiates with
+/// changes (a new optional syscall or defaulted reply field) do **not** bump it.
+/// A client negotiates with
 /// [`Syscall::Hello`] and learns the server's `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
 /// support window; an out-of-range client gets a clear error rather than silent
 /// breakage. See `RELEASING.md` ("Toward a stable API").
@@ -81,6 +82,10 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 #[cfg(test)]
 #[path = "identity_admin_tests.rs"]
 mod identity_admin_tests;
+
+#[cfg(test)]
+#[path = "gate_statistics_tests.rs"]
+mod gate_statistics_tests;
 
 /// Maximum duration accepted from an untrusted wire `WaitAgent` request.
 ///
@@ -1430,6 +1435,10 @@ pub enum SyscallReply {
         pid: u64,
         capabilities: Vec<String>,
         namespaces: Vec<u64>,
+        /// This agent's process-local decisions; reset on process restart.
+        /// Older compatible servers omit this additive field.
+        #[serde(default)]
+        gate_decisions: crate::syscall_gate::GateStats,
     },
     /// The LLM providers registered with the kernel (reply to [`Syscall::ListProviders`]).
     Providers {
@@ -3835,6 +3844,7 @@ async fn dispatch_scoped_inner_with_fence(
                     pid: info.pid,
                     capabilities: info.capabilities,
                     namespaces: info.namespaces,
+                    gate_decisions: kernel.syscall_gate.agent_stats(id),
                 },
                 None => SyscallReply::Error {
                     message: format!("unknown agent: {agent_id}"),

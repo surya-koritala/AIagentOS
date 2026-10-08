@@ -659,13 +659,19 @@ impl<'a> S3Client<'a> {
         if !response.status().is_success() {
             return Err(status_error("download", key, &response));
         }
+        #[cfg(not(windows))]
         let mut options = tokio::fs::OpenOptions::new();
+        #[cfg(not(windows))]
         options.create_new(true).write(true);
         #[cfg(unix)]
         {
             options.mode(0o600);
         }
-        let mut output = options.open(destination).await.map_err(|error| {
+        #[cfg(not(windows))]
+        let opened = options.open(destination).await;
+        #[cfg(windows)]
+        let opened = crate::windows_private_fs::create_new_file(destination).map(tokio::fs::File::from_std);
+        let mut output = opened.map_err(|error| {
             remote_error(format!(
                 "failed to create remote-backup staging file {}: {error}",
                 destination.display()
@@ -867,7 +873,7 @@ pub async fn fetch_remote_backup(
             .unwrap_or("backup"),
         uuid::Uuid::new_v4()
     ));
-    fs::create_dir(&staging).map_err(|error| {
+    create_private_directory(&staging).map_err(|error| {
         remote_error(format!(
             "failed to create remote-backup staging directory {}: {error}",
             staging.display()
@@ -930,7 +936,7 @@ pub async fn fetch_remote_backup(
     }
     sync_directory(&staging)?;
     reject_existing_destination(destination)?;
-    fs::rename(&staging, destination).map_err(|error| {
+    rename_durable(&staging, destination).map_err(|error| {
         remote_error(format!(
             "failed to atomically publish fetched backup {}: {error}",
             destination.display()
@@ -1214,9 +1220,26 @@ fn require_real_directory(path: &Path, label: &str) -> Result<(), ContextError> 
     Ok(())
 }
 
+fn create_private_directory(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    { crate::windows_private_fs::create_directory(path.as_ref()) }
+    #[cfg(not(windows))]
+    { fs::create_dir(path) }
+}
+
+fn rename_durable(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    { crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref()) }
+    #[cfg(not(windows))]
+    { fs::rename(source, destination) }
+}
+
 fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
-    #[cfg(not(unix))]
-    let _ = path;
+    #[cfg(windows)]
+    crate::windows_private_fs::protect_path(path, true)
+        .map_err(|error| remote_error(format!("failed to protect remote-backup directory: {error}")))?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(remote_error("private remote-backup directory protection is unsupported"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1242,9 +1265,15 @@ fn sync_directory(path: &Path) -> Result<(), ContextError> {
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), ContextError> {
+    crate::windows_private_fs::sync_directory(path)
+        .map_err(|error| remote_error(format!("failed to persist remote-backup directory metadata: {error}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(_path: &Path) -> Result<(), ContextError> {
-    Ok(())
+    Err(remote_error("remote-backup directory durability is unsupported"))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -1328,7 +1357,7 @@ mod tests {
                 "agentos-remote-backup-test-{}",
                 uuid::Uuid::new_v4()
             ));
-            fs::create_dir(&path).unwrap();
+            create_private_directory(&path).unwrap();
             Self(path)
         }
     }

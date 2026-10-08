@@ -58,6 +58,8 @@ pub mod scheduler;
 mod schema;
 pub mod storage;
 pub mod storage_encryption;
+#[cfg(windows)]
+pub(crate) mod windows_private_fs;
 pub mod syscall_gate;
 pub mod syscall_server;
 pub mod sysctl;

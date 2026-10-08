@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Persistence
+- Add protected current-user Windows DACLs at private file/directory creation,
+  handle-based ownership and reparse rejection, write-through storage publication,
+  and native permission/durability CI regressions. Physical power-loss and final
+  production qualification remain open (#337).
+
 - Added Gemini native JSON-schema function declarations, ordered parallel calls
   and paired results, with bounded durable assistant replay state and preserved
   thought signatures. Checkpoints, cloning, restart, context admission and

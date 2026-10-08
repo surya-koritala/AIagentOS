@@ -884,14 +884,20 @@ fn read_bounded_regular_file(
     max_bytes: u64,
     owner_only: bool,
 ) -> Result<Vec<u8>, ContextError> {
+    #[cfg(not(windows))]
     let mut options = OpenOptions::new();
+    #[cfg(not(windows))]
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path).map_err(|error| {
+    #[cfg(not(windows))]
+    let opened = options.open(path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::open_read(path, owner_only);
+    let mut file = opened.map_err(|error| {
         storage_error(format!(
             "failed to open {label} {} as a regular non-symlink file: {error}",
             path.display()
@@ -919,7 +925,7 @@ fn read_bounded_regular_file(
             )));
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = owner_only;
     let size = metadata.len();
     if size == 0 || size > max_bytes {
@@ -1114,14 +1120,20 @@ fn write_new_owner_only_file(path: &Path, bytes: &[u8], label: &str) -> Result<(
         .unwrap_or_else(|| Path::new("."));
     require_real_directory(parent, &format!("{label} parent"))?;
 
+    #[cfg(not(windows))]
     let mut options = OpenOptions::new();
+    #[cfg(not(windows))]
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(|error| {
+    #[cfg(not(windows))]
+    let opened = options.open(path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::create_new_file(path);
+    let mut file = opened.map_err(|error| {
         storage_error(format!(
             "failed to create {label} {}: {error}",
             path.display()
@@ -1139,7 +1151,7 @@ fn write_new_owner_only_file(path: &Path, bytes: &[u8], label: &str) -> Result<(
                     ))
                 })?;
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         set_owner_only_file(path)?;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
@@ -1202,6 +1214,35 @@ fn bounded_text(value: &str) -> String {
         .collect()
 }
 
+fn create_private_directory(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    { crate::windows_private_fs::create_directory(path.as_ref()) }
+    #[cfg(not(windows))]
+    { fs::create_dir(path) }
+}
+
+fn create_private_directory_all(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    { crate::windows_private_fs::ensure_directory(path.as_ref()) }
+    #[cfg(not(windows))]
+    { fs::create_dir_all(path) }
+}
+
+#[cfg(test)]
+fn copy_private(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<u64> {
+    #[cfg(windows)]
+    { crate::windows_private_fs::copy_private(source.as_ref(), destination.as_ref()) }
+    #[cfg(not(windows))]
+    { fs::copy(source, destination) }
+}
+
+fn rename_durable(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    { crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref()) }
+    #[cfg(not(windows))]
+    { fs::rename(source, destination) }
+}
+
 fn storage_error(message: impl Into<String>) -> ContextError {
     ContextError::StorageError(message.into())
 }
@@ -1260,13 +1301,16 @@ impl Drop for StagingDirectory {
 
 pub(crate) fn acquire_storage_lease(database_path: &Path) -> Result<StorageLease, ContextError> {
     let lock_path = companion_path(database_path, ".lock");
-    let lock = OpenOptions::new()
+    #[cfg(not(windows))]
+    let opened = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)
-        .map_err(|error| {
+        .open(&lock_path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::open_private_rw(&lock_path);
+    let lock = opened.map_err(|error| {
             storage_error(format!(
                 "failed to open storage lease {}: {error}",
                 lock_path.display()
@@ -1307,7 +1351,7 @@ fn prepare_backup_root(root: &Path) -> Result<(), ContextError> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(root).map_err(|error| {
+            create_private_directory_all(root).map_err(|error| {
                 storage_error(format!(
                     "failed to create backup root {}: {error}",
                     root.display()
@@ -1340,13 +1384,16 @@ fn acquire_backup_publication_lock(root: &Path) -> Result<File, ContextError> {
             )))
         }
     }
-    let publication_lock = OpenOptions::new()
+    #[cfg(not(windows))]
+    let opened = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&publication_lock_path)
-        .map_err(|error| {
+        .open(&publication_lock_path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::open_private_rw(&publication_lock_path);
+    let publication_lock = opened.map_err(|error| {
             storage_error(format!("failed to open backup publication lock: {error}"))
         })?;
     let metadata = fs::symlink_metadata(&publication_lock_path).map_err(|error| {
@@ -1383,6 +1430,9 @@ fn reject_existing_path(path: &Path, label: &str) -> Result<(), ContextError> {
 }
 
 fn require_regular_file(path: &Path, label: &str) -> Result<u64, ContextError> {
+    #[cfg(windows)]
+    drop(crate::windows_private_fs::open_read(path, false)
+        .map_err(|error| storage_error(format!("{label} must be a regular non-reparse file: {error}")))?);
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         storage_error(format!(
             "failed to inspect {label} {}: {error}",
@@ -1399,6 +1449,9 @@ fn require_regular_file(path: &Path, label: &str) -> Result<u64, ContextError> {
 }
 
 fn require_real_directory(path: &Path, label: &str) -> Result<(), ContextError> {
+    #[cfg(windows)]
+    crate::windows_private_fs::check_directory(path)
+        .map_err(|error| storage_error(format!("{label} must be a real non-reparse directory: {error}")))?;
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         storage_error(format!(
             "failed to inspect {label} {}: {error}",
@@ -1415,7 +1468,11 @@ fn require_real_directory(path: &Path, label: &str) -> Result<(), ContextError> 
 }
 
 fn sha256_file(path: &Path) -> Result<String, ContextError> {
-    let mut file = File::open(path)
+    #[cfg(not(windows))]
+    let opened = File::open(path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::open_read(path, false);
+    let mut file = opened
         .map_err(|error| storage_error(format!("failed to hash {}: {error}", path.display())))?;
     let mut digest = DigestContext::new(&SHA256);
     let mut buffer = [0_u8; 64 * 1024];
@@ -1460,11 +1517,14 @@ fn write_manifest(path: &Path, manifest: &BackupManifest) -> Result<(), ContextE
     let mut bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|error| storage_error(format!("failed to serialize backup manifest: {error}")))?;
     bytes.push(b'\n');
-    let mut file = OpenOptions::new()
+    #[cfg(not(windows))]
+    let opened = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(path)
-        .map_err(|error| {
+        .open(path);
+    #[cfg(windows)]
+    let opened = crate::windows_private_fs::create_new_file(path);
+    let mut file = opened.map_err(|error| {
             storage_error(format!(
                 "failed to create backup manifest {}: {error}",
                 path.display()
@@ -1927,7 +1987,7 @@ pub fn export_portable_storage(
         uuid::Uuid::new_v4()
     ));
     reject_existing_path(&staging_dir, "portable storage staging directory")?;
-    fs::create_dir(&staging_dir).map_err(|error| {
+    create_private_directory(&staging_dir).map_err(|error| {
         storage_error(format!(
             "failed to create portable storage staging directory {}: {error}",
             staging_dir.display()
@@ -1970,14 +2030,14 @@ pub fn export_portable_storage(
         ));
     }
     reject_existing_path(bundle_dir, "portable storage bundle")?;
-    fs::rename(&staging_dir, bundle_dir).map_err(|error| {
+    rename_durable(&staging_dir, bundle_dir).map_err(|error| {
         storage_error(format!(
             "failed to publish portable storage bundle {}: {error}",
             bundle_dir.display()
         ))
     })?;
     if let Err(error) = sync_directory(parent) {
-        fs::rename(bundle_dir, &staging_dir).map_err(|rollback_error| {
+        rename_durable(bundle_dir, &staging_dir).map_err(|rollback_error| {
             storage_error(format!(
                 "portable storage publication was not durable ({error}); reverting it also \
                  failed: {rollback_error}"
@@ -2033,7 +2093,7 @@ pub fn import_portable_storage(
         ));
     }
     reject_existing_path(destination_database, "portable storage import destination")?;
-    fs::rename(&stage, destination_database).map_err(|error| {
+    rename_durable(&stage, destination_database).map_err(|error| {
         storage_error(format!(
             "failed to publish portable storage import {}: {error}",
             destination_database.display()
@@ -2047,7 +2107,7 @@ pub fn import_portable_storage(
         require_matching_portable_metadata(&manifest, &published_metadata)
     })();
     if let Err(error) = publication {
-        fs::rename(destination_database, &stage).map_err(|rollback_error| {
+        rename_durable(destination_database, &stage).map_err(|rollback_error| {
             storage_error(format!(
                 "portable storage import failed after publication ({error}); reverting it also \
                  failed: {rollback_error}"
@@ -2369,7 +2429,7 @@ fn delete_verified_backup(
     require_removable_backup_contents(&backup_dir)?;
     let tombstone = backup_root.join(format!(".{}.{}.deleting", entry.name, uuid::Uuid::new_v4()));
     reject_existing_path(&tombstone, "backup deletion staging directory")?;
-    fs::rename(&backup_dir, &tombstone).map_err(|error| {
+    rename_durable(&backup_dir, &tombstone).map_err(|error| {
         storage_error(format!(
             "failed to stage backup {} for expiration: {error}",
             backup_dir.display()
@@ -2452,7 +2512,7 @@ impl SqliteContextManager {
         let final_dir = backup_root.join(name);
         reject_existing_path(&final_dir, "backup destination")?;
         let staging_dir = backup_root.join(format!(".{name}.{}.staging", uuid::Uuid::new_v4()));
-        fs::create_dir(&staging_dir).map_err(|error| {
+        create_private_directory(&staging_dir).map_err(|error| {
             storage_error(format!(
                 "failed to create backup staging directory {}: {error}",
                 staging_dir.display()
@@ -2469,6 +2529,9 @@ impl SqliteContextManager {
                     .conn
                     .lock()
                     .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+                #[cfg(windows)]
+                drop(crate::windows_private_fs::create_new_file(&database_path)
+                    .map_err(|error| storage_error(format!("failed to create private backup database: {error}")))?);
                 let mut destination = Connection::open(&database_path).map_err(|error| {
                     storage_error(format!("failed to create backup database: {error}"))
                 })?;
@@ -2539,14 +2602,14 @@ impl SqliteContextManager {
             }
 
             reject_existing_path(&final_dir, "backup destination")?;
-            fs::rename(&staging_dir, &final_dir).map_err(|error| {
+            rename_durable(&staging_dir, &final_dir).map_err(|error| {
                 storage_error(format!(
                     "failed to publish backup {}: {error}",
                     final_dir.display()
                 ))
             })?;
             if let Err(error) = sync_directory(backup_root) {
-                fs::rename(&final_dir, &staging_dir).map_err(|rollback_error| {
+                rename_durable(&final_dir, &staging_dir).map_err(|rollback_error| {
                     storage_error(format!(
                         "backup publication was not durable ({error}); reverting it also failed: \
                          {rollback_error}"
@@ -2933,6 +2996,14 @@ fn checkpoint_existing_database(
         })
 }
 
+#[cfg(windows)]
+fn copy_to_new_file(source: &Path, destination: &Path) -> Result<(), ContextError> {
+    crate::windows_private_fs::copy_private(source, destination)
+        .map(|_| ())
+        .map_err(|error| storage_error(format!("failed to copy private restore staging file: {error}")))
+}
+
+#[cfg(not(windows))]
 fn copy_to_new_file(source: &Path, destination: &Path) -> Result<(), ContextError> {
     let mut source_file = File::open(source).map_err(|error| {
         storage_error(format!(
@@ -3273,7 +3344,7 @@ fn recover_corrupt_storage_from_config_internal(
                 format!(".{database_file}.corrupt-recovery-{operation_id}.quarantine");
             let quarantine_path = parent.join(&quarantine_dir);
             reject_existing_path(&quarantine_path, "corrupt recovery quarantine")?;
-            fs::create_dir(&quarantine_path).map_err(|error| {
+            create_private_directory(&quarantine_path).map_err(|error| {
                 storage_error(format!(
                     "failed to create corrupt recovery quarantine {}: {error}",
                     quarantine_path.display()
@@ -3336,7 +3407,7 @@ fn recover_corrupt_storage_from_config_internal(
             validate_quarantined_original_sidecar(&quarantined_wal, journal.original_wal, "WAL")?;
             validate_quarantined_original_sidecar(&quarantined_shm, journal.original_shm, "SHM")?;
         } else if destination_exists {
-            fs::rename(&destination, &quarantined_database).map_err(|error| {
+            rename_durable(&destination, &quarantined_database).map_err(|error| {
                 storage_error(format!(
                     "failed to quarantine corrupt database {}: {error}",
                     destination.display()
@@ -3373,7 +3444,7 @@ fn recover_corrupt_storage_from_config_internal(
                 copy_to_new_file(&backup_dir.join(BACKUP_DATABASE_FILE), &stage)?;
                 verify_recovery_candidate(&stage, &manifest, storage_key.as_ref())?;
             }
-            fs::rename(&stage, &destination).map_err(|error| {
+            rename_durable(&stage, &destination).map_err(|error| {
                 storage_error(format!(
                     "failed to publish corrupt recovery database {}: {error}",
                     destination.display()
@@ -3584,7 +3655,7 @@ fn reconcile_quarantined_sidecar(
     let quarantined_exists =
         optional_regular_file_exists(quarantined, &format!("quarantined {label}"))?;
     match (expected, source_exists, quarantined_exists) {
-        (true, true, false) => fs::rename(source, quarantined).map_err(|error| {
+        (true, true, false) => rename_durable(source, quarantined).map_err(|error| {
             storage_error(format!(
                 "failed to quarantine corrupt destination {label}: {error}"
             ))
@@ -3629,7 +3700,7 @@ fn preserve_interrupted_candidate_sidecar(
         forensic_destination,
         &format!("interrupted candidate {label} forensic file"),
     )?;
-    fs::rename(source, forensic_destination).map_err(|error| {
+    rename_durable(source, forensic_destination).map_err(|error| {
         storage_error(format!(
             "failed to preserve interrupted recovery candidate {label}: {error}"
         ))
@@ -3670,7 +3741,7 @@ fn destination_verifies_without_mutation(
         uuid::Uuid::new_v4()
     ));
     reject_existing_path(&inspection_dir, "corrupt recovery inspection directory")?;
-    fs::create_dir(&inspection_dir).map_err(|error| {
+    create_private_directory(&inspection_dir).map_err(|error| {
         storage_error(format!(
             "failed to create corrupt recovery inspection directory {}: {error}",
             inspection_dir.display()
@@ -3714,19 +3785,19 @@ fn rollback_corrupt_recovery(
         &quarantine.join("failed-replacement.sqlite3-shm"),
     )?;
     preserve_failed_recovery_file(stage, &quarantine.join("failed-staging.sqlite3"))?;
-    fs::rename(quarantined_database, destination).map_err(|error| {
+    rename_durable(quarantined_database, destination).map_err(|error| {
         storage_error(format!(
             "failed to restore quarantined database {}: {error}",
             destination.display()
         ))
     })?;
     if original_wal {
-        fs::rename(quarantined_wal, companion_path(destination, "-wal")).map_err(|error| {
+        rename_durable(quarantined_wal, companion_path(destination, "-wal")).map_err(|error| {
             storage_error(format!("failed to restore quarantined WAL: {error}"))
         })?;
     }
     if original_shm {
-        fs::rename(quarantined_shm, companion_path(destination, "-shm")).map_err(|error| {
+        rename_durable(quarantined_shm, companion_path(destination, "-shm")).map_err(|error| {
             storage_error(format!("failed to restore quarantined SHM: {error}"))
         })?;
     }
@@ -3750,7 +3821,7 @@ fn preserve_failed_recovery_file(source: &Path, destination: &Path) -> Result<()
         return Ok(());
     }
     reject_existing_path(destination, "failed recovery quarantine file")?;
-    fs::rename(source, destination).map_err(|error| {
+    rename_durable(source, destination).map_err(|error| {
         storage_error(format!(
             "failed to preserve recovery candidate {}: {error}",
             source.display()
@@ -3776,9 +3847,15 @@ fn verify_owner_only_directory(path: &Path) -> Result<(), ContextError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_owner_only_directory(path: &Path) -> Result<(), ContextError> {
+    crate::windows_private_fs::verify_path(path, true)
+        .map_err(|error| storage_error(format!("recovery quarantine must be current-owner-only: {error}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn verify_owner_only_directory(_path: &Path) -> Result<(), ContextError> {
-    Ok(())
+    Err(storage_error("private recovery directory verification is unsupported"))
 }
 
 fn restore_backup_internal<T>(
@@ -3813,7 +3890,7 @@ fn restore_backup_internal<T>(
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(parent).map_err(|error| {
+            create_private_directory_all(parent).map_err(|error| {
                 storage_error(format!(
                     "failed to create restore destination directory {}: {error}",
                     parent.display()
@@ -3880,7 +3957,7 @@ fn restore_backup_internal<T>(
     if replaced_existing {
         checkpoint_existing_database(destination_database, storage_key)?;
         reject_existing_path(&rollback, "restore rollback file")?;
-        fs::rename(destination_database, &rollback).map_err(|error| {
+        rename_durable(destination_database, &rollback).map_err(|error| {
             storage_error(format!(
                 "failed to preserve restore rollback database {}: {error}",
                 rollback.display()
@@ -3894,7 +3971,7 @@ fn restore_backup_internal<T>(
             remove_if_exists(&companion_path(destination_database, "-wal"))?;
             remove_if_exists(&companion_path(destination_database, "-shm"))?;
         }
-        fs::rename(&stage, destination_database).map_err(|error| {
+        rename_durable(&stage, destination_database).map_err(|error| {
             storage_error(format!(
                 "failed to publish restored database {}: {error}",
                 destination_database.display()
@@ -3929,7 +4006,7 @@ fn restore_backup_internal<T>(
             ))
         })?;
         if replaced_existing {
-            fs::rename(&rollback, destination_database).map_err(|rollback_error| {
+            rename_durable(&rollback, destination_database).map_err(|rollback_error| {
                 storage_error(format!(
                     "restore failed ({error}); automatic rollback also failed: {rollback_error}"
                 ))
@@ -3969,9 +4046,15 @@ fn set_owner_only_file(path: &Path) -> Result<(), ContextError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_owner_only_file(path: &Path) -> Result<(), ContextError> {
+    crate::windows_private_fs::protect_path(path, false)
+        .map_err(|error| storage_error(format!("failed to protect private storage file: {error}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_owner_only_file(_path: &Path) -> Result<(), ContextError> {
-    Ok(())
+    Err(storage_error("private storage file protection is unsupported"))
 }
 
 #[cfg(unix)]
@@ -3985,9 +4068,15 @@ fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
+    crate::windows_private_fs::protect_path(path, true)
+        .map_err(|error| storage_error(format!("failed to protect private storage directory: {error}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_owner_only_directory(_path: &Path) -> Result<(), ContextError> {
-    Ok(())
+    Err(storage_error("private storage directory protection is unsupported"))
 }
 
 #[cfg(unix)]
@@ -4002,14 +4091,28 @@ fn sync_directory(path: &Path) -> Result<(), ContextError> {
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), ContextError> {
+    crate::windows_private_fs::sync_directory(path)
+        .map_err(|error| storage_error(format!("failed to persist storage directory metadata: {error}")))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(_path: &Path) -> Result<(), ContextError> {
-    Ok(())
+    Err(storage_error("storage directory durability is unsupported"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    fn symlink(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
+        if source.as_ref().is_dir() {
+            std::os::windows::fs::symlink_dir(source, destination)
+        } else {
+            std::os::windows::fs::symlink_file(source, destination)
+        }
+    }
     use rusqlite::OptionalExtension;
     use std::io::{Seek, SeekFrom};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -4025,7 +4128,7 @@ mod tests {
                 "aiagentos-storage-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
-            fs::create_dir(&path).unwrap();
+            create_private_directory(&path).unwrap();
             Self { path }
         }
     }
@@ -4678,7 +4781,7 @@ mod tests {
         set_backup_age(&root, "augmented", chrono::Duration::hours(8));
         set_backup_age(&root, "foreign", chrono::Duration::hours(8));
         fs::write(root.join("augmented/operator-notes.txt"), b"preserve").unwrap();
-        fs::create_dir(root.join("corrupt")).unwrap();
+        create_private_directory(root.join("corrupt")).unwrap();
         fs::write(root.join("corrupt/manifest.json"), b"not json").unwrap();
 
         let report = apply_backup_retention_after_inherited_test_lock_drains(
@@ -4754,9 +4857,10 @@ mod tests {
         assert!(error.to_string().contains("retention pass is active"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn retention_does_not_follow_symlinked_backup_entries() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::new("retention-symlink");
@@ -4764,7 +4868,7 @@ mod tests {
         let root = directory.path.join("backups");
         manager.create_backup(&root, "real").unwrap();
         let outside = directory.path.join("outside");
-        fs::create_dir(&outside).unwrap();
+        create_private_directory(&outside).unwrap();
         fs::write(outside.join("must-survive"), b"proof").unwrap();
         symlink(&outside, root.join("linked")).unwrap();
 
@@ -4879,7 +4983,7 @@ mod tests {
         let first_dir = backup_root.join("backup_001");
         let second_dir = backup_root.join("backup_002");
         let anchor_path = directory.path.join("recovery-points/backup_001.json");
-        fs::create_dir(anchor_path.parent().unwrap()).unwrap();
+        create_private_directory(anchor_path.parent().unwrap()).unwrap();
         let anchor =
             generate_backup_recovery_anchor(&first_dir, None, &signer.trust_root(), &anchor_path)
                 .unwrap();
@@ -4927,7 +5031,7 @@ mod tests {
             .to_string()
             .contains("unknown field"));
         let colocated = first_dir.join("copied-anchor.json");
-        fs::copy(&anchor_path, &colocated).unwrap();
+        copy_private(&anchor_path, &colocated).unwrap();
         assert!(
             load_independent_backup_recovery_anchor(&first_dir, &colocated)
                 .unwrap_err()
@@ -4975,7 +5079,7 @@ mod tests {
             .create_signed_backup(&backup_root, "second", &signer)
             .unwrap();
         let anchor_path = directory.path.join("anchors/first.json");
-        fs::create_dir(anchor_path.parent().unwrap()).unwrap();
+        create_private_directory(anchor_path.parent().unwrap()).unwrap();
         let anchor = generate_backup_recovery_anchor(
             &backup_root.join("first"),
             None,
@@ -5024,7 +5128,7 @@ mod tests {
             .unwrap();
         let backup_dir = backup_root.join("qualified");
         let anchor_path = directory.path.join("anchors/qualified.json");
-        fs::create_dir(anchor_path.parent().unwrap()).unwrap();
+        create_private_directory(anchor_path.parent().unwrap()).unwrap();
         let anchor = generate_backup_recovery_anchor(
             &backup_dir,
             Some(&key),
@@ -5372,7 +5476,7 @@ mod tests {
         drop(source_manager);
 
         let data_dir = directory.path.join("data");
-        fs::create_dir(&data_dir).unwrap();
+        create_private_directory(&data_dir).unwrap();
         let destination = data_dir.join(BACKUP_DATABASE_FILE);
         let corrupt_bytes = b"corrupt database evidence";
         let wal_bytes = b"corrupt wal evidence";
@@ -5426,7 +5530,7 @@ mod tests {
         drop(source_manager);
 
         let data_dir = directory.path.join("data");
-        fs::create_dir(&data_dir).unwrap();
+        create_private_directory(&data_dir).unwrap();
         let destination = data_dir.join(BACKUP_DATABASE_FILE);
         fs::write(&destination, b"must remain corrupt").unwrap();
         let wrong_id = uuid::Uuid::new_v4().to_string();
@@ -5470,7 +5574,7 @@ mod tests {
         drop(source_manager);
 
         let data_dir = directory.path.join("data");
-        fs::create_dir(&data_dir).unwrap();
+        create_private_directory(&data_dir).unwrap();
         let destination = data_dir.join(BACKUP_DATABASE_FILE);
         fs::write(&destination, b"original corrupt evidence").unwrap();
         let mut config = recovery_config(&data_dir);
@@ -5516,7 +5620,7 @@ mod tests {
         drop(source_manager);
 
         let data_dir = directory.path.join("data");
-        fs::create_dir(&data_dir).unwrap();
+        create_private_directory(&data_dir).unwrap();
         let destination = data_dir.join(BACKUP_DATABASE_FILE);
         fs::write(&destination, b"interrupted corrupt evidence").unwrap();
         let operation_id = uuid::Uuid::new_v4();
@@ -5537,19 +5641,19 @@ mod tests {
             original_shm: false,
         };
         let quarantine = data_dir.join(&journal.quarantine_dir);
-        fs::create_dir(&quarantine).unwrap();
+        create_private_directory(&quarantine).unwrap();
         set_owner_only_directory(&quarantine).unwrap();
         write_corrupt_recovery_journal(
             &companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX),
             &journal,
         )
         .unwrap();
-        fs::rename(
+        rename_durable(
             &destination,
             quarantine.join(&journal.quarantined_database_file),
         )
         .unwrap();
-        fs::copy(
+        copy_private(
             backup_root.join("qualified").join(BACKUP_DATABASE_FILE),
             &destination,
         )
@@ -5626,9 +5730,9 @@ mod tests {
         drop(source_manager);
 
         let data_dir = directory.path.join("data");
-        fs::create_dir(&data_dir).unwrap();
+        create_private_directory(&data_dir).unwrap();
         let destination = data_dir.join(BACKUP_DATABASE_FILE);
-        fs::copy(&source, &destination).unwrap();
+        copy_private(&source, &destination).unwrap();
         let mut file = OpenOptions::new().write(true).open(&destination).unwrap();
         file.seek(SeekFrom::Start(64)).unwrap();
         file.write_all(b"corrupted encrypted page").unwrap();
@@ -5744,9 +5848,10 @@ mod tests {
         .contains("filename is invalid"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn corrupt_recovery_rejects_symlink_sidecar_without_touching_target() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::new("corrupt-recovery-symlink");
@@ -5759,7 +5864,7 @@ mod tests {
             .unwrap();
         drop(source_manager);
         let data_dir = directory.path.join("data");
-        fs::create_dir(&data_dir).unwrap();
+        create_private_directory(&data_dir).unwrap();
         let destination = data_dir.join(BACKUP_DATABASE_FILE);
         fs::write(&destination, b"corrupt database").unwrap();
         let outside = directory.path.join("outside-wal");
@@ -5938,9 +6043,10 @@ mod tests {
         assert!(!destination.exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn portable_storage_is_owner_only_and_rejects_symlink_payloads() {
+        #[cfg(unix)]
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let directory = TestDirectory::new("portable-permissions");
@@ -5948,6 +6054,8 @@ mod tests {
         drop(SqliteContextManager::new(&source).unwrap());
         let bundle = directory.path.join("portable-bundle");
         export_portable_storage(&source, &bundle, None).unwrap();
+        #[cfg(unix)]
+        {
         assert_eq!(
             fs::metadata(&bundle).unwrap().permissions().mode() & 0o777,
             0o700
@@ -5968,23 +6076,31 @@ mod tests {
                 & 0o777,
             0o600
         );
+        }
+        #[cfg(windows)]
+        {
+            crate::windows_private_fs::verify_path(&bundle, true).unwrap();
+            crate::windows_private_fs::verify_path(&bundle.join(PORTABLE_STORAGE_DATABASE_FILE), false).unwrap();
+            crate::windows_private_fs::verify_path(&bundle.join(PORTABLE_STORAGE_MANIFEST_FILE), false).unwrap();
+        }
 
         let database = bundle.join(PORTABLE_STORAGE_DATABASE_FILE);
         let moved = directory.path.join("moved.sqlite3");
-        fs::rename(&database, &moved).unwrap();
+        rename_durable(&database, &moved).unwrap();
         symlink(&moved, &database).unwrap();
         assert!(verify_portable_storage(&bundle).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn backup_rejects_symlink_roots_and_files() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::new("symlink");
         let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
         let real_root = directory.path.join("real-root");
-        fs::create_dir(&real_root).unwrap();
+        create_private_directory(&real_root).unwrap();
         let linked_root = directory.path.join("linked-root");
         symlink(&real_root, &linked_root).unwrap();
         assert!(manager.create_backup(&linked_root, "blocked").is_err());
@@ -6007,7 +6123,7 @@ mod tests {
         let backup_dir = real_root.join("valid");
         let database = backup_dir.join(BACKUP_DATABASE_FILE);
         let moved = backup_dir.join("moved.db");
-        fs::rename(&database, &moved).unwrap();
+        rename_durable(&database, &moved).unwrap();
         symlink(&moved, &database).unwrap();
         assert!(verify_backup(&backup_dir).is_err());
     }

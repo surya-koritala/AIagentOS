@@ -1136,6 +1136,16 @@ impl SqliteContextManager {
                 )));
             }
         }
+        // Attach the Windows descriptor before SQLite can create or write any
+        // sensitive pages. Its private parent also restricts WAL/SHM creation.
+        #[cfg(windows)]
+        {
+            let parent = db_path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            crate::windows_private_fs::ensure_directory(parent)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            drop(crate::windows_private_fs::open_private_rw(db_path)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?);
+        }
         let storage_lease = if acquire_lease {
             Some(crate::storage::acquire_storage_lease(db_path)?)
         } else {

@@ -1529,7 +1529,10 @@ impl Config {
         }
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         if let Some(parent) = path.parent() {
+            #[cfg(not(windows))]
             std::fs::create_dir_all(parent)?;
+            #[cfg(windows)]
+            crate::windows_private_fs::ensure_directory(parent)?;
             // Best effort: an operator-owned directory we cannot chmod must not
             // turn a successful save into a failure. The file mode below is the
             // load-bearing control.
@@ -1557,8 +1560,8 @@ impl Config {
 /// reapplied afterwards so a file left at the default umask by an older build
 /// is repaired on the next save.
 ///
-/// Windows has no mode bits; the durable-state Windows permission gap is
-/// tracked separately and is not narrowed here.
+/// Windows creates a protected current-user DACL before writing and publishes
+/// replacements with a same-directory write-through rename.
 #[cfg(unix)]
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     use std::io::Write;
@@ -1574,9 +1577,14 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
-    std::fs::write(path, contents)
+    crate::windows_private_fs::write_config(path, contents)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_owner_only(_path: &Path, _contents: &[u8]) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "private configuration storage is unsupported"))
 }
 
 #[cfg(unix)]
@@ -1585,9 +1593,14 @@ fn set_owner_only_directory(path: &Path) -> Result<(), std::io::Error> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_owner_only_directory(path: &Path) -> Result<(), std::io::Error> {
+    crate::windows_private_fs::protect_path(path, true)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_owner_only_directory(_path: &Path) -> Result<(), std::io::Error> {
-    Ok(())
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "private directory protection is unsupported"))
 }
 
 /// Get the platform-appropriate config directory.
@@ -1935,6 +1948,22 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saved_config_is_owner_only_and_repairs_permissive_existing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config/config.toml");
+        let mut config = Config::default();
+        config.set_api_key("private-fixture", "fixture-value-no-live-provider".into());
+        config.save_to(&path).unwrap();
+        crate::windows_private_fs::verify_path(&path, false).unwrap();
+        crate::windows_private_fs::verify_path(path.parent().unwrap(), true).unwrap();
+        crate::windows_private_fs::grant_world_read_for_test(&path, false);
+        config.save_to(&path).unwrap();
+        crate::windows_private_fs::verify_path(&path, false).unwrap();
+        assert_eq!(Config::load_from(&path).get_api_key("private-fixture"), Some("fixture-value-no-live-provider"));
     }
 
     #[test]

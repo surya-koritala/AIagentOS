@@ -49,6 +49,9 @@ async fn huggingface_router_legacy_governed_calls_are_estimated_and_audited_once
     assert_eq!(output.content,"finished");
     assert_eq!(output.usage.shim_recovered_tool_calls,1);
     assert_eq!(output.usage.degraded_requests,2);
+    assert_eq!(output.usage.provider_reported_requests,0);
+    assert_eq!(output.usage.estimated_requests,2);
+    assert!(output.usage.input_tokens>0 && output.usage.output_tokens>0);
     assert_eq!(calls.load(Ordering::SeqCst),2);
     let sandbox = kernel.sandbox_manager.get_sandbox_for_agent(agent.id).unwrap();
     let file = kernel.sandbox_manager.resolve_file_path(sandbox,std::path::Path::new("hf-proof.txt")).unwrap();

@@ -101,19 +101,60 @@ Rules:
 - Format: one step per line, numbered: "1. Do X\n2. Do Y"
 - Do NOT include explanations, just the steps"#;
 
+pub const MAX_PLAN_TASK_BYTES: usize = 8 * 1024;
+pub const MAX_PLAN_RESPONSE_BYTES: usize = 32 * 1024;
+pub const MAX_PLAN_STEPS: usize = 10;
+pub const MAX_PLAN_STEP_BYTES: usize = 1_024;
+
+pub fn validate_plan_task(task: &str) -> Result<(), KernelError> {
+    if task.trim().is_empty() || task.len() > MAX_PLAN_TASK_BYTES || task.contains('\0') {
+        return Err(KernelError::Policy(
+            "plan task must contain 1..=8192 UTF-8 bytes without NUL".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Generate a plan from a task description using the LLM.
 pub async fn generate_plan(session: &dyn LlmSession, task: &str) -> Result<Plan, KernelError> {
+    generate_plan_with(task, |messages| async move {
+        session.send(messages).await.map_err(KernelError::Connector)
+    })
+    .await
+}
+
+/// The production executor supplies its governed sender here. No tool
+/// definitions are offered and generation never executes returned calls.
+pub(crate) async fn generate_plan_with<F, Fut>(task: &str, send: F) -> Result<Plan, KernelError>
+where
+    F: FnOnce(Vec<StandardMessage>) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::connector::LlmResponse, KernelError>>,
+{
+    validate_plan_task(task)?;
     let messages = vec![
         StandardMessage::system(PLAN_SYSTEM_PROMPT),
         StandardMessage::user(format!("Create a plan for: {}", task)),
     ];
 
-    let response = session
-        .send(messages)
-        .await
-        .map_err(KernelError::Connector)?;
+    let response = send(messages).await?;
+    if !response.tool_calls.is_empty() || response.content.len() > MAX_PLAN_RESPONSE_BYTES {
+        return Err(KernelError::Policy(
+            "plan response must be bounded text without executable tool calls".into(),
+        ));
+    }
 
     let steps = parse_plan_steps(&response.content);
+    if steps.is_empty()
+        || steps.len() > MAX_PLAN_STEPS
+        || steps.iter().any(|step| {
+            step.description.len() > MAX_PLAN_STEP_BYTES
+                || step.description.chars().any(char::is_control)
+        })
+    {
+        return Err(KernelError::Policy(
+            "plan must have 1..=10 numbered steps of at most 1024 UTF-8 bytes each".into(),
+        ));
+    }
 
     Ok(Plan {
         task: task.to_string(),
@@ -129,10 +170,19 @@ pub fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
         .filter_map(|line| {
             let trimmed = line.trim();
             // Match "1. Do something" or "1) Do something"
-            let content = trimmed
-                .strip_prefix(|c: char| c.is_ascii_digit())
-                .and_then(|s| s.strip_prefix('.').or(s.strip_prefix(')')))
-                .map(|s| s.trim().to_string())?;
+            let number_end = trimmed.find(|c: char| !c.is_ascii_digit())?;
+            if number_end == 0 {
+                return None;
+            }
+            trimmed[..number_end]
+                .parse::<usize>()
+                .ok()
+                .filter(|number| *number > 0)?;
+            let content = trimmed[number_end..]
+                .strip_prefix('.')
+                .or_else(|| trimmed[number_end..].strip_prefix(')'))?
+                .trim()
+                .to_string();
             if content.is_empty() {
                 return None;
             }
@@ -355,6 +405,34 @@ mod tests {
         let steps = parse_plan_steps(text);
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].description, "First step");
+    }
+
+    #[tokio::test]
+    async fn planning_rejects_overflow_empty_and_oversized_steps() {
+        for text in [
+            "not numbered".to_string(),
+            (1..=MAX_PLAN_STEPS + 1)
+                .map(|number| format!("{number}. step\n"))
+                .collect(),
+            format!("1. {}", "a".repeat(MAX_PLAN_STEP_BYTES + 1)),
+            format!("1. {}", "a".repeat(MAX_PLAN_RESPONSE_BYTES + 1)),
+        ] {
+            let result = generate_plan_with("bounded task", |_| async {
+                Ok(serde_json::from_value(serde_json::json!({
+                    "content": text, "finish_reason":"stop", "tokens_used": 1, "tool_calls": []
+                }))
+                .unwrap())
+            })
+            .await;
+            assert!(result.is_err());
+        }
+        assert!(validate_plan_task("").is_err());
+        assert!(validate_plan_task(&"x".repeat(MAX_PLAN_TASK_BYTES + 1)).is_err());
+        assert_eq!(
+            parse_plan_steps("10. Last step")[0].description,
+            "Last step"
+        );
+        assert!(parse_plan_steps("0. Invalid step").is_empty());
     }
 
     #[test]

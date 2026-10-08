@@ -1,0 +1,7 @@
+{
+  "identifier": "trusted-main-desktop",
+  "description": "Bundled main desktop webview only; no remote origins or auxiliary windows.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["desktop-public-wire", "local-peripheral-operator"]
+}

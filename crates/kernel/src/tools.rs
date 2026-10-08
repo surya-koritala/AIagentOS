@@ -367,6 +367,7 @@ pub struct PreparedToolExecution {
     /// SHA-256 identity of the immutable agent request. Raw parameters may
     /// contain secrets and are never retained in the approval-map key.
     pub approval_contract_digest: String,
+    pub(crate) binding_identity: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,6 +408,7 @@ pub struct ToolRegistry {
     binding_ids: DashMap<String, uuid::Uuid>,
     /// Command templates for custom tools: name -> (command, args_template)
     command_templates: DashMap<String, (String, Vec<String>)>,
+    pub(crate) local_peripheral: std::sync::Mutex<std::sync::Weak<crate::peripheral_operator::PeripheralRequests>>,
 }
 
 impl Default for ToolRegistry {
@@ -422,6 +424,7 @@ impl ToolRegistry {
             tools: DashMap::new(),
             binding_ids: DashMap::new(),
             command_templates: DashMap::new(),
+            local_peripheral: std::sync::Mutex::new(std::sync::Weak::new()),
         };
         registry.register_builtins();
         registry
@@ -970,6 +973,7 @@ impl ToolRegistry {
             authorization,
             request,
             approval_contract_digest,
+            binding_identity: *self.binding_ids.get(name).ok_or(TOOL_NOT_FOUND_ERROR)?,
         })
     }
 
@@ -1055,7 +1059,8 @@ impl ToolRegistry {
             &prepared.request.parameters,
         )
         .map_err(ToolAuthorizationError::InvalidDeclaration)?;
-        let (_, guard, proof) = gate
+        let registration = gate.peripheral_registration(agent_id);
+        let admission = gate
             .authorize_and_acquire_tool_call_declared_contract(
                 agent_id,
                 name,
@@ -1066,12 +1071,60 @@ impl ToolRegistry {
                     request_identity: &request_identity,
                     track_peripheral_activity: prepared.request.resource_type
                         == ResourceType::Peripheral,
+                    expected_registration: None,
                 },
             )
-            .await
-            .map_err(ToolAuthorizationError::Denied)?;
+            .await;
+        let admission = match admission {
+            Err(crate::syscall_gate::GateDenial::ApprovalRequired { .. })
+                if prepared.request.resource_type == ResourceType::Peripheral => {
+                let requests = self.local_peripheral.lock().unwrap().upgrade();
+                if let (Some(requests), Some(registration)) = (requests, registration) {
+                    if let Some(mut approval) = requests.wait_for_approval(gate, name, &prepared, &request_identity, registration).await {
+                        // The immutable request is admitted by the same gate again.
+                        // No slot or provider task exists while a human decides.
+                        let result = gate.authorize_and_acquire_tool_call_declared_contract(
+                            agent_id, name, &prepared.authorization.resource,
+                            &prepared.authorization.security,
+                            crate::syscall_gate::GateAdmissionContract {
+                                approval_contract: &prepared.approval_contract_digest,
+                                request_identity: &request_identity,
+                                track_peripheral_activity: true,
+                                expected_registration: Some(registration),
+                            },
+                        ).await;
+                        approval.admitted = result.is_ok();
+                        result
+                    } else {
+                        Err(crate::syscall_gate::GateDenial::ApprovalRequired {
+                            tool: name.to_string(), policy: prepared.authorization.security.approval_policy,
+                        })
+                    }
+                } else {
+                    Err(crate::syscall_gate::GateDenial::ApprovalRequired {
+                        tool: name.to_string(), policy: prepared.authorization.security.approval_policy,
+                    })
+                }
+            }
+            other => other,
+        };
+        let (_, guard, proof) = admission.map_err(ToolAuthorizationError::Denied)?;
         prepared.request.gate_admission = Some(proof);
         Ok((prepared, guard))
+    }
+
+    pub(crate) fn cancel_pending_peripheral(&self, agent_id: AgentId) {
+        if let Some(requests) = self.local_peripheral.lock().unwrap().upgrade() {
+            requests.cancel_agent(agent_id);
+        }
+    }
+
+    pub(crate) fn with_peripheral_binding<T>(&self, name: &str, binding: uuid::Uuid, action: impl FnOnce() -> T) -> Option<T> {
+        let _publication = self.publication.read().ok()?;
+        if self.binding_ids.get(name).is_none_or(|current| *current != binding) {
+            return None;
+        }
+        Some(action())
     }
 
     pub(crate) fn binding_id_for_agent(

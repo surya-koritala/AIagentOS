@@ -351,7 +351,7 @@ maturity = "integrated"
 release = "v0.9"
 tracking_issue = 124
 kernel_modules = ["vision"]
-source_paths = ["crates/resources/src/lib.rs", "crates/resources/src/application.rs", "crates/resources/src/browser.rs", "crates/resources/src/filesystem.rs", "crates/resources/src/network.rs", "crates/resources/src/peripheral.rs", "crates/resources/src/playwright.rs", "crates/kernel/src/lib.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs", "crates/kernel/src/syscall_gate.rs", "crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/permissions.rs", "crates/kernel/src/tools.rs", "docs/PROVIDER_MATRIX.md"]
+source_paths = ["crates/resources/src/lib.rs", "crates/resources/src/application.rs", "crates/resources/src/browser.rs", "crates/resources/src/filesystem.rs", "crates/resources/src/network.rs", "crates/resources/src/peripheral.rs", "crates/resources/src/playwright.rs", "crates/kernel/src/lib.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs", "crates/kernel/src/syscall_gate.rs", "crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/permissions.rs", "crates/kernel/src/tools.rs", "crates/kernel/src/peripheral_operator.rs", "crates/tauri-app/src/lib.rs", "crates/tauri-app/src/commands.rs", "crates/tauri-app/ui/src/lib/PeripheralApprovals.svelte", "docs/PROVIDER_MATRIX.md"]
 public_entry_points = ["crates/kernel/src/resources.rs::ResourceProvider", "crates/kernel/src/resources.rs::ResourceBroker", "crates/kernel/src/lib.rs::AgentKernelImpl::approve_peripheral_call", "crates/kernel/src/lib.rs::AgentKernelImpl::peripheral_call_state", "crates/kernel/src/lib.rs::AgentKernelImpl::revoke_peripheral_call", "crates/kernel/src/syscall_server.rs::CallTool"]
 runtime_call_paths = ["crates/kernel/src/resources.rs::ResourceBrokerImpl::execute", "crates/kernel/src/syscall_gate.rs::SyscallGate::revoke_peripheral_call_contract", "crates/kernel/src/lib.rs::BuiltinFilesystemProvider", "crates/kernel/src/lib.rs::BuiltinNetworkProvider", "crates/kernel/src/lib.rs::BuiltinAppProvider"]
 test_evidence = [
@@ -392,6 +392,11 @@ test_evidence = [
   "crates/kernel/src/lib.rs::tests::peripheral_grant_has_visible_active_state_and_revokes_exact_use",
   "crates/kernel/src/lib.rs::tests::admitted_peripheral_use_is_revocable_before_provider_dispatch",
   "crates/kernel/src/lib.rs::tests::agent_kill_revokes_active_peripheral_use",
+  "crates/kernel/src/lib.rs::tests::local_peripheral_pending_approval_is_single_use_and_revocable_before_admission",
+  "crates/kernel/src/lib.rs::tests::local_peripheral_waiters_are_bounded_and_cancel_with_their_call_or_host",
+  "crates/kernel/src/lib.rs::tests::local_peripheral_approval_rechecks_binding_policy_and_agent_lifecycle",
+  "crates/kernel/src/lib.rs::tests::local_peripheral_kill_cancels_active_and_waiting_requests_in_the_operator_view",
+  "crates/tauri-app/src/peripheral_tests.rs::desktop_peripheral_stub_transcript_proves_pending_active_exact_revocation_and_stop",
   "tests/src/capability_registry.rs::peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant",
   "crates/kernel/src/lib.rs::tests::builtin_network_provider_bounds_data_and_rejects_ambient_channels",
   "crates/kernel/src/lib.rs::tests::builtin_application_provider_exposes_only_launch",

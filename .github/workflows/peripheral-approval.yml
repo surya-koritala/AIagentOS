@@ -1,0 +1,72 @@
+name: Trusted local peripheral approval evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, 'codex/**']
+    paths:
+      - '.github/workflows/peripheral-approval.yml'
+      - 'crates/kernel/src/peripheral_operator.rs'
+      - 'crates/kernel/src/tools.rs'
+      - 'crates/kernel/src/syscall_gate.rs'
+      - 'crates/kernel/src/lib.rs'
+      - 'crates/tauri-app/**'
+      - 'tests/src/capability_registry.rs'
+      - 'docs/PROVIDER_MATRIX.md'
+      - 'docs/capabilities.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peripheral-approval-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native-handoff:
+    name: Native peripheral handoff and stub transcript
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Retain exact source identity
+        run: |
+          mkdir -p target/qualification/peripheral
+          git rev-parse HEAD > target/qualification/peripheral/source-commit.txt
+      - name: Peripheral kernel grant, waiter, fence, and lifecycle regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel peripheral --locked -- --nocapture 2>&1 | tee target/qualification/peripheral/kernel.txt
+      - name: No remote grant or device capability promotion
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p integration-tests capability_registry --locked 2>&1 | tee target/qualification/peripheral/registry.txt
+      - name: Actual desktop kernel and authenticated-wire stub cycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tauri-app --no-default-features --locked peripheral_tests -- --nocapture 2>&1 | tee target/qualification/peripheral/desktop-transcript.txt
+          if grep -Fq 'never-display-this-private-camera-target' target/qualification/peripheral/desktop-transcript.txt; then
+            echo 'Desktop transcript exposed a raw peripheral target'
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: peripheral-approval-${{ github.sha }}
+          path: target/qualification/peripheral
+          if-no-files-found: error
+          retention-days: 30

@@ -144,7 +144,7 @@ const systemAudit = {
   ],
 };
 
-async function installTauriFixture(page, { setupComplete = true } = {}) {
+async function installTauriFixture(page, { setupComplete = true, peripheralRequests = [] } = {}) {
   await page.addInitScript(
     ({
       complete,
@@ -153,6 +153,7 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
       serviceHistoryFixtures,
       tunableAuditFixtures,
       systemAuditFixture,
+      peripheralFixtures,
     }) => {
       const config = {
         setup_complete: complete,
@@ -166,11 +167,27 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
       };
 
       window.__TAURI_CALLS__ = [];
+      window.__PERIPHERAL_FIXTURE__ = peripheralFixtures;
       window.__TAURI_INTERNALS__ = {
         invoke(command, args = {}) {
           window.__TAURI_CALLS__.push({ command, args });
           if (command === 'load_config') return Promise.resolve(config);
           if (command === 'get_operator_view') return Promise.resolve(snapshot);
+          if (command === 'get_peripheral_requests') return Promise.resolve(structuredClone(window.__PERIPHERAL_FIXTURE__));
+          if (['approve_peripheral_request', 'deny_peripheral_request', 'revoke_peripheral_request'].includes(command)) {
+            const request = window.__PERIPHERAL_FIXTURE__.find(item => item.request_id === args.requestId);
+            if (!request) return Promise.reject(new Error('peripheral request unavailable'));
+            if (command === 'approve_peripheral_request') {
+              request.status = 'approved'; request.grant_pending = true;
+            } else if (command === 'deny_peripheral_request') {
+              request.status = 'denied';
+            } else {
+              const result = { pending_grant_revoked: request.grant_pending, active_uses_cancelled: request.active_uses };
+              request.status = 'revoked'; request.grant_pending = false; request.active_uses = 0;
+              return Promise.resolve(result);
+            }
+            return Promise.resolve();
+          }
           if (command === 'list_checkpoints') return Promise.resolve(checkpointFixtures);
           if (command === 'resume_checkpoint') {
             return Promise.resolve({ state: 'Running', output: null });
@@ -244,6 +261,7 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
       serviceHistoryFixtures: serviceHistory,
       tunableAuditFixtures: tunableAudit,
       systemAuditFixture: systemAudit,
+      peripheralFixtures: peripheralRequests,
     },
   );
 }
@@ -255,6 +273,62 @@ async function expectWcagAxeClean(page) {
 
   expect(results.violations, JSON.stringify(results.violations, null, 2)).toEqual([]);
 }
+
+const peripheralRequest = {
+  request_id: '72d3ba1e-aebd-4015-8b33-14cc212f03e2',
+  agent_id: 'agent-1',
+  agent_name: 'Research agent',
+  tool_name: 'camera_fixture',
+  resource_identity: `sha256:${'b'.repeat(64)}`,
+  required_policy: 'user',
+  status: 'awaiting-approval',
+  grant_pending: false,
+  active_uses: 0,
+};
+
+test('peripheral approval dialog is keyboard operable, opaque-only, and revokes an unconsumed grant', async ({ page }) => {
+  await installTauriFixture(page, { peripheralRequests: [{ ...peripheralRequest }] });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Review peripheral request for Research agent' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Approve peripheral request' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('Research agent');
+  await expect(dialog).toContainText('camera_fixture');
+  await expect(dialog).toContainText(peripheralRequest.resource_identity);
+  await expect(dialog.getByRole('button', { name: 'Approve exact call' })).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(dialog.getByRole('button', { name: 'Close review' })).toBeFocused();
+  await expectWcagAxeClean(page);
+  await dialog.getByRole('button', { name: 'Approve exact call' }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByText(/Pending grant: yes\. Active uses: 0\./)).toBeVisible();
+  await page.getByRole('button', { name: 'Revoke peripheral access for Research agent' }).click();
+  await expect(page.getByText('Pending grant revoked: yes; active uses cancelled: 0.', { exact: true })).toBeVisible();
+  const decisions = await page.evaluate(() => window.__TAURI_CALLS__.filter(call => ['approve_peripheral_request', 'revoke_peripheral_request'].includes(call.command)));
+  expect(decisions.map(call => call.args)).toEqual([{ requestId: peripheralRequest.request_id }, { requestId: peripheralRequest.request_id }]);
+  await expect(page.locator('body')).not.toContainText('never-display-this-private-camera-target');
+  await expectWcagAxeClean(page);
+});
+
+test('peripheral state shows exact active counts, denial, and lifecycle cleanup without raw targets', async ({ page }) => {
+  await installTauriFixture(page, { peripheralRequests: [{ ...peripheralRequest }] });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Review peripheral request for Research agent' }).click();
+  await page.getByRole('button', { name: 'Deny request' }).click();
+  await expect(page.getByText('Request denied.', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Status: denied\./)).toBeVisible();
+  await page.evaluate(() => {
+    const request = window.__PERIPHERAL_FIXTURE__[0];
+    request.status = 'approved'; request.active_uses = 2;
+  });
+  await expect(page.getByText(/Active uses: 2\./)).toBeVisible();
+  await page.getByRole('button', { name: 'Revoke peripheral access for Research agent' }).click();
+  await expect(page.getByText('Pending grant revoked: no; active uses cancelled: 2.', { exact: true })).toBeVisible();
+  await page.evaluate(() => { window.__PERIPHERAL_FIXTURE__[0].status = 'cancelled'; });
+  await expect(page.getByText(/Status: cancelled\. Pending grant: no\. Active uses: 0\./)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Revoke peripheral access for Research agent' })).toHaveCount(0);
+  await expectWcagAxeClean(page);
+});
 
 test('production dashboard, status, and settings views pass rendered WCAG checks', async ({ page }) => {
   await installTauriFixture(page);

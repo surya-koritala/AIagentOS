@@ -1,0 +1,22 @@
+[[permission]]
+identifier = "desktop-public-wire"
+description = "Existing desktop operations through their authenticated kernel client and native host services."
+commands.allow = [
+  "create_agent", "send_message", "stream_message", "cancel_message",
+  "pause_agent", "resume_agent", "stop_agent", "list_checkpoints",
+  "resume_checkpoint", "delete_checkpoint", "start_service", "stop_service",
+  "restart_service", "service_history", "set_operator_tunable",
+  "rollback_operator_tunable", "operator_tunable_audit", "list_installed_packages",
+  "install_package", "run_installed_package", "rollback_installed_package",
+  "remove_installed_package", "list_agents", "get_metrics", "get_operator_view",
+  "get_system_audit", "check_for_update", "install_update", "load_config",
+  "save_config", "delete_provider_credential",
+]
+
+[[permission]]
+identifier = "local-peripheral-operator"
+description = "Process-local human decisions for opaque peripheral request identities."
+commands.allow = [
+  "get_peripheral_requests", "approve_peripheral_request",
+  "deny_peripheral_request", "revoke_peripheral_request",
+]

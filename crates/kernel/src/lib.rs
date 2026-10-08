@@ -10,6 +10,7 @@ pub mod auth;
 pub mod budget;
 pub mod cfs;
 pub mod cgroups;
+pub mod cloning;
 pub mod cluster_consensus;
 pub mod cluster_control;
 pub mod cluster_runtime;
@@ -2494,6 +2495,8 @@ impl AgentKernelImpl {
     /// and best-effort per agent: a malformed row is skipped, not fatal. Returns
     /// the ids that were brought back. A fresh / empty DB rehydrates nothing.
     pub async fn rehydrate_agents(&self) -> Result<Vec<AgentId>, KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        self.context_manager.reconcile_pending_clones()?;
         // Rehydrate tenancy first so an agent's tenant is known to the AuthSystem
         // by the time the agent is re-placed into its tenant's namespace/cgroup.
         self.rehydrate_tenancy().await;
@@ -2587,6 +2590,18 @@ impl AgentKernelImpl {
                 restored.push(p.id);
                 continue;
             }
+            let clone_security = match self.context_manager.clone_security(p.id) {
+                Ok(Some(security))
+                    if security.version == 1 && security.profile == config.permission_profile =>
+                {
+                    Some(security)
+                }
+                Ok(None) => None,
+                _ => {
+                    tracing::warn!("Skipping agent {}: invalid clone security metadata", p.id);
+                    continue;
+                }
+            };
             let sandbox_result = if SandboxManagerImpl::is_managed_config(&sandbox_config) {
                 self.sandbox_manager
                     .create_managed_sandbox(p.id, &sandbox_config)
@@ -2604,23 +2619,35 @@ impl AgentKernelImpl {
                 p.id,
                 p.session_id,
                 config.clone(),
-                state.clone(),
+                if clone_security.is_some() {
+                    AgentState::Initializing
+                } else {
+                    state.clone()
+                },
                 p.created_at,
                 p.last_activity_at,
+            );
+            PermissionSystem::assign_profile(
+                &*self.permission_manager,
+                p.id,
+                &config.permission_profile,
             );
             // Re-admit to the priority scheduler and re-place into OS subsystems,
             // re-arming the agent's tenant isolation: a tenanted agent rejoins its
             // tenant's namespace group + cgroup exactly as at creation, so
             // cross-tenant isolation survives the restart.
-            self.scheduler.admit_id(p.id);
             let persisted_group = self.context_manager.agent_namespace_group(p.id)?;
             let group = persisted_group.as_deref().or_else(|| {
                 (p.tenant_id != crate::context::DEFAULT_TENANT).then_some(p.tenant_id.as_str())
             });
-            if let Err(error) = self
-                .place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
-                .await
-            {
+            let placed = if let Some(security) = clone_security.as_ref() {
+                self.place_cloned_agent(p.id, &config, group, &p.tenant_id, security)
+                    .await
+            } else {
+                self.place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
+                    .await
+            };
+            if let Err(error) = placed {
                 tracing::warn!(
                     "Skipping persisted agent {} because enforcement could not be restored: {}",
                     p.id,
@@ -2630,6 +2657,30 @@ impl AgentKernelImpl {
                 self.agent_manager.purge_agent(p.id);
                 continue;
             }
+            if clone_security.is_some() {
+                if let Some(pid) = self.syscall_gate.pid_of(p.id) {
+                    self.os.procfs.lock().await.set_agent_info(
+                        pid,
+                        "state".into(),
+                        if state == AgentState::Paused {
+                            "paused".into()
+                        } else {
+                            "running".into()
+                        },
+                    );
+                }
+                self.ipc.register_agent(p.id);
+                self.agent_manager
+                    .transition_state(p.id, AgentState::Running)?;
+                if state == AgentState::Paused {
+                    self.agent_manager
+                        .transition_state(p.id, AgentState::Paused)?;
+                }
+                self.syscall_gate
+                    .reopen_tool_admission(p.id)
+                    .map_err(|error| KernelError::Policy(error.to_string()))?;
+            }
+            self.scheduler.admit_id(p.id);
             if state == AgentState::Paused {
                 self.scheduler.set_paused(p.id);
             }

@@ -131,6 +131,14 @@
   },
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",
+    "child_agent_id": "00000000-0000-0000-0000-000000000005",
+    "child_ownership_proof": null,
+    "drop_capabilities": [],
+    "name": "fixture",
+    "op": "clone_agent"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
     "op": "pause_agent"
   },
   {

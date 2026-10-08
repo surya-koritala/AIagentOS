@@ -197,7 +197,7 @@ fn registry_is_complete_and_honest() {
     }
     assert_eq!(
         registry.capability.len(),
-        24,
+        25,
         "every roadmap child issue must have a capability decision"
     );
 
@@ -248,7 +248,7 @@ fn registry_is_complete_and_honest() {
         "adding or removing a public kernel module requires a capability classification"
     );
 
-    let expected_issues: BTreeSet<u64> = (106..=128).chain([392]).collect();
+    let expected_issues: BTreeSet<u64> = (106..=128).chain([392, 393]).collect();
     assert_eq!(
         issues, expected_issues,
         "every child roadmap issue must be represented exactly once"

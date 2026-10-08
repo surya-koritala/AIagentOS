@@ -198,6 +198,16 @@ impl Default for SandboxManagerImpl {
 }
 
 impl SandboxManagerImpl {
+    pub(crate) fn sandbox_config(&self, id: SandboxId) -> Option<SandboxConfig> {
+        self.sandboxes.get(&id).map(|state| SandboxConfig {
+            workspace_dir: state.workspace_dir.clone(),
+            allowed_network_hosts: Some(state.allowed_network_hosts.iter().cloned().collect()),
+            isolation_level: state.isolation_level.clone(),
+            max_disk_usage_bytes: state.max_disk_usage_bytes,
+            max_memory_bytes: state.max_memory_bytes,
+            container_image: state.container_image.clone(),
+        })
+    }
     const MANAGED_MARKER: &'static str = ".aiagentos-managed";
 
     pub fn new() -> Self {

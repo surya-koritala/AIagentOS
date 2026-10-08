@@ -529,3 +529,59 @@ async fn canonical_agentctl_covers_tenant_runtime_streams_and_operations_views()
     server_task.abort();
     let _ = server_task.await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agentctl_clone_creates_a_resumable_branch_with_attenuated_capabilities() {
+    let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+    kernel
+        .register_provider(Arc::new(CliTestAdapter {
+            id: "cli-clone".into(),
+            delayed_calls: Arc::new(AtomicUsize::new(0)),
+            delayed_calls_per_provider: 0,
+        }))
+        .unwrap();
+    let server = kernel::syscall_server::SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+        .await
+        .unwrap();
+    let address = server.local_addr().unwrap().to_string();
+    let task = tokio::spawn(server.serve());
+    let created = agentctl(
+        &address,
+        None,
+        &["create", "CLI parent", "branch history", "cli-clone"],
+    );
+    assert_success(&created, "create parent");
+    let parent = parse_json(&created)["id"].as_str().unwrap().to_string();
+    let message = agentctl(
+        &address,
+        None,
+        &["message", &parent, "original parent prompt"],
+    );
+    assert_success(&message, "parent message");
+    let child = kernel::AgentId::new_v4().to_string();
+    let cloned = agentctl(
+        &address,
+        None,
+        &["clone", &parent, &child, "CLI branch", "CAP_EXEC"],
+    );
+    assert_success(&cloned, "clone");
+    let result = parse_json(&cloned);
+    assert_eq!(result["child_id"], child);
+    assert_eq!(result["inherited_handles"], 0);
+    assert!(result["snapshot"].is_object());
+    let capabilities = agentctl(&address, None, &["capabilities", &child]);
+    assert_success(&capabilities, "child capabilities");
+    assert!(!parse_json(&capabilities)["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cap| cap == "CAP_EXEC"));
+    let message = agentctl(&address, None, &["message", &child, "continue branch"]);
+    assert_success(&message, "child message");
+    assert_eq!(parse_json(&message)["tokens"], 7);
+    for id in [&parent, &child] {
+        assert_success(&agentctl(&address, None, &["stop", id]), "stop");
+    }
+    task.abort();
+    let _ = task.await;
+}

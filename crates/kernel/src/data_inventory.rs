@@ -243,7 +243,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "agents",
         "agent and tenant",
         "tenant_id",
-        "agent identity, task, provider, and policy metadata",
+        "agent identity, task, provider, clone lineage, and captured policy metadata",
         "until agent or tenant erasure",
         "not encrypted; owner-only database file permissions",
         "erase last after owned child rows"

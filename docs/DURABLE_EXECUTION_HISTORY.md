@@ -45,17 +45,65 @@ Garbage collection removes a prefix and its index only after its last reachable
 branch disappears. A same-tenant child can retain a shared history after parent
 erasure; this retained ownership is reported in the deletion receipt. Tenant
 erasure removes every branch and shared prefix owned by that tenant.
+A child's creation metadata also retains its parent UUID as child-owned lineage.
+Parent erasure preserves that lineage; child or tenant erasure removes it.
 
 All payloads, references and search indexes remain in the kernel's single
 SQLite store. Configured SQLCipher encryption, verified database backups and
-transaction recovery cover them together. Database schema 8 requires a reader
-that understands branch tails; older binaries must not open it.
+transaction recovery cover them together. Database schema 9 requires a reader
+that understands branch tails and durable clone security; older binaries must
+not open it.
 
-This is the storage and execution foundation for
-[#393](https://github.com/surya-koritala/AIagentOS/issues/393). The in-process
-`fork_conversation` operation requires callers to serialize the parent against
-execution and teardown. It does not create an agent or transfer a sandbox,
-permissions, handles, approvals, credentials or live work. The public
-`CloneAgent` lifecycle transaction, SDK/CLI, idempotent recovery, eligibility
-rules and performance measurements remain part of #393. Named namespace groups
-are now stored with agent identity and restored with their original isolation.
+## Public agent cloning
+
+`CloneAgent`, `KernelClient::clone_agent`, and
+`agentctl clone PARENT_ID CHILD_UUID NAME [CAPABILITY_DROP_CSV]` create a new
+Running agent from an idle Running or Paused parent. An active or queued provider
+turn, live tool binding, retained generation checkpoint, transient namespace
+membership, or moved cgroup is incompatible. A checkpoint from another provider
+or model is also rejected. A parent with no conversation produces a child with
+no snapshot; its first turn starts normally. Provider/model selection and task
+configuration stay the same.
+
+The caller supplies the child UUID. Repeating the same parent, child, name and
+capability-removal request explicitly reconciles the original result without
+creating a second child or reviving a stopped child. Another creation using
+that UUID fails. The SDK never automatically replays a clone after an uncertain
+transport result. A deleted child identity is absent; reconciliation after
+explicit deletion is a new creation, so callers must use a new UUID when they
+intend a distinct branch.
+
+A child retains its parent's tenant, named namespace group, actual permission
+profile, effective capabilities, MAC label and private cgroup limits. Named
+capabilities may only be removed. The parent policy is held stable during the
+publication transaction. The child gets a new session identity, private cgroup,
+empty managed workspace and mailbox. No VFS handles are inherited: a child must
+open fresh descriptors through the ordinary gate. Approvals, credentials,
+agent-private facts/KV, live provider/tool execution, and external side effects
+do not transfer. Both branches use normal provider billing for actual new work.
+
+Creation first reserves a durable pending identity under the node's agent quota.
+Runtime registration starts with tool admission closed and an Initializing
+registry state. One SQLite transaction publishes the child context, immutable
+snapshot references, logical context quota charge, sandbox configuration and
+Running identity. Cancellation before publication removes staged resources;
+boot purges interrupted pending identities before admitting any agents and
+reconciles orphan managed workspaces. A committed child restores its attenuated
+security before reopening admission. Parent teardown and cloning serialize
+through the lifecycle lock; public erasure and both destination ownership fences
+remain held through the operation.
+
+For fenced destinations, `KernelClient::clone_agent_fenced` accepts the exact
+parent proof and an authority-reserved child identity with its own proof.
+Stale, missing or mismatched ownership proofs fail before creation.
+
+The in-process `fork_conversation` storage primitive remains available to kernel
+callers that already serialize the parent against execution and teardown. The
+public lifecycle path supplies those locks and durable reconciliation for
+[#393](https://github.com/surya-koritala/AIagentOS/issues/393).
+
+Latency, allocated database growth and sampled RSS are compared with eager
+history copy in the retained [fixture measurement record](
+../benchmarks/cloning/2026-10-08-macos-arm64/README.md). First promotion has a
+visible cost; later clones reuse the shared prefix. The record reports actual
+samples and does not imply a production performance or provider-memory guarantee.

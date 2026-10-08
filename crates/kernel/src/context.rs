@@ -18,12 +18,15 @@ use crate::{AgentId, ContextError};
 
 #[path = "context/branching.rs"]
 mod branching;
+#[path = "context/clone_store.rs"]
+mod clone_store;
 #[path = "context/shared_spills.rs"]
 mod shared_spills;
 pub use branching::{
     ExecutionSnapshotMetadata, EXECUTION_SNAPSHOT_VERSION, MAX_EXECUTION_SNAPSHOT_BYTES,
     MAX_EXECUTION_SNAPSHOT_DEPTH,
 };
+pub(crate) use clone_store::clone_request_digest;
 
 /// A message in the agent's conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2357,6 +2360,15 @@ impl SqliteContextManager {
         }
         crate::accounting_integrity::install(conn)?;
         crate::schema::add_column_if_missing(conn, "agents", "namespace_group", "TEXT")?;
+        for (name, definition) in [
+            ("clone_pending", "INTEGER NOT NULL DEFAULT 0"),
+            ("clone_parent_id", "TEXT"),
+            ("clone_request_digest", "TEXT"),
+            ("clone_security_json", "TEXT"),
+            ("clone_result_json", "TEXT"),
+        ] {
+            crate::schema::add_column_if_missing(conn, "agents", name, definition)?;
+        }
         branching::init_schema(conn)?;
         crate::schema::complete_migration(conn, schema_version)?;
         transaction.commit().map_err(|error| {

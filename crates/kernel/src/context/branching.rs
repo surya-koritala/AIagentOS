@@ -493,6 +493,19 @@ impl SqliteContextManager {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        let result = self.fork_conversation_locked(&tx, parent, source, child, target)?;
+        tx.commit().map_err(sql_error)?;
+        Ok(result)
+    }
+
+    pub(super) fn fork_conversation_locked(
+        &self,
+        tx: &Connection,
+        parent: AgentId,
+        source: &str,
+        child: AgentId,
+        target: &str,
+    ) -> Result<ExecutionSnapshotMetadata, ContextError> {
         let owned_tenant = |agent: AgentId| -> Result<String, ContextError> {
             tx.query_row(
                 "SELECT tenant_id FROM agents WHERE id = ?1",
@@ -551,13 +564,13 @@ impl SqliteContextManager {
             )
             .map_err(sql_error)?;
         }
-        let bytes = logical_bytes(&tx, source)?;
+        let bytes = logical_bytes(tx, source)?;
         if bytes > MAX_EXECUTION_SNAPSHOT_BYTES {
             return Err(failed("execution snapshot logical byte bound exceeded"));
         }
-        self.enforce_context_storage_locked(&tx, child, &tenant, bytes, 0)?;
-        let baseline = match reference(&tx, source)? {
-            Some((id, owner)) if owner == tenant => Some(node(&tx, &id, &tenant)?),
+        self.enforce_context_storage_locked(tx, child, &tenant, bytes, 0)?;
+        let baseline = match reference(tx, source)? {
+            Some((id, owner)) if owner == tenant => Some(node(tx, &id, &tenant)?),
             Some(_) => return Err(failed("conversation snapshot tenant mismatch")),
             None => None,
         };
@@ -571,7 +584,7 @@ impl SqliteContextManager {
         let snapshot = if let (0, Some(base)) = (count, &baseline) {
             base.metadata.clone()
         } else {
-            seal_tail(&tx, source, parent, &tenant, baseline.as_ref())?
+            seal_tail(tx, source, parent, &tenant, baseline.as_ref())?
         };
         tx.execute(
             "UPDATE conversations SET messages_json = '[]', messages_hash = ?1 WHERE id = ?2",
@@ -588,14 +601,14 @@ impl SqliteContextManager {
              ON CONFLICT(conversation_id) DO UPDATE SET snapshot_id = excluded.snapshot_id",
             params![source, &tenant, snapshot.id.to_string()]
         ).map_err(sql_error)?;
-        shared_spills::validate_ownership(&tx, parent, &tenant)?;
-        let spill_bytes = shared_spills::conversation_bytes(&tx, source)?;
+        shared_spills::validate_ownership(tx, parent, &tenant)?;
+        let spill_bytes = shared_spills::conversation_bytes(tx, source)?;
         if bytes.saturating_add(spill_bytes) > MAX_EXECUTION_SNAPSHOT_BYTES {
             return Err(failed(
                 "execution snapshot including spills exceeds byte bound",
             ));
         }
-        self.enforce_context_storage_locked(&tx, child, &tenant, bytes + spill_bytes, 0)?;
+        self.enforce_context_storage_locked(tx, child, &tenant, bytes + spill_bytes, 0)?;
         crash_multi_table_mutation_after_step_for_test("fork.source_reference");
         let now = Utc::now().to_rfc3339();
         tx.execute(
@@ -609,7 +622,6 @@ impl SqliteContextManager {
             params![target, &tenant, snapshot.id.to_string()]
         ).map_err(sql_error)?;
         crash_multi_table_mutation_after_step_for_test("fork.child_reference");
-        tx.commit().map_err(sql_error)?;
         Ok(snapshot)
     }
 }

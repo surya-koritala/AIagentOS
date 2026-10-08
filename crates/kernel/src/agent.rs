@@ -209,6 +209,13 @@ impl AgentManager {
         self.agents.get(&agent_id).map(|agent| agent.config.clone())
     }
 
+    pub(crate) fn update_agent_config(&self, id: AgentId, config: AgentConfig) {
+        if let Some(mut agent) = self.agents.get_mut(&id) {
+            agent.name = config.name.clone();
+            agent.config = config;
+        }
+    }
+
     /// Enter the non-runnable cleanup state from any non-terminal state. Forced
     /// kill uses this after durably staging `Stopping`, before revoking live
     /// subsystem state.

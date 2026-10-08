@@ -11,12 +11,11 @@ use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
 use agent_cli::providers::register_providers;
+use agent_cli::slash::{handle_slash, SlashOutcome};
 use kernel::config::Config;
-use kernel::connector::AgentConnector;
-use kernel::execution::{AgentExecutor, StreamEvent};
-use kernel::resources::ResourceBroker;
+use kernel::execution::StreamEvent;
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
-use tokio::sync::mpsc;
+use kernel::learning::{RuleScope, RuleStore};
 
 mod logging;
 mod policy_cmd;
@@ -83,65 +82,6 @@ fn unrecognized_flag(argv: &[String]) -> Option<&str> {
         index += 1;
     }
     None
-}
-
-/// Handle slash commands. Returns true if handled.
-fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -> bool {
-    match cmd.split_whitespace().next().unwrap_or("") {
-        "/quit" | "/exit" => std::process::exit(0),
-        "/id" => {
-            println!("\x1b[90m{}\x1b[0m", executor.conversation_id);
-            true
-        }
-        "/history" => {
-            let convs = kernel.context_manager.list_conversations();
-            println!("\x1b[90mConversations ({}):\x1b[0m", convs.len());
-            for (id, _, updated) in convs.iter().take(10) {
-                println!("  {} ({})", &id[..8], updated);
-            }
-            true
-        }
-        "/usage" => {
-            let (tokens, cost) = kernel.context_manager.get_total_usage();
-            let stats = kernel.rate_limiter.stats();
-            println!(
-                "\x1b[90mTokens: {} | Cost: ${:.4} | RPM: {}/{}\x1b[0m",
-                tokens, cost, stats.requests_this_minute, stats.rpm_limit
-            );
-            true
-        }
-        "/plan" => {
-            println!("\x1b[90mUse: /plan <task description> to generate a plan\x1b[0m");
-            true
-        }
-        "/learn" => {
-            let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
-            if parts.len() == 3 {
-                println!(
-                    "\x1b[90mRule added: when '{}' → '{}'\x1b[0m",
-                    parts[1], parts[2]
-                );
-            } else {
-                println!("\x1b[90mUse: /learn <trigger> <correction>\x1b[0m");
-            }
-            true
-        }
-        "/help" => {
-            println!("\x1b[90mCommands:");
-            println!("  /quit        Exit");
-            println!("  /id          Show conversation ID");
-            println!("  /history     List saved conversations");
-            println!("  /usage       Show token usage and cost");
-            println!("  /learn T C   Add correction rule (trigger → correction)");
-            println!("  /help        This message\x1b[0m");
-            true
-        }
-        _ if cmd.starts_with('/') => {
-            println!("\x1b[90mUnknown command. Type /help\x1b[0m");
-            true
-        }
-        _ => false,
-    }
 }
 
 #[tokio::main]
@@ -233,46 +173,29 @@ async fn main() {
     let project_ctx = project_context();
     let system_prompt = format!("You are a helpful AI assistant running in a terminal. Be concise and use tools when needed.\n\n{}", project_ctx);
 
-    let session = AgentConnector::connect(&*kernel.connector, handle.id, &config.llm_provider)
-        .await
-        .unwrap_or_else(|e| {
-            fail(format!(
-                "failed to connect to LLM provider '{}': {e}\n  (check the API key and provider settings in your config/env)",
-                config.llm_provider
-            ))
-        });
-    // Route every tool call through the kernel's syscall gate (capability /
-    // MAC / cgroup / namespace enforcement). The gate is a required argument, so
-    // there is no ungoverned path: the agent was registered with the gate in
-    // `create_agent_full` using `config.permission_profile`'s caps.
-    let mut executor = AgentExecutor::new(
-        handle.id,
-        session,
-        kernel.resource_broker.clone() as Arc<dyn ResourceBroker>,
-        kernel.tool_registry.clone(),
-        kernel.context_manager.clone(),
-        kernel.syscall_gate.clone(),
-        system_prompt,
-    );
-
-    if let Some(ref conv_id) = conversation_id {
-        executor = executor.with_conversation(conv_id);
-        eprintln!("\x1b[90mResumed: {}\x1b[0m", conv_id);
-    }
-
-    // Set up event channel
-    let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
-    executor.set_event_channel(tx);
+    let operator = kernel::config::local_operator_identity()
+        .unwrap_or_else(|error| fail(format!("failed to determine local operator: {error}")));
+    let rules = Arc::new(RuleStore::from_file(
+        &config.data_dir.join("rules.json"), RuleScope::local_cli(), &operator,
+    ).unwrap_or_else(|error| fail(format!("failed to load local correction rules: {error}"))));
+    let conversation = kernel.configure_local_cli_agent(
+        handle.id, rules.clone(), system_prompt, conversation_id.as_deref(),
+    ).await.unwrap_or_else(|error| fail(format!("failed to configure CLI agent: {error}")));
 
     // One-shot mode
     if let Some(cmd) = one_shot {
+        match cancellable_cli_operation(&kernel, handle.id, handle_slash(&cmd, &kernel, handle.id, &conversation, &rules)).await {
+            Ok(SlashOutcome::Output(output)) => { println!("{output}"); return; }
+            Ok(SlashOutcome::Quit) => return,
+            Ok(SlashOutcome::NotSlash) => {},
+            Err(error) => fail(error),
+        }
         let msg = if let Some(ref piped) = piped_input {
             format!("{}\n\nInput:\n{}", cmd, piped)
         } else {
             cmd
         };
-        let output = executor
-            .run(&msg)
+        let output = run_cli_turn(&kernel, handle.id, &msg)
             .await
             .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
@@ -286,8 +209,7 @@ async fn main() {
             .map(|s| s.as_str())
             .unwrap_or("Process this input");
         let msg = format!("{}\n\nInput:\n{}", prompt, piped);
-        let output = executor
-            .run(&msg)
+        let output = run_cli_turn(&kernel, handle.id, &msg)
             .await
             .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
@@ -301,7 +223,7 @@ async fn main() {
     );
     eprintln!(
         "\x1b[90mConversation: {} | /help for commands\x1b[0m\n",
-        &executor.conversation_id[..8]
+        &conversation
     );
 
     let stdin = io::stdin();
@@ -320,22 +242,13 @@ async fn main() {
             continue;
         }
 
-        if handle_slash(input, &executor, &kernel) {
-            continue;
+        match cancellable_cli_operation(&kernel, handle.id, handle_slash(input, &kernel, handle.id, &conversation, &rules)).await {
+            Ok(SlashOutcome::Output(output)) => { println!("{output}"); continue; }
+            Ok(SlashOutcome::Quit) => break,
+            Ok(SlashOutcome::NotSlash) => {},
+            Err(error) => { eprintln!("Error: {error}"); continue; },
         }
-
-        let output = executor.run(input).await;
-
-        // Drain events
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                StreamEvent::ToolCallStarted { name, .. } => {
-                    eprint!("\x1b[33m  🔧 {}\x1b[0m", name)
-                }
-                StreamEvent::ToolCallResult { .. } => eprintln!(" ✓"),
-                _ => {}
-            }
-        }
+        let output = run_cli_turn(&kernel, handle.id, input).await;
 
         match output {
             Ok(out) => {
@@ -345,7 +258,7 @@ async fn main() {
                         "\x1b[90m  [{} tools, {} tokens, ${:.4}]\x1b[0m\n",
                         out.tool_calls_made,
                         out.tokens_used,
-                        out.tokens_used as f64 * 0.00001
+                        out.estimated_cost_usd
                     );
                 } else {
                     eprintln!("\x1b[90m  [{} tokens]\x1b[0m\n", out.tokens_used);
@@ -354,11 +267,51 @@ async fn main() {
             Err(e) => eprintln!("\x1b[31m  Error: {}\x1b[0m\n", e),
         }
     }
-    eprintln!("\n\x1b[90mSaved: {}\x1b[0m", executor.conversation_id);
+    eprintln!("\n\x1b[90mSaved: {}\x1b[0m", conversation);
 }
 
 fn atty_is_terminal() -> bool {
     unsafe { libc::isatty(0) != 0 }
+}
+
+async fn cancellable_cli_operation<T>(
+    kernel: &AgentKernelImpl,
+    agent: kernel::AgentId,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::pin!(operation);
+    tokio::select! {
+        result = &mut operation => result,
+        interrupted = tokio::signal::ctrl_c() => {
+            interrupted.map_err(|error| format!("failed to receive terminal interrupt: {error}"))?;
+            kernel.cancel_local_turn(agent);
+            let _ = operation.await;
+            Err("Operation cancelled by terminal interrupt.".into())
+        }
+    }
+}
+
+async fn run_cli_turn(
+    kernel: &AgentKernelImpl,
+    agent: kernel::AgentId,
+    message: &str,
+) -> Result<kernel::execution::AgentOutput, String> {
+    let (events, mut receiver) = tokio::sync::mpsc::channel(256);
+    let display = tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            match event {
+                StreamEvent::ToolCallStarted { name, .. } => eprint!("\x1b[33m  🔧 {name}\x1b[0m"),
+                StreamEvent::ToolCallResult { .. } => eprintln!(" ✓"),
+                _ => {},
+            }
+        }
+    });
+    let request = kernel::AgentId::new_v4().to_string();
+    let output = cancellable_cli_operation(kernel, agent, async {
+        kernel.send_message_stream(agent, message, &request, events).await.map_err(|error| error.to_string())
+    }).await;
+    display.await.map_err(|error| format!("terminal event display failed: {error}"))?;
+    output
 }
 
 /// Print a clean, user-facing startup error and exit non-zero.

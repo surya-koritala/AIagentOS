@@ -9,6 +9,7 @@ use std::ops::{Deref, DerefMut};
 use agent_sdk::{ConnectionProfile, KernelClient, SdkError};
 
 pub mod policy;
+pub mod slash;
 /// Provider registration shared by every first-party host surface.
 ///
 /// Keeping this in the library prevents the server, interactive CLI, and

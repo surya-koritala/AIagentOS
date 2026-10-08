@@ -619,6 +619,19 @@ impl AgentExecutor {
     }
 
     /// Resume from a saved conversation.
+    pub(crate) fn configure_terminal_prompt(&mut self, prompt: String, conversation: Option<&str>) -> Result<(), KernelError> {
+        self.system_prompt = prompt.clone();
+        self.messages = match conversation {
+            Some(id) => {
+                self.conversation_id = id.to_string();
+                self.context_manager.load_conversation(id)?
+            }
+            None => vec![StandardMessage::system(prompt)],
+        };
+        Ok(())
+    }
+
+    /// Resume from a saved conversation.
     pub fn with_conversation(mut self, conversation_id: &str) -> Self {
         self.conversation_id = conversation_id.to_string();
         if let Ok(messages) = self.context_manager.load_conversation(conversation_id) {
@@ -638,8 +651,17 @@ impl AgentExecutor {
     }
 
     /// Set a rule store for learning from corrections.
-    pub fn set_rule_store(&mut self, store: Arc<crate::learning::RuleStore>) {
+    pub fn set_rule_store(&mut self, store: Arc<crate::learning::RuleStore>) -> Result<(), KernelError> {
+        let authorized = match store.scope() {
+            crate::learning::RuleScope::Agent(agent) => agent == &self.agent_id.to_string(),
+            crate::learning::RuleScope::LocalOperator { tenant_id, operator } => {
+                operator == "local-cli" && self.context_admission.as_ref().is_some_and(|(_, tenant)| tenant == tenant_id)
+            }
+            _ => false,
+        };
+        if !authorized { return Err(KernelError::Policy("correction scope does not match this executor".into())); }
         self.rule_store = Some(store);
+        Ok(())
     }
 
     /// Get a cancellation token for this executor.
@@ -725,10 +747,12 @@ impl AgentExecutor {
             }
         }
 
-        // Inject applicable correction rules
+        // Replace prior correction data each turn, including after removal.
+        self.messages.retain(|message| !message.content.starts_with(crate::learning::RULE_PROMPT_PREFIX));
+        // Correction text is user data, never elevated system policy.
         if let Some(ref store) = self.rule_store {
             if let Some(rules_prompt) = store.rules_as_prompt(user_message) {
-                self.messages.push(StandardMessage::system(rules_prompt));
+                self.messages.push(StandardMessage::user(rules_prompt));
             }
         }
 
@@ -738,6 +762,36 @@ impl AgentExecutor {
         // with a count placeholder, silently losing semantics. Pressure is now
         // handled in `compact_to_token_budget`: full evicted messages are durably
         // spilled and a retrievable reference remains in the active prompt.
+    }
+
+    /// Generate a plan through the same provider admission and accounting as
+    /// an ordinary turn. Returned calls are data errors, never tool execution.
+    pub(crate) async fn run_plan(&self, task: &str) -> Result<TurnResult, KernelError> {
+        crate::planning::validate_plan_task(task)?;
+        let mut usage = UsageTelemetry::default();
+        let accounted_usage = &mut usage;
+        let plan = crate::planning::generate_plan_with(task, |messages| async move {
+            if self.context_budget_tokens > 0 && self.estimate_prompt_tokens(&messages) > self.context_budget_tokens {
+                return Err(KernelError::Policy("plan prompt exceeds the configured active-context budget".into()));
+            }
+            let budget_call = match &self.budget_enforcer {
+                Some(budget) => Some(budget.begin_call(self.agent_id).await.map_err(|error| KernelError::Policy(error.message()))?),
+                None => None,
+            };
+            let call = self.send_prepared_with_retry(messages, &[]).await?;
+            accounted_usage.record(&call);
+            if let Some(budget) = &self.budget_enforcer {
+                let (_, charged) = budget.record_usage_charge(self.agent_id, &call.provider_id, &call.model_id, call.usage);
+                accounted_usage.charged_cost_micros = accounted_usage.charged_cost_micros.saturating_add(charged);
+            }
+            drop(budget_call);
+            Ok(call.response)
+        }).await;
+        // Even an invalid textual plan is a consumed, accounted response. The
+        // kernel records usage before returning the explicit parse error.
+        let result = plan.map_err(|error| error.to_string());
+        let content = serde_json::to_string(&result).map_err(|error| KernelError::Policy(error.to_string()))?;
+        Ok(TurnResult::Completed(self.output(content, 0, usage.input_tokens.saturating_add(usage.output_tokens), usage)))
     }
 
     /// Pause-aware run of a turn for `user_message`.
@@ -755,6 +809,7 @@ impl AgentExecutor {
     /// [`GenerationCheckpoint`] for the honest note on token-level vs
     /// turn-boundary granularity across local and hosted backends.
     pub async fn run_resumable(&mut self, user_message: &str) -> Result<TurnResult, KernelError> {
+        if let Some(store) = &self.rule_store { store.check_health().map_err(|error| KernelError::Policy(error.to_string()))?; }
         self.prepare_turn(user_message).await;
         self.drive_loop(user_message.to_string(), 0, 0, UsageTelemetry::default())
             .await
@@ -1117,6 +1172,14 @@ impl AgentExecutor {
         &self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<ProviderCall, KernelError> {
+        self.send_prepared_with_retry(self.clean_messages(), tools).await
+    }
+
+    async fn send_prepared_with_retry(
+        &self,
+        clean_messages: Vec<StandardMessage>,
+        tools: &[crate::connector::ToolDefinition],
+    ) -> Result<ProviderCall, KernelError> {
         if self.max_output_tokens_per_request > 0 && !self.session.enforces_max_output_tokens() {
             return Err(KernelError::Policy(format!(
                 "provider session {}/{} does not enforce the configured max_output_tokens_per_request={}; bounded token admission refuses to call it",
@@ -1126,7 +1189,6 @@ impl AgentExecutor {
             )));
         }
         // Filter messages: remove tool results that don't have a preceding tool_calls message
-        let clean_messages = self.clean_messages();
         let estimated_input_tokens = self
             .estimate_prompt_tokens(&clean_messages)
             .saturating_add(Self::conservative_tool_tokens(tools));

@@ -4421,6 +4421,13 @@ impl SqliteContextManager {
     }
 
     /// Load a conversation's messages.
+    pub fn conversation_owner(&self, id: &str) -> Result<AgentId, ContextError> {
+        let owner: String = self.locked_conn().query_row("SELECT agent_id FROM conversations WHERE id = ?1", [id], |row| row.get(0))
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        uuid::Uuid::parse_str(&owner).map_err(|error| ContextError::RestoreFailed(error.to_string()))
+    }
+
+    /// Load a conversation's messages.
     pub fn load_conversation(
         &self,
         id: &str,

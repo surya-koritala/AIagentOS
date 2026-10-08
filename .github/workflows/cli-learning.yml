@@ -1,0 +1,98 @@
+name: CLI learning and planning evidence
+
+on:
+  pull_request:
+    branches: [main, 'codex/**']
+    paths:
+      - 'crates/cli/**'
+      - 'crates/kernel/src/learning.rs'
+      - 'crates/kernel/src/planning.rs'
+      - 'crates/kernel/src/execution.rs'
+      - 'crates/kernel/src/config.rs'
+      - 'crates/kernel/src/windows_private_fs.rs'
+      - 'crates/kernel/src/lib.rs'
+      - '.github/workflows/cli-learning.yml'
+      - 'docs/CLI_LEARNING.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-learning-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  formatting:
+    name: CLI learning source formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Generate formatting patch in CI
+        run: |
+          cargo fmt --all
+          git diff --binary > cli-learning-formatting.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: cli-learning-formatting-${{ github.run_id }}
+          path: cli-learning-formatting.patch
+      - name: Formatting must match committed source
+        run: git diff --exit-code
+
+  commands:
+    name: CLI corrections and plans (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: false
+      - name: Bind evidence to PR head and checked-out merge
+        shell: bash
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s\n' "$PR_HEAD" > cli-learning-head.txt
+          git rev-parse HEAD > cli-learning-tested-merge.txt
+          rustc --version > cli-learning-toolchain.txt
+          git status --porcelain --untracked-files=no > cli-learning-source-state.txt
+      - name: Bounded durable rules, scopes, provenance, and plans
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel learning --locked -- --nocapture 2>&1 | tee cli-learning-store.log
+          cargo test -p kernel planning --locked -- --nocapture 2>&1 | tee cli-learning-plan.log
+          cargo test -p agent-cli slash:: --locked -- --nocapture 2>&1 | tee cli-learning-dispatch.log
+      - name: Shipped binary restart and governed actual kernel requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p agent-cli --test learning_planning --locked -- --nocapture 2>&1 | tee cli-learning-binaries.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: cli-learning-${{ matrix.os }}-${{ github.run_id }}
+          path: cli-learning-*.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: cli-learning-logs-${{ matrix.os }}-${{ github.run_id }}
+          path: cli-learning-*.log
+          if-no-files-found: error

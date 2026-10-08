@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Wired terminal `/learn` and `/unlearn` to bounded private correction storage
+  with operator provenance, atomic persistence, visible errors, restart, and
+  explicitly scoped executor injection. `/plan` generates bounded parsed
+  steps through kernel provider admission/accounting and clearly reports that
+  step execution is deferred. Slash help matches the accepted commands.
+  GitHub CI checks shipped binary restart, rule isolation, tool denial,
+  planning bounds, quota admission, and cancellation. Relates #338.
+
 - Added trusted first-operator tenant bootstrap and tenant-admin user/key
   administration through the public wire, Rust SDK, and `agentctl`. Key
   inventory and revocation use non-secret IDs, issuance prints the secret once,

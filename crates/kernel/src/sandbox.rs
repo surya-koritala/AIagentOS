@@ -336,25 +336,38 @@ impl SandboxManagerImpl {
         {
             let entry =
                 entry.map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
+            removed += usize::from(Self::reconcile_managed_entry(&root, &active, entry)?);
+        }
+        Ok(removed)
+    }
+
+    fn reconcile_managed_entry(
+        root: &Path,
+        active: &HashSet<PathBuf>,
+        entry: std::fs::DirEntry,
+    ) -> Result<bool, SandboxError> {
+        let reconcile = || -> std::io::Result<bool> {
+            let file_type = entry.file_type()?;
             if !file_type.is_dir()
                 || uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err()
             {
-                continue;
+                return Ok(false);
             }
             let path = entry.path();
-            let canonical = std::fs::canonicalize(&path)
-                .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
-            if canonical.parent() != Some(root.as_path()) || active.contains(&canonical) {
-                continue;
+            let canonical = std::fs::canonicalize(&path)?;
+            if canonical.parent() != Some(root) || active.contains(&canonical) {
+                return Ok(false);
             }
-            std::fs::remove_dir_all(&canonical)
-                .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
-            removed += 1;
+            std::fs::remove_dir_all(&canonical)?;
+            Ok(true)
+        };
+        match reconcile() {
+            Ok(removed) => Ok(removed),
+            // An external cleanup may remove a discovered entry before its
+            // metadata or deletion. Absence already satisfies reconciliation.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(SandboxError::DestructionFailed(error.to_string())),
         }
-        Ok(removed)
     }
 
     #[cfg(test)]
@@ -3374,6 +3387,51 @@ mod tests {
         mgr.destroy_sandbox(trusted_id).unwrap();
         mgr.destroy_sandbox(sid).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_reconciliation_accepts_an_entry_removed_after_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let candidate = root.path().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&candidate).unwrap();
+        let entry = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir(&candidate).unwrap();
+        assert!(!SandboxManagerImpl::reconcile_managed_entry(
+            &canonical_root,
+            &HashSet::new(),
+            entry
+        )
+        .unwrap());
+        assert!(!candidate.exists());
+
+        std::fs::create_dir(&candidate).unwrap();
+        let entry = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let active = HashSet::from([std::fs::canonicalize(&candidate).unwrap()]);
+        assert!(
+            !SandboxManagerImpl::reconcile_managed_entry(&canonical_root, &active, entry).unwrap()
+        );
+        assert!(candidate.exists());
+        let entry = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(SandboxManagerImpl::reconcile_managed_entry(
+            &canonical_root,
+            &HashSet::new(),
+            entry
+        )
+        .unwrap());
+        assert!(!candidate.exists());
     }
 
     #[test]

@@ -191,11 +191,59 @@ async fn planning_quota_denial_happens_before_provider_io() {
     assert_eq!(kernel.rate_limiter.stats().reserved_receipts, 0);
 }
 
-fn binary(home: &Path, command: &str) -> Output {
+fn binary_command(home: &Path) -> Command {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent"));
-    child.args(["-c", command]);
     for name in ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"] { child.env(name, home); }
-    child.env("RUST_LOG", "error").output().unwrap()
+    child.env("RUST_LOG", "error");
+    child
+}
+
+fn binary(home: &Path, command: &str) -> Output {
+    binary_command(home).args(["-c", command]).output().unwrap()
+}
+
+#[cfg(unix)]
+fn interactive_binary(home: &Path, commands: &str) -> String {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+    let mut terminal = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let mut command = binary_command(home);
+    command.stdin(Stdio::from(slave.try_clone().unwrap())).stdout(Stdio::from(slave.try_clone().unwrap())).stderr(Stdio::from(slave));
+    let mut child = command.spawn().unwrap();
+    drop(command);
+    terminal.write_all(commands.as_bytes()).unwrap();
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut transcript = Vec::new();
+    let mut buffer = [0_u8; 4_096];
+    loop {
+        match terminal.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => transcript.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if child.try_wait().unwrap().is_some() {
+                    while let Ok(read) = terminal.read(&mut buffer) { if read == 0 { break; } transcript.extend_from_slice(&buffer[..read]); }
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("interactive agent timed out: {}", String::from_utf8_lossy(&transcript));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => panic!("read terminal: {error}"),
+        }
+    }
+    assert!(child.wait().unwrap().success(), "{}", String::from_utf8_lossy(&transcript));
+    String::from_utf8(transcript).unwrap()
 }
 
 fn success(output: Output) -> String {
@@ -229,6 +277,15 @@ async fn shipped_agent_add_list_remove_restart_and_plan_status() {
     let missing = binary(&home.0, &format!("/unlearn {id}"));
     assert!(!missing.status.success());
     assert!(!String::from_utf8_lossy(&missing.stdout).contains("Rule removed"));
+    #[cfg(unix)] {
+        let added = interactive_binary(&home.0, "/learn ordinary restart proof\n/quit\n");
+        let interactive_id = added.split("Rule persisted: ").nth(1).unwrap().split_whitespace().next().unwrap();
+        let listed = interactive_binary(&home.0, "/learn\n/quit\n");
+        assert!(listed.contains(interactive_id) && listed.contains("ordinary") && listed.contains("restart proof"));
+        assert!(interactive_binary(&home.0, &format!("/unlearn {interactive_id}\n/quit\n")).contains("Rule removed:"));
+        assert!(interactive_binary(&home.0, "/learn\n/quit\n").contains("No correction rules"));
+        assert!(listed.contains("No messages saved."), "quit must not claim an unsaved conversation was saved");
+    }
     let plan = success(binary(&home.0, "/plan refactor parser"));
     assert!(plan.contains("1. Inspect parser") && plan.contains("Plan execution is not wired") && plan.contains("No plan steps were executed"));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);

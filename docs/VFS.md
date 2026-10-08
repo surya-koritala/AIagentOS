@@ -1,5 +1,9 @@
 # Tool VFS
 
+The process-local namespace table can mount governed aliases and revoke an
+exact binding. See [Namespace mounts](NAMESPACE_MOUNTS.md) for authority,
+generation, restart, and in-flight-operation semantics.
+
 The initial VFS slice exposes the live tool registry at `/tools/<name>` through
 the JSON syscall ABI, Rust SDK, and `agentctl`. It is an agent object namespace
 on the host OS, with one built-in tool mount.

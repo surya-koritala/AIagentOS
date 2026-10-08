@@ -70,6 +70,7 @@ pub use kernel::syscall_server::{
     OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary,
     WireErrorCode,
 };
+pub use kernel::vfs::mounts::{MountInfo, MountKind, NamespaceMountView};
 pub use kernel::vfs::workspace::{
     WorkspaceHandle, WorkspaceKind, WorkspaceOpenRequest, WorkspaceRead, WorkspaceRight,
     WorkspaceStat,
@@ -1220,6 +1221,88 @@ impl KernelClient {
         {
             SyscallReply::VfsMounts { view } => Ok(view),
             other => Err(unexpected("VfsMounts", &other)),
+        }
+    }
+
+    /// Discover this agent's mount namespace, bindings, and administrative generation.
+    pub async fn vfs_namespace_mounts(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<NamespaceMountView, SdkError> {
+        match self
+            .call(Syscall::VfsNamespaceMounts {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::VfsNamespaceMounts { view } => Ok(view),
+            other => Err(unexpected("VfsNamespaceMounts", &other)),
+        }
+    }
+
+    /// Inspect one exact mounted root without executing a backing operation.
+    pub async fn vfs_mount_entries(
+        &mut self,
+        agent_id: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Result<VfsMountView, SdkError> {
+        match self
+            .call(Syscall::VfsMountEntries {
+                agent_id: agent_id.into(),
+                path: path.into(),
+            })
+            .await?
+        {
+            SyscallReply::VfsMounts { view } => Ok(view),
+            other => Err(unexpected("VfsMounts", &other)),
+        }
+    }
+
+    /// Mount a governed built-in backend. Requires tenant Admin or trusted operator.
+    pub async fn vfs_mount(
+        &mut self,
+        agent_id: impl Into<String>,
+        expected_table_id: impl Into<String>,
+        expected_generation: u64,
+        path: impl Into<String>,
+        kind: MountKind,
+    ) -> Result<NamespaceMountView, SdkError> {
+        match self
+            .call(Syscall::VfsMount {
+                agent_id: agent_id.into(),
+                expected_table_id: expected_table_id.into(),
+                expected_generation,
+                path: path.into(),
+                kind,
+            })
+            .await?
+        {
+            SyscallReply::VfsNamespaceMounts { view } => Ok(view),
+            other => Err(unexpected("VfsNamespaceMounts", &other)),
+        }
+    }
+
+    /// Unmount an exact binding and invalidate its descriptors; never replay automatically.
+    pub async fn vfs_unmount(
+        &mut self,
+        agent_id: impl Into<String>,
+        expected_table_id: impl Into<String>,
+        expected_generation: u64,
+        path: impl Into<String>,
+        mount_id: impl Into<String>,
+    ) -> Result<NamespaceMountView, SdkError> {
+        match self
+            .call(Syscall::VfsUnmount {
+                agent_id: agent_id.into(),
+                expected_table_id: expected_table_id.into(),
+                expected_generation,
+                path: path.into(),
+                mount_id: mount_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::VfsNamespaceMounts { view } => Ok(view),
+            other => Err(unexpected("VfsNamespaceMounts", &other)),
         }
     }
 
@@ -3186,6 +3269,8 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::StorageList { .. }
             | Syscall::VfsMounts { .. }
             | Syscall::VfsWorkspaceMounts { .. }
+            | Syscall::VfsNamespaceMounts { .. }
+            | Syscall::VfsMountEntries { .. }
             | Syscall::ContextPressure { .. }
             | Syscall::ListSnapshots { .. }
             | Syscall::Hello { .. }

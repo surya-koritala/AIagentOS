@@ -47,6 +47,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "typed_errors",
     "tool_vfs",
     "workspace_vfs",
+    "namespace_mounts",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -155,6 +156,34 @@ const NI: JsonKind = JsonKind::IntegerOrNull;
 const ON: JsonKind = JsonKind::ObjectOrNull;
 
 const REQUEST_VARIANTS: &[Variant] = &[
+    Variant {
+        tag: "vfs_namespace_mounts",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
+        tag: "vfs_mount_entries",
+        fields: &[Field::required("agent_id", S), Field::required("path", S)],
+    },
+    Variant {
+        tag: "vfs_mount",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("expected_table_id", S),
+            Field::required("expected_generation", I),
+            Field::required("path", S),
+            Field::required("kind", S),
+        ],
+    },
+    Variant {
+        tag: "vfs_unmount",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("expected_table_id", S),
+            Field::required("expected_generation", I),
+            Field::required("path", S),
+            Field::required("mount_id", S),
+        ],
+    },
     Variant {
         tag: "vfs_workspace_mounts",
         fields: &[Field::required("agent_id", S)],
@@ -853,6 +882,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("signature_hex", JsonKind::String) => Value::String("00".into()),
                     ("availability", JsonKind::String) => Value::String("active".into()),
                     ("state", JsonKind::String) => Value::String("left".into()),
+                    ("kind", JsonKind::String) => Value::String("tools".into()),
                     ("request", JsonKind::Object) => serde_json::json!({"path":if variant.tag == "vfs_open_at" { "file.bin" } else { "/workspace/file.bin" },"kind":"file","rights":["read","stat"],"allow_missing":false}),
                     ("registration", JsonKind::Object) => serde_json::json!({
                         "node_id": "00000000-0000-0000-0000-000000000004",
@@ -997,6 +1027,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "vfs_mounts",
+        fields: &[Field::required("view", O)],
+    },
+    Variant {
+        tag: "vfs_namespace_mounts",
         fields: &[Field::required("view", O)],
     },
     Variant {
@@ -1613,8 +1647,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 73);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 104);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 77);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 108);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

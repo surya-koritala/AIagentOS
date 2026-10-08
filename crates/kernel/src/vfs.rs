@@ -1,8 +1,9 @@
-//! Agent-owned, ephemeral handles to the live governed tool mount.
+//! Agent-owned, ephemeral handles to governed tool and workspace mounts.
 //!
 //! Handles identify one registration, never grant authorization, and are not
 //! inherited, persisted, or reopened after a kernel restart.
 
+pub mod mounts;
 pub mod workspace;
 
 use crate::{AgentId, AgentKernelImpl};
@@ -35,7 +36,7 @@ pub struct VfsMountView {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VfsError {
-    #[error("invalid VFS path; expected canonical /tools/<name>")]
+    #[error("invalid VFS path")]
     InvalidPath,
     #[error("VFS object not found")]
     NotFound,
@@ -43,6 +44,8 @@ pub enum VfsError {
     Capacity,
     #[error("VFS unavailable")]
     Unavailable,
+    #[error("VFS mount conflict; refresh the namespace table before retrying")]
+    MountConflict,
 }
 
 pub(crate) struct ToolHandleLease {
@@ -52,11 +55,12 @@ pub(crate) struct ToolHandleLease {
     pub is_workspace: bool,
     workspace: Mutex<Option<workspace::WorkspaceCapability>>,
     workspace_bindings: Mutex<HashMap<String, Uuid>>,
+    mount: mounts::MountBinding,
 }
 
 impl ToolHandleLease {
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.closed.load(Ordering::SeqCst) || !self.mount.entry.is_active()
     }
     pub(crate) fn workspace(&self) -> Result<workspace::WorkspaceCapability, VfsError> {
         if self.is_closed() || !self.is_workspace {
@@ -107,7 +111,8 @@ impl WorkspaceReservation<'_> {
         {
             return Err(VfsError::NotFound);
         }
-        let handle = scope.handle();
+        let mut handle = scope.handle();
+        handle.path = self.lease.mount.entry.workspace_path(&handle.path);
         *self
             .lease
             .workspace
@@ -134,6 +139,7 @@ impl Drop for WorkspaceReservation<'_> {
 #[derive(Default)]
 pub struct ToolVfs {
     handles: Mutex<HashMap<AgentId, HashMap<Uuid, Arc<ToolHandleLease>>>>,
+    mounts: mounts::MountRegistry,
 }
 
 pub fn tool_name(path: &str) -> Result<&str, VfsError> {
@@ -151,9 +157,19 @@ pub fn tool_name(path: &str) -> Result<&str, VfsError> {
 }
 
 impl ToolVfs {
-    fn open(&self, agent: AgentId, path: &str, binding_id: Uuid) -> Result<VfsHandle, VfsError> {
-        let name = tool_name(path)?.to_string();
+    fn open_mounted(
+        &self,
+        agent: AgentId,
+        path: &str,
+        binding_id: Uuid,
+        mount: mounts::MountBinding,
+    ) -> Result<VfsHandle, VfsError> {
+        let canonical = format!("/tools/{}", mount.entry.relative(path)?);
+        let name = tool_name(&canonical)?.to_string();
         let mut handles = self.handles.lock().map_err(|_| VfsError::Unavailable)?;
+        if !mount.entry.is_active() {
+            return Err(VfsError::NotFound);
+        }
         if handles.values().map(HashMap::len).sum::<usize>() >= MAX_HANDLES_TOTAL
             || handles
                 .get(&agent)
@@ -171,6 +187,7 @@ impl ToolVfs {
                 is_workspace: false,
                 workspace: Mutex::new(None),
                 workspace_bindings: Mutex::new(HashMap::new()),
+                mount,
             }),
         );
         Ok(VfsHandle {
@@ -179,8 +196,15 @@ impl ToolVfs {
         })
     }
 
-    fn reserve_workspace(&self, agent: AgentId) -> Result<WorkspaceReservation<'_>, VfsError> {
+    fn reserve_workspace(
+        &self,
+        agent: AgentId,
+        mount: mounts::MountBinding,
+    ) -> Result<WorkspaceReservation<'_>, VfsError> {
         let mut handles = self.handles.lock().map_err(|_| VfsError::Unavailable)?;
+        if !mount.entry.is_active() {
+            return Err(VfsError::NotFound);
+        }
         if handles.values().map(HashMap::len).sum::<usize>() >= MAX_HANDLES_TOTAL
             || handles
                 .get(&agent)
@@ -196,6 +220,7 @@ impl ToolVfs {
             is_workspace: true,
             workspace: Mutex::new(None),
             workspace_bindings: Mutex::new(HashMap::new()),
+            mount,
         });
         handles.entry(agent).or_default().insert(id, lease.clone());
         Ok(WorkspaceReservation {
@@ -246,6 +271,39 @@ impl ToolVfs {
         }
     }
 
+    fn revoke_mount(&self, entry: &mounts::MountEntry) -> Result<(), VfsError> {
+        let mut handles = self.handles.lock().map_err(|_| VfsError::Unavailable)?;
+        handles.retain(|_, owned| {
+            owned.retain(|_, lease| {
+                let keep = lease.mount.entry.info.id != entry.info.id;
+                if !keep {
+                    lease.closed.store(true, Ordering::SeqCst);
+                }
+                keep
+            });
+            !owned.is_empty()
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn open(&self, agent: AgentId, path: &str, binding_id: Uuid) -> Result<VfsHandle, VfsError> {
+        let key = mounts::NamespaceKey {
+            tenant: "test".into(),
+            namespace: 0,
+        };
+        let entry = self.mounts.resolve(&key, path, mounts::MountKind::Tools)?;
+        self.open_mounted(
+            agent,
+            path,
+            binding_id,
+            mounts::MountBinding {
+                entry,
+                namespace_revision: 0,
+            },
+        )
+    }
+
     fn count(&self, agent: AgentId) -> Result<usize, VfsError> {
         let handles = self.handles.lock().map_err(|_| VfsError::Unavailable)?;
         Ok(handles.get(&agent).map_or(0, HashMap::len))
@@ -253,6 +311,103 @@ impl ToolVfs {
 }
 
 impl AgentKernelImpl {
+    fn vfs_namespace_key(&self, agent: AgentId) -> Result<(mounts::NamespaceKey, u64), VfsError> {
+        let (pid, memberships, revision) = self
+            .syscall_gate
+            .namespace_membership(agent)
+            .ok_or(VfsError::NotFound)?;
+        let mut namespaces = memberships.into_iter().filter(|id| {
+            self.os.namespaces.get(*id).is_some_and(|namespace| {
+                namespace.ns_type == crate::namespaces::NamespaceType::Mount
+                    && namespace.members.contains(&pid)
+            })
+        });
+        let namespace = namespaces.next().ok_or(VfsError::NotFound)?;
+        if namespaces.next().is_some() {
+            return Err(VfsError::NotFound);
+        }
+        let tenant = self
+            .context_manager
+            .agent_tenant(agent)
+            .map_err(|_| VfsError::Unavailable)?
+            .ok_or(VfsError::NotFound)?;
+        Ok((mounts::NamespaceKey { tenant, namespace }, revision))
+    }
+
+    fn vfs_resolve_mount(
+        &self,
+        agent: AgentId,
+        path: &str,
+        kind: mounts::MountKind,
+    ) -> Result<mounts::MountBinding, VfsError> {
+        let (key, namespace_revision) = self.vfs_namespace_key(agent)?;
+        let entry = self.tool_vfs.mounts.resolve(&key, path, kind)?;
+        Ok(mounts::MountBinding {
+            entry,
+            namespace_revision,
+        })
+    }
+
+    pub(crate) fn vfs_lease_live(&self, agent: AgentId, lease: &ToolHandleLease) -> bool {
+        !lease.is_closed()
+            && self.vfs_namespace_key(agent).is_ok_and(|(key, revision)| {
+                key == lease.mount.entry.key && revision == lease.mount.namespace_revision
+            })
+    }
+
+    pub(crate) fn vfs_acquire(
+        &self,
+        agent: AgentId,
+        handle: &str,
+    ) -> Result<Arc<ToolHandleLease>, VfsError> {
+        let lease = self.tool_vfs.acquire(agent, handle)?;
+        if !self.vfs_lease_live(agent, &lease) {
+            return Err(VfsError::NotFound);
+        }
+        Ok(lease)
+    }
+
+    pub fn vfs_namespace_mounts(
+        &self,
+        agent: AgentId,
+    ) -> Result<mounts::NamespaceMountView, VfsError> {
+        let (key, _) = self.vfs_namespace_key(agent)?;
+        self.tool_vfs.mounts.view(&key)
+    }
+
+    /// Trusted kernel/operator API; tenant wire callers additionally require Admin.
+    pub fn vfs_mount(
+        &self,
+        agent: AgentId,
+        expected_table_id: &str,
+        expected_generation: u64,
+        path: &str,
+        kind: mounts::MountKind,
+    ) -> Result<mounts::NamespaceMountView, VfsError> {
+        let (key, _) = self.vfs_namespace_key(agent)?;
+        self.tool_vfs
+            .mounts
+            .mount(&key, expected_table_id, expected_generation, path, kind)
+    }
+
+    /// Stops new admission and reclaims every descriptor bound to this exact mount.
+    pub fn vfs_unmount(
+        &self,
+        agent: AgentId,
+        expected_table_id: &str,
+        expected_generation: u64,
+        path: &str,
+        id: &str,
+    ) -> Result<mounts::NamespaceMountView, VfsError> {
+        let (key, _) = self.vfs_namespace_key(agent)?;
+        let (view, entry) =
+            self.tool_vfs
+                .mounts
+                .unmount(&key, expected_table_id, expected_generation, path, id)?;
+        self.tool_vfs.revoke_mount(&entry)?;
+        Ok(view)
+    }
+
     pub fn vfs_workspace_mounts(&self, agent: AgentId) -> Result<VfsMountView, VfsError> {
         use crate::sandbox::SandboxManager;
         if self.syscall_gate.pid_of(agent).is_none()
@@ -260,6 +415,7 @@ impl AgentKernelImpl {
         {
             return Err(VfsError::NotFound);
         }
+        self.vfs_resolve_mount(agent, "/workspace", mounts::MountKind::Workspace)?;
         Ok(VfsMountView {
             mount: "/workspace".into(),
             entries: vec!["/workspace".into()],
@@ -282,7 +438,7 @@ impl AgentKernelImpl {
         parent: &str,
         request: workspace::WorkspaceOpenRequest,
     ) -> Result<workspace::WorkspaceHandle, workspace::WorkspaceError> {
-        let lease = self.tool_vfs.acquire(agent, parent)?;
+        let lease = self.vfs_acquire(agent, parent)?;
         let scope = lease.workspace()?;
         self.open_workspace_entry(agent, request, Some((lease, scope)))
             .await
@@ -298,10 +454,24 @@ impl AgentKernelImpl {
         use workspace::{WorkspaceError, WorkspaceOpenOptions, WorkspaceRequest, WorkspaceRight};
         let rights = workspace::validated_rights(&request.rights, request.kind)
             .map_err(|error| WorkspaceError::Invalid(error.to_string()))?;
+        let mount = if let Some((lease, _)) = &parent {
+            if !self.vfs_lease_live(agent, lease) {
+                return Err(VfsError::NotFound.into());
+            }
+            lease.mount.clone()
+        } else {
+            self.vfs_resolve_mount(agent, &request.path, mounts::MountKind::Workspace)?
+        };
         let relative = if parent.is_some() {
             workspace::canonical_relative(&request.path, false)
         } else {
-            workspace::workspace_path(&request.path)
+            let suffix = mount.entry.relative(&request.path)?;
+            let canonical = if suffix.is_empty() {
+                "/workspace".to_string()
+            } else {
+                format!("/workspace/{suffix}")
+            };
+            workspace::workspace_path(&canonical)
         }
         .map_err(|error| WorkspaceError::Invalid(error.to_string()))?;
         let lock = self.lifecycle_lock(agent);
@@ -314,7 +484,7 @@ impl AgentKernelImpl {
                 .sandbox_manager
                 .get_sandbox_for_agent(agent)
                 .ok_or(VfsError::NotFound)?;
-            (self.tool_vfs.reserve_workspace(agent)?, sandbox)
+            (self.tool_vfs.reserve_workspace(agent, mount)?, sandbox)
         };
         let context = WorkspaceRequest::open(WorkspaceOpenOptions {
             identity: reservation.id,
@@ -359,8 +529,10 @@ impl AgentKernelImpl {
             )
             .await
             .map_err(WorkspaceError::Tool)?;
-        if reservation.lease.is_closed()
-            || parent.as_ref().is_some_and(|(lease, _)| lease.is_closed())
+        if !self.vfs_lease_live(agent, &reservation.lease)
+            || parent
+                .as_ref()
+                .is_some_and(|(lease, _)| !self.vfs_lease_live(agent, lease))
         {
             return Err(VfsError::NotFound.into());
         }
@@ -381,7 +553,10 @@ impl AgentKernelImpl {
         let _lifecycle = lock.lock().await;
         if self.syscall_gate.pid_of(agent).is_none()
             || self.sandbox_manager.get_sandbox_for_agent(agent) != Some(sandbox)
-            || parent.as_ref().is_some_and(|(lease, _)| lease.is_closed())
+            || !self.vfs_lease_live(agent, &reservation.lease)
+            || parent
+                .as_ref()
+                .is_some_and(|(lease, _)| !self.vfs_lease_live(agent, lease))
         {
             return Err(VfsError::NotFound.into());
         }
@@ -406,14 +581,16 @@ impl AgentKernelImpl {
         use crate::sandbox::SandboxManager;
         let lock = self.lifecycle_lock(agent);
         let _lifecycle = lock.lock().await;
-        let lease = self.tool_vfs.acquire(agent, handle)?;
+        let lease = self.vfs_acquire(agent, handle)?;
         let original = lease.workspace()?;
         if self.syscall_gate.pid_of(agent).is_none()
             || self.sandbox_manager.get_sandbox_for_agent(agent) != Some(original.sandbox())
         {
             return Err(VfsError::NotFound.into());
         }
-        let reservation = self.tool_vfs.reserve_workspace(agent)?;
+        let reservation = self
+            .tool_vfs
+            .reserve_workspace(agent, lease.mount.clone())?;
         let scope = original
             .attenuate(reservation.id, &rights)
             .map_err(|_| workspace::WorkspaceError::PermissionDenied)?;
@@ -422,7 +599,7 @@ impl AgentKernelImpl {
             .lock()
             .map_err(|_| VfsError::Unavailable)?
             .clone();
-        if lease.is_closed() {
+        if !self.vfs_lease_live(agent, &lease) {
             return Err(VfsError::NotFound.into());
         }
         reservation
@@ -439,7 +616,7 @@ impl AgentKernelImpl {
     ) -> Result<serde_json::Value, workspace::WorkspaceError> {
         use crate::sandbox::SandboxManager;
         use workspace::{WorkspaceError, WorkspaceRequest};
-        let lease = self.tool_vfs.acquire(agent, handle)?;
+        let lease = self.vfs_acquire(agent, handle)?;
         let scope = lease.workspace()?;
         scope
             .require(right)
@@ -479,7 +656,7 @@ impl AgentKernelImpl {
             )
             .await
             .map_err(WorkspaceError::Tool)?;
-        if lease.is_closed()
+        if !self.vfs_lease_live(agent, &lease)
             || self
                 .tool_registry
                 .workspace_binding_id(&self.syscall_gate, agent, name, operation)
@@ -576,32 +753,50 @@ impl AgentKernelImpl {
     }
 
     pub async fn vfs_open(&self, agent: AgentId, path: &str) -> Result<VfsHandle, VfsError> {
-        let name = tool_name(path)?;
         let lock = self.lifecycle_lock(agent);
         let _lifecycle = lock.lock().await;
+        let mount = self.vfs_resolve_mount(agent, path, mounts::MountKind::Tools)?;
+        let canonical = format!("/tools/{}", mount.entry.relative(path)?);
+        let name = tool_name(&canonical)?;
         let binding_id = self
             .tool_registry
             .binding_id_for_agent(&self.syscall_gate, agent, name)
             .ok_or(VfsError::NotFound)?;
-        self.tool_vfs.open(agent, path, binding_id)
+        self.tool_vfs.open_mounted(agent, path, binding_id, mount)
     }
 
     pub fn vfs_mounts(&self, agent: AgentId) -> Result<VfsMountView, VfsError> {
-        if self.syscall_gate.pid_of(agent).is_none() {
-            return Err(VfsError::NotFound);
-        }
-        let mut entries = self
-            .tool_registry
-            .definitions_for_agent(&self.syscall_gate, agent)
-            .into_iter()
-            .map(|tool| format!("/tools/{}", tool.name))
-            .filter(|path| tool_name(path).is_ok())
-            .collect::<Vec<_>>();
+        self.vfs_mount_entries(agent, "/tools")
+    }
+
+    pub fn vfs_mount_entries(&self, agent: AgentId, path: &str) -> Result<VfsMountView, VfsError> {
+        use crate::sandbox::SandboxManager;
+        let view = self.vfs_namespace_mounts(agent)?;
+        let entry = view
+            .mounts
+            .iter()
+            .find(|entry| entry.path == path)
+            .ok_or(VfsError::NotFound)?;
+        let mut entries = match entry.kind {
+            mounts::MountKind::Tools => self
+                .tool_registry
+                .definitions_for_agent(&self.syscall_gate, agent)
+                .into_iter()
+                .filter(|tool| tool_name(&format!("/tools/{}", tool.name)).is_ok())
+                .map(|tool| format!("{path}/{}", tool.name))
+                .collect::<Vec<_>>(),
+            mounts::MountKind::Workspace => {
+                if self.sandbox_manager.get_sandbox_for_agent(agent).is_none() {
+                    return Err(VfsError::NotFound);
+                }
+                vec![path.into()]
+            }
+        };
         entries.sort();
         let truncated = entries.len() > MAX_MOUNT_ENTRIES;
         entries.truncate(MAX_MOUNT_ENTRIES);
         Ok(VfsMountView {
-            mount: "/tools".into(),
+            mount: path.into(),
             entries,
             truncated,
             open_handles: self.tool_vfs.count(agent)?,

@@ -364,6 +364,30 @@ pub enum Syscall {
     VfsWorkspaceMounts {
         agent_id: String,
     },
+    /// Inspect the target agent's live mount namespace.
+    VfsNamespaceMounts {
+        agent_id: String,
+    },
+    VfsMountEntries {
+        agent_id: String,
+        path: String,
+    },
+    /// Tenant Admin or trusted operator; mounts only a built-in governed backend.
+    VfsMount {
+        agent_id: String,
+        expected_table_id: String,
+        expected_generation: u64,
+        path: String,
+        kind: crate::vfs::mounts::MountKind,
+    },
+    /// Revoke the exact mount identity, rejecting stale administrative writes.
+    VfsUnmount {
+        agent_id: String,
+        expected_table_id: String,
+        expected_generation: u64,
+        path: String,
+        mount_id: String,
+    },
     VfsOpenWorkspace {
         agent_id: String,
         request: crate::vfs::workspace::WorkspaceOpenRequest,
@@ -1234,6 +1258,9 @@ pub enum SyscallReply {
         handle: crate::vfs::VfsHandle,
     },
     VfsClosed,
+    VfsNamespaceMounts {
+        view: crate::vfs::mounts::NamespaceMountView,
+    },
     WorkspaceOpened {
         handle: crate::vfs::workspace::WorkspaceHandle,
     },
@@ -1651,6 +1678,16 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
             (AccessLevel::User, "agent.call_tool", Some(agent_id))
         }
         Syscall::VfsClose { agent_id, .. } => (AccessLevel::User, "vfs.close", Some(agent_id)),
+        Syscall::VfsNamespaceMounts { agent_id } => (
+            AccessLevel::ReadOnly,
+            "vfs.namespace.mounts",
+            Some(agent_id),
+        ),
+        Syscall::VfsMountEntries { agent_id, .. } => {
+            (AccessLevel::ReadOnly, "vfs.mount.entries", Some(agent_id))
+        }
+        Syscall::VfsMount { agent_id, .. } => (AccessLevel::Admin, "vfs.mount", Some(agent_id)),
+        Syscall::VfsUnmount { agent_id, .. } => (AccessLevel::Admin, "vfs.unmount", Some(agent_id)),
         Syscall::VfsWorkspaceMounts { agent_id } => (
             AccessLevel::ReadOnly,
             "vfs.workspace.mounts",
@@ -2028,6 +2065,7 @@ fn starts_new_work(call: &Syscall) -> bool {
             | Syscall::VfsWriteWorkspace { .. }
             | Syscall::VfsListWorkspace { .. }
             | Syscall::VfsStatWorkspace { .. }
+            | Syscall::VfsMount { .. }
             | Syscall::RunInstalledPackage { .. }
     )
 }
@@ -2054,6 +2092,8 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
         | Syscall::VfsWriteWorkspace { agent_id, .. }
         | Syscall::VfsListWorkspace { agent_id, .. }
         | Syscall::VfsStatWorkspace { agent_id, .. }
+        | Syscall::VfsMount { agent_id, .. }
+        | Syscall::VfsUnmount { agent_id, .. }
         | Syscall::MemoryStore { agent_id, .. }
         | Syscall::MemoryUpdate { agent_id, .. }
         | Syscall::MemoryDelete { agent_id, .. }
@@ -2189,6 +2229,7 @@ fn vfs_error(error: crate::vfs::VfsError) -> SyscallReply {
         crate::vfs::VfsError::NotFound => WireErrorCode::NotFound,
         crate::vfs::VfsError::Capacity => WireErrorCode::QuotaExceeded,
         crate::vfs::VfsError::Unavailable => WireErrorCode::Unavailable,
+        crate::vfs::VfsError::MountConflict => WireErrorCode::Conflict,
     };
     SyscallReply::TypedError {
         code,
@@ -2212,7 +2253,10 @@ async fn dispatch_tool_call(
             }
         }
     };
-    if lease.as_ref().is_some_and(|lease| lease.is_closed()) {
+    if lease
+        .as_ref()
+        .is_some_and(|lease| !kernel.vfs_lease_live(id, lease))
+    {
         return vfs_error(crate::vfs::VfsError::NotFound);
     }
     // Security preparation is shared with executor/MCP/SDK so action,
@@ -2247,7 +2291,7 @@ async fn dispatch_tool_call(
     };
 
     if lease.as_ref().is_some_and(|lease| {
-        lease.is_closed()
+        !kernel.vfs_lease_live(id, lease)
             || kernel
                 .tool_registry
                 .binding_id_for_agent(&kernel.syscall_gate, id, tool)
@@ -2959,13 +3003,61 @@ async fn dispatch_scoped_inner_with_fence(
             },
             Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
         },
+        Syscall::VfsNamespaceMounts { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_namespace_mounts(id) {
+                Ok(view) => SyscallReply::VfsNamespaceMounts { view },
+                Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsMountEntries { agent_id, path } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_mount_entries(id, &path) {
+                Ok(view) => SyscallReply::VfsMounts { view },
+                Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsMount {
+            agent_id,
+            expected_table_id,
+            expected_generation,
+            path,
+            kind,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => {
+                match kernel.vfs_mount(id, &expected_table_id, expected_generation, &path, kind) {
+                    Ok(view) => SyscallReply::VfsNamespaceMounts { view },
+                    Err(error) => vfs_error(error),
+                }
+            }
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsUnmount {
+            agent_id,
+            expected_table_id,
+            expected_generation,
+            path,
+            mount_id,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_unmount(
+                id,
+                &expected_table_id,
+                expected_generation,
+                &path,
+                &mount_id,
+            ) {
+                Ok(view) => SyscallReply::VfsNamespaceMounts { view },
+                Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
         Syscall::VfsInvoke {
             agent_id,
             handle,
             args,
         } => {
             let lease = match uuid::Uuid::parse_str(&agent_id) {
-                Ok(id) => kernel.tool_vfs.acquire(id, &handle),
+                Ok(id) => kernel.vfs_acquire(id, &handle),
                 Err(_) => Err(crate::vfs::VfsError::NotFound),
             };
             match lease {
@@ -9497,6 +9589,27 @@ memory = ["remember this"]
             Syscall::VfsWorkspaceMounts {
                 agent_id: id.clone(),
             },
+            Syscall::VfsNamespaceMounts {
+                agent_id: id.clone(),
+            },
+            Syscall::VfsMountEntries {
+                agent_id: id.clone(),
+                path: "/tools".into(),
+            },
+            Syscall::VfsMount {
+                agent_id: id.clone(),
+                expected_table_id: "fixture-mount-table".into(),
+                expected_generation: 2,
+                path: "/alias".into(),
+                kind: crate::vfs::mounts::MountKind::Tools,
+            },
+            Syscall::VfsUnmount {
+                agent_id: id.clone(),
+                expected_table_id: "fixture-mount-table".into(),
+                expected_generation: 2,
+                path: "/tools".into(),
+                mount_id: uuid::Uuid::new_v4().to_string(),
+            },
             Syscall::VfsOpenWorkspace {
                 agent_id: id.clone(),
                 request: crate::vfs::workspace::WorkspaceOpenRequest {
@@ -10085,7 +10198,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 104);
+        assert_eq!(calls.len(), 108);
         assert_eq!(fixture_tags, schema_tags);
     }
 

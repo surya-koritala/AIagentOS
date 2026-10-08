@@ -23,10 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_OUTPUT = 16 * 1024
 
 
-def command(argv: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def command(argv: list[str], *, cwd: Path | None = None, timeout: int = 15) -> subprocess.CompletedProcess:
     result = subprocess.run(
         argv, cwd=cwd, env={}, stdin=subprocess.DEVNULL,
-        capture_output=True, timeout=15, check=False,
+        capture_output=True, timeout=timeout, check=False,
     )
     if len(result.stdout) > MAX_OUTPUT or len(result.stderr) > MAX_OUTPUT:
         raise ValueError("probe output exceeded its bound")
@@ -66,6 +66,7 @@ def run(output: Path) -> None:
         "backend_enabled": False,
         "production_claim_allowed": False,
         "native_process_contract_qualified": False,
+        "process_deadlines_seconds": {"fixture_compilation": 120, "observation": 15},
         "fixture_parent_scope": "globally_traversable_disposable_tmp",
         "observations": {},
     }
@@ -95,10 +96,12 @@ def run(output: Path) -> None:
             "CFBundleVersion": "1",
             "LSBackgroundOnly": True,
         }))
+        # Cold SDK/compiler startup is preparation, separate from an agent's
+        # observation deadline. Every sandbox observation retains the 15s cap.
         built = command([
             "/usr/bin/clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
             str(ROOT / "scripts/fixtures/macos_app_sandbox_probe.c"), "-o", str(binary),
-        ])
+        ], timeout=120)
         if built.returncode:
             raise ValueError("probe compilation failed")
         report["unsigned_fixture_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()

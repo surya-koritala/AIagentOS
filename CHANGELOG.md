@@ -10,6 +10,23 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added bounded system-operator model catalogs through the wire API, SDK and
+  `agentctl`, with explicit unsupported providers and redacted diagnostics.
+  Added tenant-scoped per-agent gate statistics while preserving the existing
+  global `gate-stats` response. Relates #361 and #339.
+- Required CLI, container and supply-chain release assets can be assembled
+  independently of optional desktop qualification. Signed desktop updater
+  metadata still requires the complete eligible installer set. Relates #340;
+  actual stable publication and desktop qualification remain pending.
+- Coalesced each bounded JSON body and newline into one transport write,
+  preserving framing limits and socket options. Added controlled paired
+  loopback measurements and real SDK regressions on all three host OSes.
+- Expanded public-wire VFS acceptance with actual child-process termination
+  after stage sync and rename, plus delayed memory writes across provider
+  deadlines and client disconnects. Fixtures assert fresh authorized recovery,
+  capacity reclamation and no late durable fact publication. Physical
+  power-loss and independent production qualification remain open under #392.
+
 - Wired terminal `/learn` and `/unlearn` to bounded private correction storage
   with operator provenance, atomic persistence, visible errors, restart, and
   explicitly scoped executor injection. `/plan` generates bounded parsed

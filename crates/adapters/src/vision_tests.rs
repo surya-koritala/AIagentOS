@@ -181,31 +181,43 @@ async fn image_input_unknown_profile_unsupported_modes_and_audio_send_zero_reque
             message(),
             StandardMessage::user_content(MessageContent::parts(vec![ContentPart::Audio]).unwrap()),
         ] {
-            assert!(matches!(
-                session.send(vec![message.clone()]).await,
-                Err(ConnectorError::UnsupportedContent(_))
-            ), "{} must refuse unsupported content before send I/O", adapter.id());
-            assert!(matches!(
-                session
-                    .send_streaming_with_options(
-                        vec![message.clone()],
-                        &[],
-                        LlmRequestOptions::default()
-                    )
-                    .await,
-                Err(ConnectorError::UnsupportedContent(_))
-            ), "{} must refuse unsupported content before stream I/O", adapter.id());
-            assert!(matches!(
-                session
-                    .send_streaming_controlled(
-                        vec![message],
-                        &[],
-                        LlmRequestOptions::default(),
-                        &tokio_util::sync::CancellationToken::new()
-                    )
-                    .await,
-                Err(ConnectorError::UnsupportedContent(_))
-            ), "{} must refuse unsupported content before controlled stream I/O", adapter.id());
+            assert!(
+                matches!(
+                    session.send(vec![message.clone()]).await,
+                    Err(ConnectorError::UnsupportedContent(_))
+                ),
+                "{} must refuse unsupported content before send I/O",
+                adapter.id()
+            );
+            assert!(
+                matches!(
+                    session
+                        .send_streaming_with_options(
+                            vec![message.clone()],
+                            &[],
+                            LlmRequestOptions::default()
+                        )
+                        .await,
+                    Err(ConnectorError::UnsupportedContent(_))
+                ),
+                "{} must refuse unsupported content before stream I/O",
+                adapter.id()
+            );
+            assert!(
+                matches!(
+                    session
+                        .send_streaming_controlled(
+                            vec![message],
+                            &[],
+                            LlmRequestOptions::default(),
+                            &tokio_util::sync::CancellationToken::new()
+                        )
+                        .await,
+                    Err(ConnectorError::UnsupportedContent(_))
+                ),
+                "{} must refuse unsupported content before controlled stream I/O",
+                adapter.id()
+            );
         }
     }
     assert!(server.received_requests().await.unwrap().is_empty());

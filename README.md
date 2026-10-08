@@ -61,7 +61,7 @@ requires a shared governance layer.
 
 AI Agent OS provides:
 
-- **Process management** — create, clone, signal, kill agents (like fork/exec/kill)
+- **Process management** — create, pause/resume, checkpoint, stop, and kill agents
 - **Fair scheduling** — cooperative, CFS-inspired weighted turn admission
 - **Context management** — per-agent/tenant/kernel active and durable bounds, verified spill references, explicit backpressure
 - **Logical isolation** — tenant ownership, namespaces, cgroup-style quotas, and sandbox identities

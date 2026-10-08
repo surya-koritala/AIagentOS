@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use cap_primitives::fs::FollowSymlinks;
 use cap_std::ambient_authority;
@@ -17,8 +17,8 @@ use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
 use crate::vfs::workspace::{
-    WorkspaceBinding, WorkspaceCapability, WorkspaceExecution, WorkspaceKind, WorkspaceRequest,
-    WorkspaceRight, WorkspaceStat, MAX_WORKSPACE_TRANSFER_BYTES,
+    WorkspaceBinding, WorkspaceCapability, WorkspaceDirectory, WorkspaceExecution, WorkspaceKind,
+    WorkspaceRequest, WorkspaceRight, WorkspaceStat, MAX_WORKSPACE_TRANSFER_BYTES,
 };
 use crate::{AgentId, IsolationLevel, SandboxConfig, SandboxError, SandboxId};
 
@@ -171,6 +171,7 @@ struct SandboxState {
     isolation_level: IsolationLevel,
     managed_workspace: bool,
     workspace: Arc<Mutex<Option<Dir>>>,
+    workspace_directories: Arc<Mutex<Vec<Weak<WorkspaceDirectory>>>>,
     max_disk_usage_bytes: Option<u64>,
     max_memory_bytes: Option<u64>,
     container_image: Option<String>,
@@ -537,6 +538,7 @@ impl SandboxManagerImpl {
             isolation_level: config.isolation_level.clone(),
             managed_workspace,
             workspace: Arc::new(Mutex::new(workspace)),
+            workspace_directories: Arc::new(Mutex::new(Vec::new())),
             max_disk_usage_bytes: config.max_disk_usage_bytes,
             max_memory_bytes: config.max_memory_bytes,
             container_image: config.container_image.clone(),
@@ -1118,7 +1120,7 @@ impl SandboxManagerImpl {
         }
         let current = Self::open_directory_nofollow(root, capability.directory_path())?;
         if crate::vfs::workspace::directory_identity(&current)?
-            != crate::vfs::workspace::directory_identity(capability.directory())?
+            != capability.with_directory(crate::vfs::workspace::directory_identity)?
         {
             return Err(SandboxError::BoundaryViolation(
                 "workspace directory binding revoked".into(),
@@ -1159,15 +1161,10 @@ impl SandboxManagerImpl {
     ) -> Result<WorkspaceExecution, SandboxError> {
         context.validate_open()?;
         let WorkspaceRequest::Open {
-            identity,
             owner,
             sandbox,
-            path,
-            relative,
             parent,
-            kind,
-            rights,
-            allow_missing,
+            ..
         } = context
         else {
             return Err(SandboxError::BoundaryViolation(
@@ -1179,11 +1176,37 @@ impl SandboxManagerImpl {
                 "workspace capability owner denied".into(),
             ));
         }
-        let base = if let Some(parent) = parent {
+        if let Some(parent) = parent {
             Self::validate_workspace_capability(state, root, parent)?;
-            parent.directory()
-        } else {
-            root
+            return parent.with_directory(|base| {
+                Self::open_workspace_from_base(state, root, base, context, cancellation)
+            });
+        }
+        Self::open_workspace_from_base(state, root, root, context, cancellation)
+    }
+
+    fn open_workspace_from_base(
+        state: &SandboxState,
+        root: &Dir,
+        base: &Dir,
+        context: &WorkspaceRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkspaceExecution, SandboxError> {
+        let WorkspaceRequest::Open {
+            identity,
+            owner,
+            sandbox,
+            path,
+            relative,
+            kind,
+            rights,
+            allow_missing,
+            ..
+        } = context
+        else {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace open context required".into(),
+            ));
         };
         Self::filesystem_checkpoint(Some(cancellation))?;
         let relative = Path::new(relative);
@@ -1247,6 +1270,11 @@ impl SandboxManagerImpl {
         );
         Self::validate_workspace_capability(state, root, &scope)?;
         Self::filesystem_checkpoint(Some(cancellation))?;
+        let mut references = state.workspace_directories.lock().map_err(|_| {
+            SandboxError::BoundaryViolation("workspace references unavailable".into())
+        })?;
+        references.retain(|reference| reference.strong_count() != 0);
+        references.push(scope.directory_reference());
         Ok(WorkspaceExecution {
             data: metadata,
             opened: Some(scope),
@@ -1400,55 +1428,53 @@ impl SandboxManagerImpl {
             unreachable!()
         };
         Self::validate_workspace_capability(state, root, capability)?;
-        let data = match operation {
-            "read_bytes" if capability.kind() == WorkspaceKind::File => {
-                capability.require(WorkspaceRight::Read)?;
-                Self::read_workspace_chunk(
-                    capability.directory(),
-                    capability.entry(),
-                    parameters,
-                    cancellation,
-                )?
-            }
-            "write_bytes" if capability.kind() == WorkspaceKind::File => {
-                capability.require(WorkspaceRight::Write)?;
-                let bytes = Self::workspace_write_bytes(parameters)?;
-                Self::atomic_write_bytes(
-                    state,
-                    root,
-                    capability.directory(),
-                    capability.entry(),
-                    &bytes,
-                    Some(cancellation),
-                )?;
-                serde_json::json!({"written_bytes":bytes.len()})
-            }
-            "list" if capability.kind() == WorkspaceKind::Directory => {
-                capability.require(WorkspaceRight::List)?;
-                Self::list_directory(
-                    capability.directory(),
-                    capability.entry(),
-                    Some(cancellation),
-                )?
-            }
-            "stat" => {
-                capability.require(WorkspaceRight::Stat)?;
-                let metadata = Self::filesystem_stat(capability.directory(), capability.entry())?;
-                if metadata.kind != capability.kind() {
-                    return Err(SandboxError::BoundaryViolation(
-                        "workspace object kind changed".into(),
-                    ));
+        let data = capability.with_directory(|directory| {
+            Ok(match operation {
+                "read_bytes" if capability.kind() == WorkspaceKind::File => {
+                    capability.require(WorkspaceRight::Read)?;
+                    Self::read_workspace_chunk(
+                        directory,
+                        capability.entry(),
+                        parameters,
+                        cancellation,
+                    )?
                 }
-                serde_json::to_value(metadata).map_err(|_| {
-                    SandboxError::BoundaryViolation("workspace metadata unavailable".into())
-                })?
-            }
-            _ => {
-                return Err(SandboxError::BoundaryViolation(
-                    "workspace operation or object kind denied".into(),
-                ))
-            }
-        };
+                "write_bytes" if capability.kind() == WorkspaceKind::File => {
+                    capability.require(WorkspaceRight::Write)?;
+                    let bytes = Self::workspace_write_bytes(parameters)?;
+                    Self::atomic_write_bytes(
+                        state,
+                        root,
+                        directory,
+                        capability.entry(),
+                        &bytes,
+                        Some(cancellation),
+                    )?;
+                    serde_json::json!({"written_bytes":bytes.len()})
+                }
+                "list" if capability.kind() == WorkspaceKind::Directory => {
+                    capability.require(WorkspaceRight::List)?;
+                    Self::list_directory(directory, capability.entry(), Some(cancellation))?
+                }
+                "stat" => {
+                    capability.require(WorkspaceRight::Stat)?;
+                    let metadata = Self::filesystem_stat(directory, capability.entry())?;
+                    if metadata.kind != capability.kind() {
+                        return Err(SandboxError::BoundaryViolation(
+                            "workspace object kind changed".into(),
+                        ));
+                    }
+                    serde_json::to_value(metadata).map_err(|_| {
+                        SandboxError::BoundaryViolation("workspace metadata unavailable".into())
+                    })?
+                }
+                _ => {
+                    return Err(SandboxError::BoundaryViolation(
+                        "workspace operation or object kind denied".into(),
+                    ))
+                }
+            })
+        })?;
         Self::filesystem_checkpoint(Some(cancellation))?;
         Ok(WorkspaceExecution { data, opened: None })
     }
@@ -1998,6 +2024,19 @@ impl SandboxManager for SandboxManagerImpl {
         let _operation = state.operation_lock.lock().map_err(|_| {
             SandboxError::DestructionFailed("sandbox filesystem unavailable".into())
         })?;
+        // Contexts awaiting broker admission or lifecycle publication may still
+        // own capability clones. Close their native references while actual I/O
+        // is quiescent so they cannot pin a managed directory after teardown.
+        let mut references = state.workspace_directories.lock().map_err(|_| {
+            SandboxError::DestructionFailed("workspace references unavailable".into())
+        })?;
+        for reference in references
+            .drain(..)
+            .filter_map(|reference| reference.upgrade())
+        {
+            reference.revoke();
+        }
+        drop(references);
         let workspace = state
             .workspace
             .lock()

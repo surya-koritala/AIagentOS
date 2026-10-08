@@ -66,9 +66,10 @@ def run(output: Path) -> None:
         "backend_enabled": False,
         "production_claim_allowed": False,
         "native_process_contract_qualified": False,
+        "fixture_parent_scope": "globally_traversable_disposable_tmp",
         "observations": {},
     }
-    with tempfile.TemporaryDirectory(prefix="aiagentos-app-sandbox-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="aiagentos-app-sandbox-", dir="/private/tmp") as temporary:
         root = Path(temporary).resolve()
         root.chmod(0o755)
         workspace, outside = root / "workspace", root / "outside"
@@ -135,6 +136,7 @@ def run(output: Path) -> None:
                 observed[name] = observe(binary, workspace, "read", str(path))
             observed["workspace_write"] = observe(binary, workspace, "write", str(workspace / "created.txt"))
             observed["outside_write"] = observe(binary, workspace, "write", str(outside / "created.txt"))
+            observed["runtime_temporary_write"] = observe(binary, workspace, "temporary", str(workspace))
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                 listener.bind(("127.0.0.1", 0))
                 listener.listen(1)
@@ -153,6 +155,7 @@ def run(output: Path) -> None:
                 "outside_public_read_denied": observed["outside_public_read"].get("allowed") is False,
                 "outside_private_read_denied": observed["outside_private_read"].get("allowed") is False,
                 "outside_write_denied": observed["outside_write"].get("allowed") is False,
+                "outside_workspace_temporary_write_denied": observed["runtime_temporary_write"].get("path_resolved") is True and observed["runtime_temporary_write"].get("inside_workspace") is False and observed["runtime_temporary_write"].get("allowed") is False,
                 "network_connection_denied": observed["network"].get("connected") is False and observed["network"].get("listener_accepted") is False and observed["network"].get("errno") in {errno.EPERM, errno.EACCES},
                 "process_group_escape_denied": observed["detach"].get("allowed") is False,
                 "undeclared_exec_denied": observed["exec"].get("allowed") is False,

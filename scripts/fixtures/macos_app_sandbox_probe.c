@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,23 @@ int main(int argc, char **argv) {
             close(fd);
         }
         result(allowed, error);
+        return 0;
+    }
+    if (!strcmp(argv[1], "temporary") && argc == 3) {
+        char directory[PATH_MAX], target[PATH_MAX];
+        size_t size = confstr(_CS_DARWIN_USER_TEMP_DIR, directory, sizeof(directory));
+        int resolved = size > 0 && size <= sizeof(directory);
+        int allowed = 0, error = 0, inside_workspace = 0;
+        if (resolved) {
+            inside_workspace = !strncmp(directory, argv[2], strlen(argv[2]));
+            int count = snprintf(target, sizeof(target), "%saiagentos-ci-%d", directory, getpid());
+            if (count < 0 || (size_t)count >= sizeof(target)) return 3;
+            int fd = open(target, O_WRONLY | O_CREAT | O_EXCL, 0600);
+            allowed = fd >= 0;
+            error = allowed ? 0 : errno;
+            if (allowed) { close(fd); unlink(target); }
+        }
+        printf("{\"path_resolved\":%s,\"inside_workspace\":%s,\"allowed\":%s,\"errno\":%d}\n", resolved ? "true" : "false", inside_workspace ? "true" : "false", allowed ? "true" : "false", error);
         return 0;
     }
     if (!strcmp(argv[1], "network") && argc == 3) {

@@ -2,9 +2,8 @@
 //!
 //! Every private object is created with its descriptor already attached. Reads
 //! validate the opened handle, not a second path lookup. Directory metadata
-//! flush is attempted explicitly; where NTFS rejects directory handles, a
-//! flushed private marker is renamed with MOVEFILE_WRITE_THROUGH in that same
-//! directory. This is a process-crash boundary, not a power-loss qualification.
+//! flush uses a writable directory handle and fails closed if unsupported.
+//! CI process-crash evidence is not a physical power-loss qualification.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -16,8 +15,7 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    LocalFree, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE,
+    LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
@@ -502,10 +500,9 @@ pub(crate) fn durable_rename(source: &Path, destination: &Path) -> io::Result<()
 #[derive(Debug)]
 enum DirectorySyncMechanism {
     DirectoryHandleFlush,
-    WriteThroughMetadataMarker,
 }
 
-/// A real directory flush, or a flushed write-through metadata barrier.
+/// Flush the actual directory handle; unsupported filesystems fail closed.
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     sync_directory_with_evidence(path).map(|_| ())
 }
@@ -515,31 +512,7 @@ fn sync_directory_with_evidence(path: &Path) -> io::Result<DirectorySyncMechanis
     if unsafe { FlushFileBuffers(directory.as_raw_handle()) } != 0 {
         return Ok(DirectorySyncMechanism::DirectoryHandleFlush);
     }
-    let error = io::Error::last_os_error();
-    if !matches!(error.raw_os_error(), Some(code) if code == ERROR_INVALID_HANDLE as i32
-        || code == ERROR_INVALID_FUNCTION as i32 || code == ERROR_NOT_SUPPORTED as i32
-        || code == ERROR_ACCESS_DENIED as i32)
-    {
-        return Err(error);
-    }
-    // The fallback must itself perform and persist metadata I/O. It never
-    // accepts a failure to create, flush, or write-through rename its marker.
-    let stage = path.join(format!(".agentos-sync-{}.stage", uuid::Uuid::new_v4()));
-    let published = path.join(format!(".agentos-sync-{}.done", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut marker = create_new_file(&stage)?;
-        marker.write_all(b"AIOS-directory-metadata-barrier\n")?;
-        marker.sync_all()?;
-        drop(marker);
-        durable_rename(&stage, &published)?;
-        std::fs::remove_file(&published)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&stage);
-        let _ = std::fs::remove_file(&published);
-    }
-    result.map(|()| DirectorySyncMechanism::WriteThroughMetadataMarker)
+    Err(io::Error::last_os_error())
 }
 
 pub(crate) fn write_config(path: &Path, bytes: &[u8]) -> io::Result<()> {

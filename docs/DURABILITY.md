@@ -58,11 +58,11 @@ operator identity, not a tenant or remote authentication principal.
 Windows publication and rollback moves use `MoveFileExW` with
 `MOVEFILE_WRITE_THROUGH`; cross-volume copy/delete fallback is prohibited.
 Directory sync explicitly opens a directory with `FILE_FLAG_BACKUP_SEMANTICS`
-and attempts `FlushFileBuffers`. Where the filesystem rejects directory flushes,
-it creates an owner-only metadata marker, flushes its file handle, and performs a
-same-directory write-through rename before removing the marker. Marker creation,
-flush, and rename errors fail the operation. This fallback performs metadata I/O;
-it is not an unconditional successful stub. Process-exit publication/recovery,
+and requires successful `FlushFileBuffers` on that actual directory handle.
+The native hosted NTFS report records `DirectoryHandleFlush`. Unsupported or
+rejected directory flushes fail the storage operation; no marker or unrelated
+file is treated as proof that prior directory entries are durable.
+Process-exit publication/recovery,
 ACL, ownership, reparse, and cleanup regressions run in Windows CI. These tests
 do not establish physical power-loss, controller-cache, device-loss, network
 filesystem, or independently reviewed production qualification under

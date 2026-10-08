@@ -51,10 +51,14 @@ impl GroqSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> reqwest::RequestBuilder {
-        let body = crate::streaming::openai_streaming_body(messages, tools, options, Some(&self.model));
+        let body =
+            crate::streaming::openai_streaming_body(messages, tools, options, Some(&self.model));
         let request = self
             .client
-            .post(format!("{}/chat/completions", self.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                self.base_url.trim_end_matches('/')
+            ))
             .json(&body);
         if self.api_key.is_empty() {
             request

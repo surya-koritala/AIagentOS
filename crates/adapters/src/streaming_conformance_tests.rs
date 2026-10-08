@@ -97,7 +97,10 @@ async fn collect(
 #[tokio::test]
 async fn nine_network_adapters_conform_to_declared_streaming() {
     let server = MockServer::start().await;
-    for request_path in ["/chat/completions", "/openai/deployments/fixture/chat/completions"] {
+    for request_path in [
+        "/chat/completions",
+        "/openai/deployments/fixture/chat/completions",
+    ] {
         Mock::given(method("POST"))
             .and(path(request_path))
             .and(body_partial_json(json!({
@@ -114,10 +117,19 @@ async fn nine_network_adapters_conform_to_declared_streaming() {
             .await;
     }
     let fallback_fixtures = [
-        ("/messages", json!({"content": [{"type": "text", "text": "Hello 🌐"}], "stop_reason": "end_turn", "usage": {"input_tokens": 11, "output_tokens": 3, "cache_read_input_tokens": 4}})),
-        ("/v1beta/models/fixture:generateContent", json!({"candidates": [{"content": {"parts": [{"text": "Hello 🌐"}]}, "finishReason": "STOP"}], "usageMetadata": {"totalTokenCount": 14, "promptTokenCount": 11, "candidatesTokenCount": 3, "cachedContentTokenCount": 4}})),
+        (
+            "/messages",
+            json!({"content": [{"type": "text", "text": "Hello 🌐"}], "stop_reason": "end_turn", "usage": {"input_tokens": 11, "output_tokens": 3, "cache_read_input_tokens": 4}}),
+        ),
+        (
+            "/v1beta/models/fixture:generateContent",
+            json!({"candidates": [{"content": {"parts": [{"text": "Hello 🌐"}]}, "finishReason": "STOP"}], "usageMetadata": {"totalTokenCount": 14, "promptTokenCount": 11, "candidatesTokenCount": 3, "cachedContentTokenCount": 4}}),
+        ),
         ("/models/fixture", json!([{"generated_text": "Hello 🌐"}])),
-        ("/api/chat", json!({"message": {"content": "Hello 🌐"}, "prompt_eval_count": 11, "eval_count": 3})),
+        (
+            "/api/chat",
+            json!({"message": {"content": "Hello 🌐"}, "prompt_eval_count": 11, "eval_count": 3}),
+        ),
     ];
     for (request_path, fixture) in fallback_fixtures {
         Mock::given(method("POST"))
@@ -146,17 +158,42 @@ async fn nine_network_adapters_conform_to_declared_streaming() {
         ),
         Box::new(LocalLlmAdapter::new(server.uri(), "fixture".into())),
     ]);
-    let mut ids: Vec<_> = adapters.iter().map(|adapter| adapter.id().as_str()).collect();
+    let mut ids: Vec<_> = adapters
+        .iter()
+        .map(|adapter| adapter.id().as_str())
+        .collect();
     ids.sort_unstable();
-    assert_eq!(ids, ["anthropic", "azure-openai", "deepseek", "gemini", "groq", "huggingface", "local", "openai", "vllm"]);
+    assert_eq!(
+        ids,
+        [
+            "anthropic",
+            "azure-openai",
+            "deepseek",
+            "gemini",
+            "groq",
+            "huggingface",
+            "local",
+            "openai",
+            "vllm"
+        ]
+    );
     for adapter in adapters {
         let (response, deltas) = collect(adapter.as_ref(), &[]).await.unwrap();
         assert_eq!(response.content, "Hello 🌐", "{}", adapter.id());
         assert_eq!(deltas.concat(), response.content, "{}", adapter.id());
         if adapter.capabilities().native_streaming {
-            assert!(deltas.len() >= 2, "{} claimed native streaming", adapter.id());
+            assert!(
+                deltas.len() >= 2,
+                "{} claimed native streaming",
+                adapter.id()
+            );
         } else {
-            assert_eq!(deltas.len(), 1, "{} claimed fallback streaming", adapter.id());
+            assert_eq!(
+                deltas.len(),
+                1,
+                "{} claimed fallback streaming",
+                adapter.id()
+            );
         }
         if adapter.id() == "huggingface" {
             assert_eq!(response.usage, LlmUsage::default());
@@ -166,7 +203,10 @@ async fn nine_network_adapters_conform_to_declared_streaming() {
             assert_eq!(response.usage.input_tokens, 11, "{}", adapter.id());
             assert_eq!(response.usage.output_tokens, 3, "{}", adapter.id());
             assert_eq!(response.tokens_used, 14, "{}", adapter.id());
-            assert_eq!(response.usage.cached_tokens, if adapter.id() == "local" { 0 } else { 4 });
+            assert_eq!(
+                response.usage.cached_tokens,
+                if adapter.id() == "local" { 0 } else { 4 }
+            );
         }
     }
 }
@@ -179,7 +219,8 @@ async fn native_adapters_assemble_interleaved_parallel_tool_arguments() {
         sse_event(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "a.txt\"}"}}, {"index": 1, "function": {"arguments": "7}"}}]}, "finish_reason": "tool_calls"}]})),
         sse_event(json!({"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14, "prompt_cache_hit_tokens": 5}})),
         "data: [DONE]\n\n".to_string(),
-    ].concat();
+    ]
+    .concat();
     Mock::given(method("POST"))
         .and(body_partial_json(json!({"stream": true, "tools": [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]})))
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
@@ -195,10 +236,21 @@ async fn native_adapters_assemble_interleaved_parallel_tool_arguments() {
         let (response, deltas) = collect(adapter.as_ref(), &tools).await.unwrap();
         assert!(deltas.is_empty());
         assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(response.tool_calls, vec![
-            ToolCall { id: "first".into(), name: "read".into(), arguments: json!({"path": "a.txt"}) },
-            ToolCall { id: "second".into(), name: "lookup".into(), arguments: json!({"id": 7}) },
-        ]);
+        assert_eq!(
+            response.tool_calls,
+            vec![
+                ToolCall {
+                    id: "first".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "a.txt"})
+                },
+                ToolCall {
+                    id: "second".into(),
+                    name: "lookup".into(),
+                    arguments: json!({"id": 7})
+                },
+            ]
+        );
         assert_eq!(response.tokens_used, 14);
         assert_eq!(response.usage.cached_tokens, 5);
     }
@@ -211,6 +263,7 @@ async fn native_adapters_reject_oversized_streams_and_malformed_tool_calls() {
         [sse_event(json!({"choices": [{"delta": {"tool_calls": [{"index": u64::MAX, "id": "bad"}]}, "finish_reason": "tool_calls"}]})), "data: [DONE]\n\n".into()].concat(),
         [sse_event(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "bad", "function": {"name": "read", "arguments": "{broken"}}]}, "finish_reason": "tool_calls"}]})), "data: [DONE]\n\n".into()].concat(),
         "data: {\"error\":{\"message\":\"sk-secret prompt-private\"}}\n\n".into(),
+        "data: {\"choices\":[],\"x_groq\":{\"error\":\"sk-secret prompt-private\"}}\n\n".into(),
         "data: {broken}\n\n".into(),
     ];
     for body in bad_bodies {
@@ -222,7 +275,10 @@ async fn native_adapters_reject_oversized_streams_and_malformed_tool_calls() {
             .await;
         for adapter in native_adapters(&server.uri()) {
             let error = collect(adapter.as_ref(), &[]).await.unwrap_err();
-            assert!(matches!(error, ConnectorError::ProtocolError(_)), "{error:?}");
+            assert!(
+                matches!(error, ConnectorError::ProtocolError(_)),
+                "{error:?}"
+            );
             assert!(!error.to_string().contains("sk-secret"));
             assert!(!error.to_string().contains("prompt-private"));
         }
@@ -233,7 +289,11 @@ async fn native_adapters_reject_oversized_streams_and_malformed_tool_calls() {
 // completes, and can split an individual UTF-8 code point across wire chunks.
 async fn paused_stream(
     chunks: Vec<Vec<u8>>,
-) -> (String, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let uri = format!("http://{}", listener.local_addr().unwrap());
     let (resume, resumed) = tokio::sync::oneshot::channel();
@@ -256,7 +316,10 @@ async fn paused_stream(
             if index == 1 {
                 let _ = resumed.take().unwrap().await;
             }
-            socket.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                .await
+                .unwrap();
             socket.write_all(&chunk).await.unwrap();
             socket.write_all(b"\r\n").await.unwrap();
             socket.flush().await.unwrap();
@@ -269,31 +332,52 @@ async fn paused_stream(
 #[tokio::test]
 async fn native_stream_delivers_before_completion_and_preserves_split_utf8() {
     let first = sse_event(json!({"choices": [{"delta": {"content": "first "}}]}));
-    let second = sse_event(json!({"choices": [{"delta": {"content": "🌐"}, "finish_reason": "stop"}]})).replace('\n', "\r\n");
-    let split = second.as_bytes().iter().position(|byte| *byte == 0xf0).unwrap() + 2;
+    let second =
+        sse_event(json!({"choices": [{"delta": {"content": "🌐"}, "finish_reason": "stop"}]}))
+            .replace('\n', "\r\n");
+    let split = second
+        .as_bytes()
+        .iter()
+        .position(|byte| *byte == 0xf0)
+        .unwrap()
+        + 2;
     for index in 0..5 {
         let (uri, resume, server) = paused_stream(vec![
             first.clone().into_bytes(),
             second.as_bytes()[..split].to_vec(),
             second.as_bytes()[split..].to_vec(),
             b"data: [DONE]\r\n\r\n".to_vec(),
-        ]).await;
+        ])
+        .await;
         let adapter = native_adapters(&uri).remove(index);
         let session = adapter.create_session().await.unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
-            session.send_streaming_events_controlled(
-                vec![StandardMessage::user("fixture")],
-                &[],
-                LlmRequestOptions { timeout: Some(Duration::from_secs(5)), ..Default::default() },
-                &CancellationToken::new(),
-                ProviderEventSink::new(sender),
-            ).await
+            session
+                .send_streaming_events_controlled(
+                    vec![StandardMessage::user("fixture")],
+                    &[],
+                    LlmRequestOptions {
+                        timeout: Some(Duration::from_secs(5)),
+                        ..Default::default()
+                    },
+                    &CancellationToken::new(),
+                    ProviderEventSink::new(sender),
+                )
+                .await
         });
-        assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap(), Some(ProviderStreamEvent::TextDelta("first ".into())));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap(),
+            Some(ProviderStreamEvent::TextDelta("first ".into()))
+        );
         assert!(!task.is_finished());
         resume.send(()).unwrap();
-        assert_eq!(receiver.recv().await, Some(ProviderStreamEvent::TextDelta("🌐".into())));
+        assert_eq!(
+            receiver.recv().await,
+            Some(ProviderStreamEvent::TextDelta("🌐".into()))
+        );
         assert_eq!(task.await.unwrap().unwrap().content, "first 🌐");
         server.await.unwrap();
     }
@@ -315,11 +399,18 @@ async fn native_stream_cancellation_and_deadline_cover_backpressure() {
             let cancel = cancellation.clone();
             let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
             let task = tokio::spawn(async move {
-                session.send_streaming_events_controlled(
-                    vec![StandardMessage::user("fixture")], &[],
-                    LlmRequestOptions { timeout: Some(Duration::from_millis(if timeout { 100 } else { 5000 })), ..Default::default() },
-                    &cancellation, ProviderEventSink::new(sender),
-                ).await
+                session
+                    .send_streaming_events_controlled(
+                        vec![StandardMessage::user("fixture")],
+                        &[],
+                        LlmRequestOptions {
+                            timeout: Some(Duration::from_millis(if timeout { 100 } else { 5000 })),
+                            ..Default::default()
+                        },
+                        &cancellation,
+                        ProviderEventSink::new(sender),
+                    )
+                    .await
             });
             // Waiting until the bounded channel is full makes backpressure
             // deterministic without consuming a delta or timing a sleep.
@@ -327,15 +418,26 @@ async fn native_stream_cancellation_and_deadline_cover_backpressure() {
                 while receiver.is_empty() {
                     tokio::task::yield_now().await;
                 }
-            }).await.unwrap();
-            if !timeout { cancel.cancel(); }
-            let error = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap_err();
+            })
+            .await
+            .unwrap();
+            if !timeout {
+                cancel.cancel();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
             if timeout {
                 assert!(matches!(error, ConnectorError::Timeout(_)));
             } else {
                 assert!(matches!(error, ConnectorError::Cancelled(_)));
             }
-            assert_eq!(receiver.recv().await, Some(ProviderStreamEvent::TextDelta("Hello ".into())));
+            assert_eq!(
+                receiver.recv().await,
+                Some(ProviderStreamEvent::TextDelta("Hello ".into()))
+            );
             assert_eq!(receiver.recv().await, None);
         }
     }
@@ -346,7 +448,9 @@ async fn visible_native_failure_suppresses_connector_retry_and_failover() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(sse_event(json!({"choices": [{"delta": {"content": "partial"}}]}))))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse_event(
+            json!({"choices": [{"delta": {"content": "partial"}}]}),
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -357,13 +461,118 @@ async fn visible_native_failure_suppresses_connector_retry_and_failover() {
         .mount(&server)
         .await;
     let connector = Arc::new(AgentConnectorImpl::new());
-    connector.register_provider(Arc::new(OpenAiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("fixture".into()))).unwrap();
-    connector.register_provider(Arc::new(GroqAdapter::new("fixture-key".into()).with_base_url(format!("{}/backup", server.uri())).with_model("fixture".into()))).unwrap();
+    connector
+        .register_provider(Arc::new(
+            OpenAiAdapter::new("fixture-key".into())
+                .with_base_url(server.uri())
+                .with_model("fixture".into()),
+        ))
+        .unwrap();
+    connector
+        .register_provider(Arc::new(
+            GroqAdapter::new("fixture-key".into())
+                .with_base_url(format!("{}/backup", server.uri()))
+                .with_model("fixture".into()),
+        ))
+        .unwrap();
     connector.set_backup(&"openai".into(), &"groq".into());
-    let session = connector.connect_resilient(kernel::AgentId::new_v4(), &"openai".into()).await.unwrap();
+    let session = connector
+        .connect_resilient(kernel::AgentId::new_v4(), &"openai".into())
+        .await
+        .unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
-    let error = session.send_streaming_events_controlled(vec![StandardMessage::user("fixture")], &[], LlmRequestOptions::default(), &CancellationToken::new(), ProviderEventSink::new(sender)).await.unwrap_err();
+    let error = session
+        .send_streaming_events_controlled(
+            vec![StandardMessage::user("fixture")],
+            &[],
+            LlmRequestOptions::default(),
+            &CancellationToken::new(),
+            ProviderEventSink::new(sender),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(error, ConnectorError::PartialStream(_)));
-    assert_eq!(receiver.recv().await, Some(ProviderStreamEvent::TextDelta("partial".into())));
+    assert_eq!(
+        receiver.recv().await,
+        Some(ProviderStreamEvent::TextDelta("partial".into()))
+    );
     assert_eq!(session.last_attempts(), Some(1));
+}
+
+#[tokio::test]
+async fn native_stream_without_event_sink_preserves_history_and_zero_usage() {
+    let server = MockServer::start().await;
+    let body = [
+        sse_event(json!({"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]})),
+        sse_event(json!({"choices": [], "usage": null, "x_groq": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}})),
+        "data: [DONE]\n\n".to_string(),
+    ].concat();
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"stream": true, "max_tokens": 9, "messages": [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"a.txt\"}"}}]},
+            {"role": "tool", "content": "fixture-result", "tool_call_id": "call"}
+        ]})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(5)
+        .mount(&server)
+        .await;
+    let mut assistant = StandardMessage::assistant("");
+    assistant.tool_calls = Some(vec![ToolCall {
+        id: "call".into(),
+        name: "read".into(),
+        arguments: json!({"path": "a.txt"}),
+    }]);
+    for adapter in native_adapters(&server.uri()) {
+        let session = adapter.create_session().await.unwrap();
+        let response = session
+            .send_streaming_with_options(
+                vec![
+                    assistant.clone(),
+                    StandardMessage::tool_result("call", "fixture-result"),
+                ],
+                &[],
+                LlmRequestOptions {
+                    max_output_tokens: Some(9),
+                    timeout: Some(Duration::from_secs(5)),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content, "answer");
+        assert_eq!(response.tokens_used, 0);
+        assert_eq!(response.usage, LlmUsage::reported(0, 0, 0));
+    }
+}
+
+#[tokio::test]
+async fn cancelled_native_attempt_makes_no_request_and_http_errors_stay_typed() {
+    for index in 0..5 {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(json!({"error": {"api_key": "sk-secret"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = native_adapters(&server.uri()).remove(index);
+        let session = adapter.create_session().await.unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = session
+            .send_streaming_controlled(
+                vec![StandardMessage::user("fixture")],
+                &[],
+                LlmRequestOptions::default(),
+                &cancellation,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConnectorError::Cancelled(_)));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let error = collect(adapter.as_ref(), &[]).await.unwrap_err();
+        assert!(matches!(error, ConnectorError::Authentication(_)));
+        assert!(!error.to_string().contains("sk-secret"));
+    }
 }

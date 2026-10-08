@@ -253,8 +253,6 @@ impl LlmSession for AzureSession {
     fn model_id(&self) -> &str {
         &self.model_id
     }
-
-
 }
 
 #[async_trait::async_trait]

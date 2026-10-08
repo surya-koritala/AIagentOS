@@ -186,7 +186,10 @@ fn update_identity(target: &mut String, value: &Value) -> Result<(), ConnectorEr
 }
 
 fn read_usage(json: &Value) -> Option<(LlmUsage, u32)> {
-    let usage = json.get("usage")?.as_object()?;
+    let usage = json
+        .get("usage")
+        .and_then(Value::as_object)
+        .or_else(|| json["x_groq"]["usage"].as_object())?;
     let input = crate::json_usage_u32(usage.get("prompt_tokens").unwrap_or(&Value::Null));
     let output = crate::json_usage_u32(usage.get("completion_tokens").unwrap_or(&Value::Null));
     let cached = usage
@@ -217,9 +220,8 @@ impl StreamState {
             self.done = true;
             return Ok(());
         }
-        let json: Value =
-            serde_json::from_str(data).map_err(|_| protocol("malformed SSE JSON"))?;
-        if json.get("error").is_some() {
+        let json: Value = serde_json::from_str(data).map_err(|_| protocol("malformed SSE JSON"))?;
+        if json.get("error").is_some() || !json["x_groq"]["error"].is_null() {
             return Err(protocol("provider sent an in-band error"));
         }
         let choices = json["choices"]
@@ -249,6 +251,9 @@ impl StreamState {
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for call in calls {
+                    if !call["type"].is_null() && call["type"].as_str() != Some("function") {
+                        return Err(protocol("unsupported tool type"));
+                    }
                     let index = call["index"]
                         .as_u64()
                         .and_then(|index| usize::try_from(index).ok())
@@ -467,8 +472,8 @@ async fn parse_openai_stream(
         }
     }
     let response = if is_sse == Some(false) {
-        let json: Value = serde_json::from_slice(&prefix)
-            .map_err(|_| protocol("malformed completion JSON"))?;
+        let json: Value =
+            serde_json::from_slice(&prefix).map_err(|_| protocol("malformed completion JSON"))?;
         let response = regular_response(&json, provider)?;
         if !response.content.is_empty() {
             sink.text(&response.content).await;

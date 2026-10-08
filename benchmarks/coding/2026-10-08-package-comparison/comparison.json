@@ -1,0 +1,96 @@
+{
+  "containment_in_every_strategy": true,
+  "evidence_class": "deterministic_fixture",
+  "image": "rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e",
+  "production_claim_allowed": false,
+  "provider_api_calls": 0,
+  "results": [
+    {
+      "attempts": 2,
+      "changed_file_sha256": "8c16b7a695c1bc585f79aea12296bed6d112dc8bdb0587a0b887d4253ed80cdd",
+      "completed": true,
+      "copy_on_write": true,
+      "duration_ms": 17526,
+      "kernel_governance": true,
+      "provider_tokens": 2131,
+      "strategy": "governed_cow",
+      "tests": [
+        {
+          "duration_ms": 1004,
+          "exit_code": 101,
+          "kind": "isolated_process",
+          "operation_id": "a78669fc-bb6c-4964-9281-8592bd5c1360",
+          "stderr": "   Compiling coding-utf8-budget-fixture v0.0.0 (/workspace)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s\n     Running tests/utf8_budget.rs (target/debug/deps/utf8_budget-eaae964466df3073)\nerror: test failed, to rerun pass `--test utf8_budget`\n",
+          "stdout": "\nrunning 2 tests\ntest ascii_empty_and_unlimited_budgets ... ok\ntest multibyte_text_never_panics_or_exceeds_the_byte_budget ... FAILED\n\nfailures:\n\n---- multibyte_text_never_panics_or_exceeds_the_byte_budget stdout ----\n\nthread 'multibyte_text_never_panics_or_exceeds_the_byte_budget' (96) panicked at tests/utf8_budget.rs:16:13:\nassertion failed: actual.len() <= budget\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    multibyte_text_never_panics_or_exceeds_the_byte_budget\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+          "tool": "/tools/coding_tests"
+        },
+        {
+          "duration_ms": 568,
+          "exit_code": 0,
+          "kind": "isolated_process",
+          "operation_id": "c65387bc-6552-4d9e-92ba-84ae5e0c6416",
+          "stderr": "   Compiling coding-utf8-budget-fixture v0.0.0 (/workspace)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s\n     Running tests/utf8_budget.rs (target/debug/deps/utf8_budget-eaae964466df3073)\n",
+          "stdout": "\nrunning 2 tests\ntest ascii_empty_and_unlimited_budgets ... ok\ntest multibyte_text_never_panics_or_exceeds_the_byte_budget ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+          "tool": "/tools/coding_tests"
+        }
+      ]
+    },
+    {
+      "attempts": 2,
+      "changed_file_sha256": "8c16b7a695c1bc585f79aea12296bed6d112dc8bdb0587a0b887d4253ed80cdd",
+      "completed": true,
+      "copy_on_write": false,
+      "duration_ms": 5113,
+      "kernel_governance": true,
+      "provider_tokens": 2394,
+      "strategy": "governed_sequential",
+      "tests": [
+        {
+          "duration_ms": 581,
+          "exit_code": 101,
+          "kind": "isolated_process",
+          "operation_id": "d282f4b0-8adc-4198-b71a-c7586844d018",
+          "stderr": "   Compiling coding-utf8-budget-fixture v0.0.0 (/workspace)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s\n     Running tests/utf8_budget.rs (target/debug/deps/utf8_budget-eaae964466df3073)\nerror: test failed, to rerun pass `--test utf8_budget`\n",
+          "stdout": "\nrunning 2 tests\ntest ascii_empty_and_unlimited_budgets ... ok\ntest multibyte_text_never_panics_or_exceeds_the_byte_budget ... FAILED\n\nfailures:\n\n---- multibyte_text_never_panics_or_exceeds_the_byte_budget stdout ----\n\nthread 'multibyte_text_never_panics_or_exceeds_the_byte_budget' (96) panicked at tests/utf8_budget.rs:16:13:\nassertion failed: actual.len() <= budget\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    multibyte_text_never_panics_or_exceeds_the_byte_budget\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+          "tool": "/tools/coding_tests"
+        },
+        {
+          "duration_ms": 484,
+          "exit_code": 0,
+          "kind": "isolated_process",
+          "operation_id": "a7d729cc-3747-4df3-a891-cc3fb521e1cf",
+          "stderr": "   Compiling coding-utf8-budget-fixture v0.0.0 (/workspace)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running tests/utf8_budget.rs (target/debug/deps/utf8_budget-eaae964466df3073)\n",
+          "stdout": "\nrunning 2 tests\ntest ascii_empty_and_unlimited_budgets ... ok\ntest multibyte_text_never_panics_or_exceeds_the_byte_budget ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+          "tool": "/tools/coding_tests"
+        }
+      ]
+    },
+    {
+      "attempts": 2,
+      "changed_file_sha256": "8c16b7a695c1bc585f79aea12296bed6d112dc8bdb0587a0b887d4253ed80cdd",
+      "completed": true,
+      "copy_on_write": false,
+      "duration_ms": 893,
+      "kernel_governance": false,
+      "provider_tokens": 2294,
+      "strategy": "contained_direct",
+      "tests": [
+        {
+          "duration_ms": 502,
+          "exit_code": 101,
+          "kind": "isolated_process"
+        },
+        {
+          "duration_ms": 389,
+          "exit_code": 0,
+          "kind": "isolated_process"
+        }
+      ]
+    }
+  ],
+  "same_prompts_and_proposal_decoder": true,
+  "schema_version": 1,
+  "task": "utf8_byte_budget",
+  "timing_scope": "prepared file snapshot through selection; single run, includes test compilation",
+  "token_counter_scope": "synthetic fixture usage; not a billed-provider measurement"
+}

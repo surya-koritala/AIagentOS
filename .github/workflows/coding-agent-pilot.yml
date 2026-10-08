@@ -1,0 +1,115 @@
+name: Reviewed live coding pilot
+
+# No schedule, pull-request trigger, or automatic provider spend.
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_utf8_task:
+        description: Confirm the fixed UTF-8 source/test task has been reviewed
+        type: boolean
+        required: true
+      model:
+        description: Explicit OpenAI Chat Completions model
+        type: string
+        required: true
+      max_usd:
+        description: Authorized configured USD ceiling for this task
+        type: string
+        required: true
+      input_price_per_1k:
+        description: Current configured input USD per 1000 tokens
+        type: string
+        required: true
+      output_price_per_1k:
+        description: Current configured output USD per 1000 tokens
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  reviewed-live-task:
+    name: Reviewed model task on Linux/rootless
+    if: inputs.reviewed_utf8_task == true
+    environment: provider-qualification
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: 0
+      CODING_MODEL: ${{ inputs.model }}
+      CODING_MAX_USD: ${{ inputs.max_usd }}
+      CODING_INPUT_PRICE: ${{ inputs.input_price_per_1k }}
+      CODING_OUTPUT_PRICE: ${{ inputs.output_price_per_1k }}
+      CODING_RUST_IMAGE: rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate reviewed bounds without exposing credentials
+        id: plan
+        run: |
+          mkdir -p target/coding-pilot
+          python3 - <<'PY'
+          import json, math, os, pathlib
+          model = os.environ['CODING_MODEL'].strip()
+          budget = float(os.environ['CODING_MAX_USD'])
+          prices = [float(os.environ[key]) for key in ('CODING_INPUT_PRICE','CODING_OUTPUT_PRICE')]
+          if not model or len(model) > 256 or not math.isfinite(budget) or not 0 < budget <= 100 or any(not math.isfinite(price) or price <= 0 for price in prices):
+              raise SystemExit('invalid reviewed model, budget or configured prices')
+          available = bool(os.environ.get('OPENAI_API_KEY','').strip())
+          pathlib.Path('target/coding-pilot/plan.json').write_text(json.dumps({
+              'status':'planned' if available else 'not_run', 'model':model,
+              'authorized_configured_max_usd':budget, 'reviewed_task':'utf8_byte_budget',
+              'provider_api_calls':0, 'production_claim_allowed':False,
+              'reason':None if available else 'protected provider credential is not configured'
+          },indent=2)+'\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              output.write('run_live='+str(available).lower()+'\n')
+          manifest = {
+              'instruction':'Fix bounded_prefix to return the maximal borrowed UTF-8 prefix within a byte budget while preserving its public signature and all tests.',
+              'files':['Cargo.toml','Cargo.lock','src/lib.rs','tests/utf8_budget.rs'],
+              'editable':['src/lib.rs'], 'test_target':'utf8_budget', 'max_branches':2,
+              'max_steps':1024, 'deadline_seconds':600, 'max_usd':budget,'max_output_tokens':2048
+          }
+          pathlib.Path('target/coding-pilot/task.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          PY
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        if: steps.plan.outputs.run_live == 'true'
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        if: steps.plan.outputs.run_live == 'true'
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5
+        if: steps.plan.outputs.run_live == 'true'
+        with:
+          version: v29.6.2
+          rootless: true
+          daemon-config: |
+            {"exec-opts": ["native.cgroupdriver=cgroupfs"]}
+      - name: Execute only the reviewed task with the authorized bounds
+        if: steps.plan.outputs.run_live == 'true'
+        run: |
+          docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
+          docker pull "$CODING_RUST_IMAGE"
+          cargo build -p coding-agent --bin agent-code --locked
+          mkdir -p "$RUNNER_TEMP/coding-reviewed-source"
+          cp -R fixtures/coding-agent/utf8-budget/. "$RUNNER_TEMP/coding-reviewed-source/"
+          target/debug/agent-code run --repo "$RUNNER_TEMP/coding-reviewed-source" \
+            --manifest target/coding-pilot/task.json --model "$CODING_MODEL" \
+            --input-price-per-1k "$CODING_INPUT_PRICE" --output-price-per-1k "$CODING_OUTPUT_PRICE" \
+            --image "$CODING_RUST_IMAGE" --data-dir "$RUNNER_TEMP/coding-reviewed-job" \
+            > target/coding-pilot/result.json 2> target/coding-pilot/events.jsonl
+          diff -qr fixtures/coding-agent/utf8-budget "$RUNNER_TEMP/coding-reviewed-source"
+          jq -e '.status == "completed" and .original_repository_written == false and any(.branches[]; .test.exit_code == 0 and .test.kind == "isolated_process")' target/coding-pilot/result.json
+          test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
+      - name: Missing provider credentials are not a passing task
+        if: steps.plan.outputs.run_live != 'true'
+        run: |
+          echo 'Reviewed coding task is not_run; no provider request was made.'
+          exit 1
+      - name: Retain exact-source plan, outcomes and failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reviewed-coding-pilot-${{ github.sha }}
+          path: target/coding-pilot/

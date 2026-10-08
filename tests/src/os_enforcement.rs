@@ -199,6 +199,12 @@ async fn enforcement_stacks_capability_mac_and_cgroup_concurrency() {
     assert_eq!(stats.denied_capability, 1);
     assert_eq!(stats.denied_mac, 1);
     assert_eq!(stats.denied_cgroup, 1);
+    assert_eq!(gate.agent_stats(a).denied_capability, 1);
+    assert_eq!(gate.agent_stats(a).denied_mac, 0);
+    assert_eq!(gate.agent_stats(b).denied_mac, 1);
+    assert_eq!(gate.agent_stats(b).denied_cgroup, 0);
+    assert_eq!(gate.agent_stats(c).denied_cgroup, 1);
+    assert_eq!(gate.agent_stats(c).denied_capability, 0);
 }
 
 /// Phase 2: creating an agent through the unified kernel really places it in

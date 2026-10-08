@@ -64,7 +64,9 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl policy-explain POLICY_FILE --subject SUBJECT --action ACTION --object OBJECT\n\
          \n\
          system audit commands:\n\
-           agentctl [SERVER OPTIONS] gate-stats\n\
+           agentctl [SERVER OPTIONS] gate-stats [AGENT_ID]\n\
+           With AGENT_ID: owned-agent ReadOnly counters; without: System-wide counters.\n\
+           Counters are process-local and reset on restart.\n\
            agentctl [SERVER OPTIONS] node-control-audit [LIMIT]\n\
            agentctl [SERVER OPTIONS] cluster-membership-audit [LIMIT]\n\
            agentctl [SERVER OPTIONS] cluster-certificate-rollout-audit [LIMIT]\n\
@@ -1572,13 +1574,15 @@ async fn run_online(
             return;
         }
         "gate-stats" => {
+            let agent_id = args.next();
             if args.next().is_some() {
                 usage();
             }
-            let stats = client
-                .gate_stats()
-                .await
-                .unwrap_or_else(|error| fail(error));
+            let stats = match agent_id {
+                Some(agent_id) => client.agent_gate_stats(agent_id).await,
+                None => client.gate_stats().await,
+            }
+            .unwrap_or_else(|error| fail(error));
             print_json(&stats, "gate enforcement counters");
             return;
         }

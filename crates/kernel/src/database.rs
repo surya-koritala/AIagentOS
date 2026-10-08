@@ -133,8 +133,8 @@ mod tests {
 
     #[test]
     fn query_sqlite_select() {
-        let path =
-            std::env::temp_dir().join(format!("test_db_agent_os_{}.db", uuid::Uuid::new_v4()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("query.db");
         let path_text = path.to_string_lossy().into_owned();
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
@@ -157,7 +157,8 @@ mod tests {
 
     #[test]
     fn read_only_blocks_writes() {
-        let path = std::env::temp_dir().join(format!("test_db_ro_{}.db", uuid::Uuid::new_v4()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly.db");
         let path_text = path.to_string_lossy().into_owned();
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute("CREATE TABLE IF NOT EXISTS t (x INTEGER)", [])

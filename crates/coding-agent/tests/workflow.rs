@@ -52,6 +52,20 @@ struct Harness {
     server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 impl Harness {
+    async fn release_store(mut self) {
+        let context = Arc::downgrade(&self.kernel.context_manager);
+        self.server.abort();
+        assert!((&mut self.server).await.unwrap_err().is_cancelled());
+        drop(self);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while context.strong_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server connection tasks must release the durable context");
+    }
+
     async fn new(kernel: Arc<AgentKernelImpl>) -> Self {
         kernel
             .register_provider(Arc::new(ProposalProvider::fixture()))
@@ -369,17 +383,30 @@ async fn cancellation_reclaims_the_active_owned_branch_and_retains_the_journal()
     let runner = WaitingRunner {
         entered: entered.clone(),
     };
-    let run = tokio::spawn(async move {
+    let preparation_deadline = std::time::Duration::from_secs(j.spec.deadline_seconds);
+    let mut run = tokio::spawn(async move {
         let result = run_job(&mut io, &mut j, &runner, false, false).await;
         io.client.close().await.unwrap();
         io.control.close().await.unwrap();
         (result, j)
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    // Preparation includes durable cloning, provider admission and VFS writes;
+    // its bound is the configured job deadline. Cancellation is measured only
+    // after the controlled runner is active, with the original five-second cap.
+    tokio::select! {
+        _ = entered.notified() => {}
+        result = &mut run => panic!("job completed before the controlled runner: {result:?}"),
+        _ = tokio::time::sleep(preparation_deadline) => {
+            cancel.cancel();
+            run.abort();
+            panic!("job preparation exceeded its configured deadline");
+        }
+    }
     cancel.cancel();
-    let (result, j) = run.await.unwrap();
+    let (result, j) = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("active cancellation must reclaim the owned branch within five seconds")
+        .unwrap();
     assert!(matches!(result, Err(Error::Cancelled)));
     assert_eq!(j.status, "cancelled");
     assert!(j
@@ -542,9 +569,9 @@ async fn a_kernel_restart_resumes_after_a_completed_test_without_replaying_the_f
         io.client.close().await.unwrap();
         io.control.close().await.unwrap();
         h.kernel.context_manager.checkpoint().unwrap();
-        h.server.abort();
-        tokio::task::yield_now().await;
-        (j.parent, j.id, j.branches[0].id)
+        let continuation = (j.parent, j.id, j.branches[0].id);
+        h.release_store().await;
+        continuation
     };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let kernel = loop {
@@ -583,7 +610,6 @@ async fn a_kernel_restart_resumes_after_a_completed_test_without_replaying_the_f
     io.control.close().await.unwrap();
     h.kernel.stop_agent(parent).await.unwrap();
     h.kernel.stop_agent(j.selected.unwrap()).await.unwrap();
-    h.server.abort();
-    drop(h);
+    h.release_store().await;
     std::fs::remove_dir_all(root).unwrap();
 }

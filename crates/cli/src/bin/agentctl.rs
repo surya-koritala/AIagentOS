@@ -9,13 +9,21 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] vfs-mounts AGENT_ID\n\
            agentctl [SERVER OPTIONS] vfs-open AGENT_ID /tools/NAME\n\
            agentctl [SERVER OPTIONS] vfs-invoke AGENT_ID HANDLE ARGUMENTS_JSON\n\
            agentctl [SERVER OPTIONS] vfs-close AGENT_ID HANDLE\n\
+           agentctl [SERVER OPTIONS] vfs-workspace-mounts AGENT_ID\n\
+           agentctl [SERVER OPTIONS] vfs-workspace-open AGENT_ID PATH <file|directory> RIGHTS [--allow-missing]\n\
+           agentctl [SERVER OPTIONS] vfs-open-at AGENT_ID DIRECTORY_HANDLE RELATIVE_PATH <file|directory> RIGHTS [--allow-missing]\n\
+           agentctl [SERVER OPTIONS] vfs-dup AGENT_ID HANDLE RIGHTS\n\
+           agentctl [SERVER OPTIONS] vfs-read AGENT_ID HANDLE [OFFSET [MAX_BYTES]]\n\
+           agentctl [SERVER OPTIONS] vfs-write AGENT_ID HANDLE SOURCE_FILE_OR_DASH\n\
+           agentctl [SERVER OPTIONS] vfs-list AGENT_ID DIRECTORY_HANDLE\n\
+           agentctl [SERVER OPTIONS] vfs-stat AGENT_ID HANDLE\n\
            agentctl [SERVER OPTIONS] create NAME TASK [PROVIDER [PROFILE [PRIORITY]]]\n\
            agentctl [SERVER OPTIONS] message AGENT_ID MESSAGE\n\
            agentctl [SERVER OPTIONS] stream REQUEST_ID AGENT_ID MESSAGE\n\
@@ -81,6 +89,42 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
 fn usage() -> ! {
     eprintln!("{USAGE}");
     std::process::exit(2);
+}
+
+fn workspace_rights(value: &str) -> Vec<agent_sdk::WorkspaceRight> {
+    value
+        .split(',')
+        .map(|right| match right {
+            "read" => agent_sdk::WorkspaceRight::Read,
+            "write" => agent_sdk::WorkspaceRight::Write,
+            "list" => agent_sdk::WorkspaceRight::List,
+            "stat" => agent_sdk::WorkspaceRight::Stat,
+            _ => usage(),
+        })
+        .collect()
+}
+
+fn workspace_request(
+    path: String,
+    args: &mut impl Iterator<Item = String>,
+) -> agent_sdk::WorkspaceOpenRequest {
+    let kind = match args.next().as_deref() {
+        Some("file") => agent_sdk::WorkspaceKind::File,
+        Some("directory") => agent_sdk::WorkspaceKind::Directory,
+        _ => usage(),
+    };
+    let rights = workspace_rights(&args.next().unwrap_or_else(|| usage()));
+    let allow_missing = match args.next().as_deref() {
+        None => false,
+        Some("--allow-missing") if args.next().is_none() => true,
+        _ => usage(),
+    };
+    agent_sdk::WorkspaceOpenRequest {
+        path,
+        kind,
+        rights,
+        allow_missing,
+    }
 }
 
 /// Explicit `--help`. The same text on stdout with a zero exit, so it pipes
@@ -1030,6 +1074,128 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             print_json(&serde_json::json!({"closed": true}), "VFS close");
+            return;
+        }
+        "vfs-workspace-mounts" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let view = client
+                .vfs_workspace_mounts(agent)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&view, "workspace mount");
+            return;
+        }
+        "vfs-workspace-open" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let path = args.next().unwrap_or_else(|| usage());
+            let request = workspace_request(path, &mut args);
+            let handle = client
+                .vfs_open_workspace(agent, request)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&handle, "workspace handle");
+            return;
+        }
+        "vfs-open-at" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let parent = args.next().unwrap_or_else(|| usage());
+            let path = args.next().unwrap_or_else(|| usage());
+            let request = workspace_request(path, &mut args);
+            let handle = client
+                .vfs_open_at(agent, parent, request)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&handle, "workspace child handle");
+            return;
+        }
+        "vfs-dup" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            let rights = workspace_rights(&args.next().unwrap_or_else(|| usage()));
+            if args.next().is_some() {
+                usage();
+            }
+            let duplicate = client
+                .vfs_dup_workspace(agent, handle, rights)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&duplicate, "workspace duplicate");
+            return;
+        }
+        "vfs-read" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            let offset = args
+                .next()
+                .map(|value| value.parse().unwrap_or_else(|_| usage()))
+                .unwrap_or(0);
+            let max_bytes = args
+                .next()
+                .map(|value| value.parse().unwrap_or_else(|_| usage()))
+                .unwrap_or(64 * 1024);
+            if args.next().is_some() {
+                usage();
+            }
+            let chunk = client
+                .vfs_read_workspace(agent, handle, offset, max_bytes)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&chunk, "workspace read");
+            return;
+        }
+        "vfs-write" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            let source = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let mut bytes = Vec::new();
+            let limit = kernel::vfs::workspace::MAX_WORKSPACE_TRANSFER_BYTES as u64 + 1;
+            if source == "-" {
+                std::io::stdin()
+                    .take(limit)
+                    .read_to_end(&mut bytes)
+                    .unwrap_or_else(|error| fail(agent_sdk::SdkError::Transport(error)));
+            } else {
+                std::fs::File::open(source)
+                    .unwrap_or_else(|error| fail(agent_sdk::SdkError::Transport(error)))
+                    .take(limit)
+                    .read_to_end(&mut bytes)
+                    .unwrap_or_else(|error| fail(agent_sdk::SdkError::Transport(error)));
+            }
+            let written_bytes = client
+                .vfs_write_bytes(agent, handle, &bytes)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({"written_bytes":written_bytes}),
+                "workspace write",
+            );
+            return;
+        }
+        "vfs-list" | "vfs-stat" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            if command == "vfs-list" {
+                let entries = client
+                    .vfs_list_workspace(agent, handle)
+                    .await
+                    .unwrap_or_else(|error| fail(error));
+                print_json(&entries, "workspace directory");
+            } else {
+                let metadata = client
+                    .vfs_stat_workspace(agent, handle)
+                    .await
+                    .unwrap_or_else(|error| fail(error));
+                print_json(&metadata, "workspace metadata");
+            }
             return;
         }
         "providers" => {

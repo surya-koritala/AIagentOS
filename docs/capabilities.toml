@@ -512,15 +512,15 @@ limitations = ["Independent security assessment, multi-maintainer review, reprod
 
 [[capability]]
 id = "tool-vfs"
-title = "Agent-owned tool VFS handles"
+title = "Agent-owned governed VFS handles"
 owner = "core runtime"
 maturity = "integrated"
 release = "v1.0"
 tracking_issue = 392
 kernel_modules = ["vfs"]
-source_paths = ["crates/kernel/src/vfs.rs", "crates/kernel/src/tools.rs", "docs/VFS.md"]
+source_paths = ["crates/kernel/src/vfs.rs", "crates/kernel/src/vfs/workspace.rs", "crates/kernel/src/tools.rs", "docs/VFS.md", "docs/WORKSPACE_VFS.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::VfsOpen", "crates/sdk/src/lib.rs::KernelClient::vfs_invoke", "crates/cli/src/bin/agentctl.rs"]
 runtime_call_paths = ["crates/kernel/src/vfs.rs::AgentKernelImpl::vfs_open", "crates/kernel/src/syscall_server.rs::dispatch_tool_call"]
-test_evidence = ["crates/sdk/tests/vfs.rs", "crates/kernel/src/vfs.rs::tests"]
+test_evidence = ["crates/sdk/tests/vfs.rs", "crates/sdk/tests/workspace_vfs.rs", "crates/kernel/src/vfs.rs::tests", "crates/kernel/src/vfs/workspace.rs::tests"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Only the built-in tool mount is implemented; workspace and other mounts, namespace mount administration, and duplication semantics remain incomplete.", "Handles are ephemeral, lost on restart, and not inherited by clones.", "Independent security review and full VFS production qualification remain pending in #392."]
+limitations = ["Built-in tool and workspace mounts are implemented; memory/KV/IPC mounts and namespace mount administration remain incomplete.", "Handles are ephemeral, lost on restart, and not inherited by clones.", "Independent security review and full VFS production qualification remain pending in #392."]

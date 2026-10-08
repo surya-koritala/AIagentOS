@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the `/workspace` VFS mount with agent-owned file/directory entry handles,
+  child opening, rights-narrowing duplication, bounded binary I/O, listing, and
+  metadata. Directory and sandbox rebinding revoke handles; atomic writes retain
+  whole-workspace quotas and controlled cancellation. SDK and agentctl surfaces
+  use the existing gate, broker, lifecycle, and ownership fences. Relates #392.
+
 - Added an initial tool VFS at `/tools/<name>` through the public wire, Rust SDK,
   and `agentctl`. Bounded agent-owned handles identify exact registrations;
   invocation retains current tool governance, and close/teardown revoke them.

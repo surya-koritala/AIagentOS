@@ -12,6 +12,7 @@ kernel = { path = "../kernel", version = "=0.4.0-rc.1" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 thiserror = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }

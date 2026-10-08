@@ -89,10 +89,11 @@ impl SecurityAction {
     /// more privileged operation (for example, `Read` + filesystem `delete`).
     fn for_provider_operation(resource_type: &ResourceType, operation: &str) -> Option<Self> {
         match (resource_type, operation) {
-            (ResourceType::Filesystem, "read" | "list") => Some(Self::Read),
-            (ResourceType::Filesystem, "write" | "create" | "create_dir" | "edit") => {
-                Some(Self::Write)
-            }
+            (ResourceType::Filesystem, "read" | "read_bytes" | "list" | "stat") => Some(Self::Read),
+            (
+                ResourceType::Filesystem,
+                "write" | "write_bytes" | "create" | "create_dir" | "edit",
+            ) => Some(Self::Write),
             (ResourceType::Filesystem, "delete") => Some(Self::Delete),
             (ResourceType::Network, "get" | "post" | "put" | "delete" | "browse") => {
                 Some(Self::Network)
@@ -1079,6 +1080,27 @@ impl ToolRegistry {
         self.binding_ids.get(name).map(|id| *id)
     }
 
+    pub(crate) fn workspace_binding_id(
+        &self,
+        gate: &crate::syscall_gate::SyscallGate,
+        agent_id: AgentId,
+        name: &str,
+        operation: &str,
+    ) -> Option<uuid::Uuid> {
+        let _publication = self.publication.read().ok()?;
+        if gate.pid_of(agent_id).is_none() || !gate.tool_visible_to_agent(agent_id, name) {
+            return None;
+        }
+        let binding = self.tools.get(name)?;
+        if binding.resource_type != ResourceType::Filesystem
+            || binding.operation != operation
+            || binding.security.resource_extractor != ResourceExtractor::Argument("path".into())
+        {
+            return None;
+        }
+        self.binding_ids.get(name).map(|id| *id)
+    }
+
     /// Build the validated security catalog shipped by the kernel. This is
     /// also consumed by the legacy direct-gate compatibility API, ensuring its
     /// built-in classifications are generated from the same bindings.
@@ -1243,6 +1265,41 @@ impl ToolRegistry {
     }
 
     fn register_builtins(&self) {
+        for (name, operation, description, parameters) in [
+            (
+                "stat_path",
+                "stat",
+                "Read bounded file or directory metadata inside your workspace",
+                serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            ),
+            (
+                "read_file_bytes",
+                "read_bytes",
+                "Read a bounded binary file chunk inside your workspace",
+                serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576}},"required":["path"]}),
+            ),
+            (
+                "write_file_bytes",
+                "write_bytes",
+                "Atomically replace a workspace file with bounded base64-encoded bytes",
+                serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"data_base64":{"type":"string"}},"required":["path","data_base64"]}),
+            ),
+        ] {
+            let security = if operation == "write_bytes" {
+                ToolSecurity::argument(SecurityAction::Write, "path").sandboxed()
+            } else {
+                ToolSecurity::argument(SecurityAction::Read, "path")
+            };
+            self.register(ToolBinding {
+                name: name.into(),
+                description: description.into(),
+                parameters_schema: parameters,
+                resource_type: ResourceType::Filesystem,
+                operation: operation.into(),
+                security,
+            })
+            .expect("built-in workspace filesystem declaration must be valid");
+        }
         self.register(ToolBinding {
             name: "read_file".into(),
             description: "Read the contents of a file at the given path".into(),

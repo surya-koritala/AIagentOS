@@ -307,6 +307,11 @@ impl PermissionManager {
         operation: &str,
         target: Option<&str>,
     ) -> Option<AccessDecision> {
+        let equivalent = match (resource, operation) {
+            (ResourceType::Filesystem, "stat" | "read_bytes") => "read",
+            (ResourceType::Filesystem, "write_bytes") => "write",
+            _ => operation,
+        };
         for rule in &profile.rules {
             if &rule.resource_type != resource {
                 continue;
@@ -314,7 +319,7 @@ impl PermissionManager {
             if !rule
                 .operations
                 .iter()
-                .any(|op| op == operation || op == "*")
+                .any(|op| op == operation || op == equivalent || op == "*")
             {
                 continue;
             }
@@ -632,6 +637,73 @@ mod tests {
         assert_eq!(
             mgr.check_access(id, &ResourceType::Filesystem, "read", Some("/safe/file")),
             AccessDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn filesystem_byte_and_stat_operations_preserve_scoped_policy_decisions() {
+        let mgr = PermissionManager::new();
+        let profile_id = "scoped-filesystem".to_string();
+        mgr.profiles.insert(
+            profile_id.clone(),
+            PermissionProfile {
+                id: profile_id.clone(),
+                name: "Scoped filesystem".into(),
+                rules: vec![
+                    PermissionRule {
+                        resource_type: ResourceType::Filesystem,
+                        operations: vec!["read".into(), "write".into()],
+                        targets: Some(vec!["/private/*".into()]),
+                        decision: AccessDecision::Denied,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Filesystem,
+                        operations: vec!["write".into()],
+                        targets: Some(vec!["/review/*".into()]),
+                        decision: AccessDecision::RequiresApproval,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Filesystem,
+                        operations: vec!["read".into(), "write".into()],
+                        targets: Some(vec!["/*".into()]),
+                        decision: AccessDecision::Allowed,
+                    },
+                ],
+            },
+        );
+        let id = uuid::Uuid::new_v4();
+        mgr.assign_profile(id, &profile_id);
+        for operation in ["stat", "read_bytes", "write_bytes"] {
+            for (target, expected) in [
+                (None, AccessDecision::Denied),
+                (Some("/private/secret"), AccessDecision::Denied),
+                (Some("/public/data"), AccessDecision::Allowed),
+            ] {
+                assert_eq!(
+                    mgr.check_access(id, &ResourceType::Filesystem, operation, target),
+                    expected,
+                    "{operation} at {target:?}"
+                );
+            }
+        }
+        assert_eq!(
+            mgr.check_access(
+                id,
+                &ResourceType::Filesystem,
+                "write_bytes",
+                Some("/review/data")
+            ),
+            AccessDecision::RequiresApproval
+        );
+        mgr.assign_profile(id, &"read-only".to_string());
+        assert_eq!(
+            mgr.check_access(
+                id,
+                &ResourceType::Filesystem,
+                "write_bytes",
+                Some("/public/data")
+            ),
+            AccessDecision::Denied
         );
     }
 

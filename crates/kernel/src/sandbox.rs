@@ -4,7 +4,7 @@
 //! network allowlist checking, and platform-aware isolation.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,10 @@ use cap_std::fs::{Dir, OpenOptions};
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
+use crate::vfs::workspace::{
+    WorkspaceBinding, WorkspaceCapability, WorkspaceExecution, WorkspaceKind, WorkspaceRequest,
+    WorkspaceRight, WorkspaceStat, MAX_WORKSPACE_TRANSFER_BYTES,
+};
 use crate::{AgentId, IsolationLevel, SandboxConfig, SandboxError, SandboxId};
 
 const MAX_FILESYSTEM_PATH_BYTES: usize = 4 * 1024;
@@ -99,6 +103,24 @@ pub trait SandboxManager: Send + Sync {
             ));
         }
         self.execute_filesystem(sandbox_id, operation, parameters)
+    }
+    /// Execute a broker-authenticated workspace-capability request. Backends
+    /// without this contract fail closed instead of treating it as a pathname.
+    fn execute_filesystem_scoped(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+        context: Option<&WorkspaceRequest>,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkspaceExecution, SandboxError> {
+        if context.is_some() {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace capabilities unsupported".into(),
+            ));
+        }
+        self.execute_filesystem_controlled(sandbox_id, operation, parameters, cancellation)
+            .map(|data| WorkspaceExecution { data, opened: None })
     }
     /// Execute HTTP through a client bound to the policy-validated DNS answers.
     /// Redirects and ambient proxy configuration are disabled.
@@ -817,7 +839,7 @@ impl SandboxManagerImpl {
     fn stage_file(
         workspace: &Dir,
         relative: &Path,
-        content: &str,
+        content: &[u8],
         permissions: Option<cap_std::fs::Permissions>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<PathBuf, SandboxError> {
@@ -839,7 +861,7 @@ impl SandboxManagerImpl {
                 .open_with(&temporary, &options)
                 .map_err(|error| Self::filesystem_error("stage", error))?;
             Self::filesystem_checkpoint(cancellation)?;
-            file.write_all(content.as_bytes())
+            file.write_all(content)
                 .map_err(|error| Self::filesystem_error("stage", error))?;
             Self::filesystem_checkpoint(cancellation)?;
             if let Some(permissions) = permissions {
@@ -866,6 +888,24 @@ impl SandboxManagerImpl {
         content: &str,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), SandboxError> {
+        Self::atomic_write_bytes(
+            state,
+            workspace,
+            workspace,
+            relative,
+            content.as_bytes(),
+            cancellation,
+        )
+    }
+
+    fn atomic_write_bytes(
+        state: &SandboxState,
+        quota_root: &Dir,
+        workspace: &Dir,
+        relative: &Path,
+        content: &[u8],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SandboxError> {
         Self::filesystem_checkpoint(cancellation)?;
         let (replaced_len, permissions) = match workspace.symlink_metadata(relative) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -879,7 +919,7 @@ impl SandboxManagerImpl {
         };
         Self::enforce_write_quota(
             state,
-            workspace,
+            quota_root,
             replaced_len,
             content.len() as u64,
             cancellation,
@@ -914,7 +954,8 @@ impl SandboxManagerImpl {
             Err(error) => return Err(Self::filesystem_error("create metadata", error)),
         }
         Self::enforce_write_quota(state, workspace, 0, content.len() as u64, cancellation)?;
-        let temporary = Self::stage_file(workspace, relative, content, None, cancellation)?;
+        let temporary =
+            Self::stage_file(workspace, relative, content.as_bytes(), None, cancellation)?;
         if let Err(error) = Self::filesystem_checkpoint(cancellation) {
             let _ = workspace.remove_file(&temporary);
             return Err(error);
@@ -976,6 +1017,429 @@ impl SandboxManagerImpl {
         Ok(())
     }
 
+    fn list_directory(
+        workspace: &Dir,
+        relative: &Path,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<serde_json::Value, SandboxError> {
+        let metadata = workspace
+            .symlink_metadata(relative)
+            .map_err(|error| Self::filesystem_error("list", error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SandboxError::BoundaryViolation(
+                "sandbox filesystem list requires a real directory".into(),
+            ));
+        }
+        let mut entries = workspace
+            .read_dir(relative)
+            .map_err(|error| Self::filesystem_error("list", error))?;
+        let mut details = Vec::new();
+        for entry in entries.by_ref() {
+            Self::filesystem_checkpoint(cancellation)?;
+            if details.len() == MAX_FILESYSTEM_LIST_ENTRIES {
+                return Err(SandboxError::BoundaryViolation(format!(
+                    "sandbox filesystem list exceeds {MAX_FILESYSTEM_LIST_ENTRIES} entries"
+                )));
+            }
+            let entry = entry.map_err(|error| Self::filesystem_error("list", error))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                SandboxError::BoundaryViolation(
+                    "sandbox filesystem list requires UTF-8 entry names".into(),
+                )
+            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| Self::filesystem_error("list", error))?;
+            let kind = if file_type.is_file() {
+                "file"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            details.push(serde_json::json!({"name": name, "kind": kind}));
+        }
+        details.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        let names = details
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({"entries": names, "details": details}))
+    }
+
+    fn open_directory_nofollow(workspace: &Dir, relative: &Path) -> Result<Dir, SandboxError> {
+        let mut directory = workspace
+            .try_clone()
+            .map_err(|error| Self::filesystem_error("directory clone", error))?;
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                if component == std::path::Component::CurDir {
+                    continue;
+                }
+                return Err(SandboxError::BoundaryViolation(
+                    "workspace directory path denied".into(),
+                ));
+            };
+            let base = directory
+                .try_clone()
+                .map_err(|error| Self::filesystem_error("directory clone", error))?
+                .into_std_file();
+            let file = cap_primitives::fs::open_dir_nofollow(&base, Path::new(component))
+                .map_err(|error| Self::filesystem_error("directory open", error))?;
+            directory = Dir::from_std_file(file);
+        }
+        Ok(directory)
+    }
+
+    fn validate_workspace_capability(
+        state: &SandboxState,
+        root: &Dir,
+        capability: &WorkspaceCapability,
+    ) -> Result<(), SandboxError> {
+        if capability.owner() != state.agent_id || capability.sandbox() != state.id {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace capability owner denied".into(),
+            ));
+        }
+        let current = Self::open_directory_nofollow(root, capability.directory_path())?;
+        if crate::vfs::workspace::directory_identity(&current)?
+            != crate::vfs::workspace::directory_identity(capability.directory())?
+        {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace directory binding revoked".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn filesystem_stat(workspace: &Dir, relative: &Path) -> Result<WorkspaceStat, SandboxError> {
+        let metadata = workspace
+            .symlink_metadata(relative)
+            .map_err(|error| Self::filesystem_error("stat", error))?;
+        let kind = if metadata.file_type().is_symlink() {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace symlink denied".into(),
+            ));
+        } else if metadata.is_file() {
+            WorkspaceKind::File
+        } else if metadata.is_dir() {
+            WorkspaceKind::Directory
+        } else {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace special file denied".into(),
+            ));
+        };
+        Ok(WorkspaceStat {
+            kind,
+            size: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+        })
+    }
+
+    fn open_workspace_capability(
+        state: &SandboxState,
+        root: &Dir,
+        context: &WorkspaceRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkspaceExecution, SandboxError> {
+        context.validate_open()?;
+        let WorkspaceRequest::Open {
+            identity,
+            owner,
+            sandbox,
+            path,
+            relative,
+            parent,
+            kind,
+            rights,
+            allow_missing,
+        } = context
+        else {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace open context required".into(),
+            ));
+        };
+        if *owner != state.agent_id || *sandbox != state.id {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace capability owner denied".into(),
+            ));
+        }
+        let base = if let Some(parent) = parent {
+            Self::validate_workspace_capability(state, root, parent)?;
+            parent.directory()
+        } else {
+            root
+        };
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        let relative = Path::new(relative);
+        let (directory, directory_path, entry) = if *kind == WorkspaceKind::Directory {
+            (
+                Self::open_directory_nofollow(base, relative)?,
+                PathBuf::from(path),
+                PathBuf::from("."),
+            )
+        } else {
+            let local_parent = relative
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let directory = Self::open_directory_nofollow(base, local_parent)?;
+            let entry = relative.file_name().ok_or_else(|| {
+                SandboxError::BoundaryViolation("workspace file path denied".into())
+            })?;
+            let logical_parent = Path::new(path)
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            (
+                directory,
+                logical_parent.to_path_buf(),
+                PathBuf::from(entry),
+            )
+        };
+        let metadata = match Self::filesystem_stat(&directory, &entry) {
+            Ok(stat) if stat.kind == *kind => serde_json::to_value(stat).map_err(|_| {
+                SandboxError::BoundaryViolation("workspace metadata unavailable".into())
+            })?,
+            Ok(_) => {
+                return Err(SandboxError::BoundaryViolation(
+                    "workspace object kind mismatch".into(),
+                ))
+            }
+            Err(error)
+                if *allow_missing
+                    && directory
+                        .symlink_metadata(&entry)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                let _ = error;
+                serde_json::json!({"kind":"file","exists":false})
+            }
+            Err(error) => return Err(error),
+        };
+        let scope = WorkspaceCapability::new(
+            *identity,
+            WorkspaceBinding {
+                owner: *owner,
+                sandbox: *sandbox,
+                path: path.clone(),
+                directory_path,
+                directory,
+                entry,
+                kind: *kind,
+            },
+            rights.clone(),
+        );
+        Self::validate_workspace_capability(state, root, &scope)?;
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        Ok(WorkspaceExecution {
+            data: metadata,
+            opened: Some(scope),
+        })
+    }
+
+    fn read_workspace_chunk(
+        workspace: &Dir,
+        relative: &Path,
+        parameters: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, SandboxError> {
+        use base64::Engine;
+        let offset = match parameters.get("offset") {
+            Some(value) => value.as_u64().ok_or_else(|| {
+                SandboxError::BoundaryViolation("workspace read offset invalid".into())
+            })?,
+            None => 0,
+        };
+        let limit = match parameters.get("max_bytes") {
+            Some(value) => value.as_u64().ok_or_else(|| {
+                SandboxError::BoundaryViolation("workspace read limit invalid".into())
+            })?,
+            None => 64 * 1024,
+        };
+        if limit == 0 || limit > MAX_WORKSPACE_TRANSFER_BYTES as u64 {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace read limit denied".into(),
+            ));
+        }
+        Self::regular_metadata(workspace, relative, "read")?;
+        let mut options = OpenOptions::new();
+        options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        let mut file = workspace
+            .open_with(relative, &options)
+            .map_err(|error| Self::filesystem_error("read open", error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| Self::filesystem_error("read metadata", error))?;
+        if !metadata.is_file() {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace read requires a regular file".into(),
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| Self::filesystem_error("read offset", error))?;
+        let mut bytes = Vec::with_capacity(limit as usize);
+        let mut buffer = [0u8; 16384];
+        while bytes.len() < limit as usize {
+            Self::filesystem_checkpoint(Some(cancellation))?;
+            let requested = buffer.len().min(limit as usize - bytes.len());
+            let count = file
+                .read(&mut buffer[..requested])
+                .map_err(|error| Self::filesystem_error("read", error))?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        Ok(
+            serde_json::json!({"data_base64":base64::engine::general_purpose::STANDARD.encode(&bytes),"offset":offset,"eof":offset.saturating_add(bytes.len() as u64) >= metadata.len()}),
+        )
+    }
+
+    fn workspace_write_bytes(parameters: &serde_json::Value) -> Result<Vec<u8>, SandboxError> {
+        use base64::Engine;
+        let encoded = parameters
+            .get("data_base64")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SandboxError::BoundaryViolation("workspace write data required".into())
+            })?;
+        if encoded.len() > MAX_WORKSPACE_TRANSFER_BYTES.div_ceil(3) * 4 {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace write limit denied".into(),
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| SandboxError::BoundaryViolation("workspace write data invalid".into()))?;
+        if bytes.len() > MAX_WORKSPACE_TRANSFER_BYTES {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace write limit denied".into(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn execute_workspace_inner(
+        state: &SandboxState,
+        operation: &str,
+        parameters: &serde_json::Value,
+        context: &WorkspaceRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkspaceExecution, SandboxError> {
+        let _operation = state
+            .operation_lock
+            .lock()
+            .map_err(|_| SandboxError::BoundaryViolation("workspace unavailable".into()))?;
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        let root = state
+            .workspace
+            .lock()
+            .map_err(|_| SandboxError::BoundaryViolation("workspace unavailable".into()))?;
+        let root = root
+            .as_ref()
+            .ok_or_else(|| SandboxError::BoundaryViolation("workspace revoked".into()))?;
+        let supplied = parameters
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SandboxError::BoundaryViolation("workspace target denied".into()))?;
+        let relative = Self::relative_capability_path(state, Path::new(supplied))?;
+        if relative != Path::new(context.path())
+            || context.owner() != state.agent_id
+            || context.sandbox() != state.id
+        {
+            return Err(SandboxError::BoundaryViolation(
+                "workspace target does not match capability".into(),
+            ));
+        }
+        if matches!(context, WorkspaceRequest::Open { .. }) {
+            let WorkspaceRequest::Open { rights, kind, .. } = context else {
+                unreachable!()
+            };
+            let admitted_operation = if rights.len() == 1 && rights.contains(&WorkspaceRight::Write)
+            {
+                "write_bytes"
+            } else if rights.len() == 1
+                && rights.contains(&WorkspaceRight::List)
+                && *kind == WorkspaceKind::Directory
+            {
+                "list"
+            } else {
+                "stat"
+            };
+            if operation != admitted_operation {
+                return Err(SandboxError::BoundaryViolation(
+                    "workspace open requires metadata admission".into(),
+                ));
+            }
+            return Self::open_workspace_capability(state, root, context, cancellation);
+        }
+        let WorkspaceRequest::Use { capability } = context else {
+            unreachable!()
+        };
+        Self::validate_workspace_capability(state, root, capability)?;
+        let data = match operation {
+            "read_bytes" if capability.kind() == WorkspaceKind::File => {
+                capability.require(WorkspaceRight::Read)?;
+                Self::read_workspace_chunk(
+                    capability.directory(),
+                    capability.entry(),
+                    parameters,
+                    cancellation,
+                )?
+            }
+            "write_bytes" if capability.kind() == WorkspaceKind::File => {
+                capability.require(WorkspaceRight::Write)?;
+                let bytes = Self::workspace_write_bytes(parameters)?;
+                Self::atomic_write_bytes(
+                    state,
+                    root,
+                    capability.directory(),
+                    capability.entry(),
+                    &bytes,
+                    Some(cancellation),
+                )?;
+                serde_json::json!({"written_bytes":bytes.len()})
+            }
+            "list" if capability.kind() == WorkspaceKind::Directory => {
+                capability.require(WorkspaceRight::List)?;
+                Self::list_directory(
+                    capability.directory(),
+                    capability.entry(),
+                    Some(cancellation),
+                )?
+            }
+            "stat" => {
+                capability.require(WorkspaceRight::Stat)?;
+                let metadata = Self::filesystem_stat(capability.directory(), capability.entry())?;
+                if metadata.kind != capability.kind() {
+                    return Err(SandboxError::BoundaryViolation(
+                        "workspace object kind changed".into(),
+                    ));
+                }
+                serde_json::to_value(metadata).map_err(|_| {
+                    SandboxError::BoundaryViolation("workspace metadata unavailable".into())
+                })?
+            }
+            _ => {
+                return Err(SandboxError::BoundaryViolation(
+                    "workspace operation or object kind denied".into(),
+                ))
+            }
+        };
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        Ok(WorkspaceExecution { data, opened: None })
+    }
+
     fn execute_filesystem_inner(
         state: &SandboxState,
         operation: &str,
@@ -1002,6 +1466,29 @@ impl SandboxManagerImpl {
         Self::validate_filesystem_path(supplied)?;
         let relative = Self::relative_capability_path(state, Path::new(supplied))?;
         match operation {
+            "read_bytes" => Self::read_workspace_chunk(
+                workspace,
+                &relative,
+                parameters,
+                &cancellation.cloned().unwrap_or_default(),
+            ),
+            "write_bytes" => {
+                let bytes = Self::workspace_write_bytes(parameters)?;
+                Self::atomic_write_bytes(
+                    state,
+                    workspace,
+                    workspace,
+                    &relative,
+                    &bytes,
+                    cancellation,
+                )?;
+                Ok(serde_json::json!({"written_bytes":bytes.len()}))
+            }
+            "stat" => {
+                serde_json::to_value(Self::filesystem_stat(workspace, &relative)?).map_err(|_| {
+                    SandboxError::BoundaryViolation("workspace metadata unavailable".into())
+                })
+            }
             "read" => {
                 let content = Self::read_regular_utf8(workspace, &relative, "read", cancellation)?;
                 Ok(serde_json::json!({"content": content}))
@@ -1063,53 +1550,7 @@ impl SandboxManagerImpl {
                 Self::sync_parent_directory(workspace, &relative)?;
                 Ok(serde_json::json!({"deleted": true}))
             }
-            "list" => {
-                let metadata = workspace
-                    .symlink_metadata(&relative)
-                    .map_err(|error| Self::filesystem_error("list", error))?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(SandboxError::BoundaryViolation(
-                        "sandbox filesystem list requires a real directory".into(),
-                    ));
-                }
-                let mut entries = workspace
-                    .read_dir(&relative)
-                    .map_err(|error| Self::filesystem_error("list", error))?;
-                let mut details = Vec::new();
-                for entry in entries.by_ref() {
-                    Self::filesystem_checkpoint(cancellation)?;
-                    if details.len() == MAX_FILESYSTEM_LIST_ENTRIES {
-                        return Err(SandboxError::BoundaryViolation(format!(
-                            "sandbox filesystem list exceeds {MAX_FILESYSTEM_LIST_ENTRIES} entries"
-                        )));
-                    }
-                    let entry = entry.map_err(|error| Self::filesystem_error("list", error))?;
-                    let name = entry.file_name().into_string().map_err(|_| {
-                        SandboxError::BoundaryViolation(
-                            "sandbox filesystem list requires UTF-8 entry names".into(),
-                        )
-                    })?;
-                    let file_type = entry
-                        .file_type()
-                        .map_err(|error| Self::filesystem_error("list", error))?;
-                    let kind = if file_type.is_file() {
-                        "file"
-                    } else if file_type.is_dir() {
-                        "directory"
-                    } else if file_type.is_symlink() {
-                        "symlink"
-                    } else {
-                        "other"
-                    };
-                    details.push(serde_json::json!({"name": name, "kind": kind}));
-                }
-                details.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-                let names = details
-                    .iter()
-                    .filter_map(|entry| entry["name"].as_str())
-                    .collect::<Vec<_>>();
-                Ok(serde_json::json!({"entries": names, "details": details}))
-            }
+            "list" => Self::list_directory(workspace, &relative, cancellation),
             _ => Err(SandboxError::BoundaryViolation(
                 "unsupported sandbox filesystem operation".into(),
             )),
@@ -1680,6 +2121,29 @@ impl SandboxManager for SandboxManagerImpl {
             .get(&sandbox_id)
             .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
         Self::execute_filesystem_inner(&state, operation, parameters, Some(cancellation))
+    }
+
+    fn execute_filesystem_scoped(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+        context: Option<&WorkspaceRequest>,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkspaceExecution, SandboxError> {
+        let Some(context) = context else {
+            return self
+                .execute_filesystem_controlled(sandbox_id, operation, parameters, cancellation)
+                .map(|data| WorkspaceExecution { data, opened: None });
+        };
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        #[cfg(test)]
+        self.pause_filesystem_for_test(cancellation)?;
+        let state = self
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| SandboxError::BoundaryViolation("workspace sandbox revoked".into()))?;
+        Self::execute_workspace_inner(&state, operation, parameters, context, cancellation)
     }
 
     async fn execute_network(

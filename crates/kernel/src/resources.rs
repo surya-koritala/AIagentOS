@@ -12,6 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::permissions::{AccessDecision, ActionOutcome, PermissionSystem};
 use crate::sandbox::{SandboxAction, SandboxManager};
+use crate::vfs::workspace::{
+    WorkspaceCapability, WorkspaceExecution, WorkspaceRequest, CONTEXT_PARAMETER,
+};
 use crate::{AgentId, IsolationLevel, ResourceError, SandboxId};
 
 pub(crate) const MAX_RESOURCE_OPERATION_BYTES: usize = 128;
@@ -67,7 +70,8 @@ pub(crate) fn provider_target_spec(
     match (resource_type, operation) {
         (
             ResourceType::Filesystem,
-            "read" | "write" | "create" | "create_dir" | "edit" | "delete" | "list",
+            "read" | "read_bytes" | "write" | "write_bytes" | "create" | "create_dir" | "edit"
+            | "delete" | "list" | "stat",
         ) => Some(ProviderTargetSpec::Argument("path")),
         (ResourceType::Network, "get" | "post" | "put" | "delete" | "browse") => {
             Some(ProviderTargetSpec::Argument("url"))
@@ -553,7 +557,7 @@ fn provider_join_result(result: ProviderJoinResult) -> Result<serde_json::Value,
 /// filesystem checkpoint.
 struct FilesystemTaskGuard {
     cancellation: CancellationToken,
-    handle: Option<tokio::task::JoinHandle<Result<serde_json::Value, ResourceError>>>,
+    handle: Option<tokio::task::JoinHandle<Result<WorkspaceExecution, ResourceError>>>,
 }
 
 impl FilesystemTaskGuard {
@@ -563,16 +567,18 @@ impl FilesystemTaskGuard {
         operation: String,
         parameters: serde_json::Value,
         permit: OwnedSemaphorePermit,
+        context: Option<WorkspaceRequest>,
     ) -> Self {
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             manager
-                .execute_filesystem_controlled(
+                .execute_filesystem_scoped(
                     sandbox_id,
                     &operation,
                     &parameters,
+                    context.as_ref(),
                     &worker_cancellation,
                 )
                 .map_err(|error| ResourceError::OperationFailed(error.to_string()))
@@ -583,7 +589,9 @@ impl FilesystemTaskGuard {
         }
     }
 
-    async fn join(&mut self) -> ProviderJoinResult {
+    async fn join(
+        &mut self,
+    ) -> Result<Result<WorkspaceExecution, ResourceError>, tokio::task::JoinError> {
         self.handle
             .as_mut()
             .expect("filesystem task handle is present until guard drop")
@@ -623,7 +631,9 @@ impl Drop for FilesystemTaskGuard {
     }
 }
 
-fn filesystem_join_result(result: ProviderJoinResult) -> Result<serde_json::Value, ResourceError> {
+fn filesystem_join_result(
+    result: Result<Result<WorkspaceExecution, ResourceError>, tokio::task::JoinError>,
+) -> Result<WorkspaceExecution, ResourceError> {
     match result {
         Ok(result) => result,
         Err(error) if error.is_panic() => Err(ResourceError::OperationFailed(
@@ -754,13 +764,56 @@ impl ResourceBrokerImpl {
     }
 }
 
-#[async_trait::async_trait]
-impl ResourceBroker for ResourceBrokerImpl {
-    async fn execute(
+pub(crate) struct WorkspaceBrokerResponse {
+    pub response: ResourceResponse,
+    pub opened: Option<WorkspaceCapability>,
+}
+
+impl ResourceBrokerImpl {
+    pub(crate) async fn execute_workspace(
+        &self,
+        request: ResourceRequest,
+        context: WorkspaceRequest,
+    ) -> Result<WorkspaceBrokerResponse, ResourceError> {
+        self.execute_inner(request, Some(context)).await
+    }
+    async fn execute_inner(
         &self,
         mut request: ResourceRequest,
-    ) -> Result<ResourceResponse, ResourceError> {
+        workspace_context: Option<WorkspaceRequest>,
+    ) -> Result<WorkspaceBrokerResponse, ResourceError> {
         validate_resource_request(&request.operation, &request.parameters)?;
+        let witness = request.parameters.get(CONTEXT_PARAMETER);
+        match (&workspace_context, witness) {
+            (None, None) => {}
+            (Some(context), Some(witness))
+                if request.resource_type == ResourceType::Filesystem
+                    && context.owner() == request.agent_id
+                    && context.witness() == *witness
+                    && request
+                        .parameters
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(context.path()) => {}
+            _ => {
+                return Err(ResourceError::OperationFailed(
+                    "workspace context witness denied".into(),
+                ))
+            }
+        }
+        if let Some(context) = &workspace_context {
+            if self.sandbox_manager.is_none()
+                || request
+                    .sandbox_context
+                    .is_some_and(|id| id != context.sandbox())
+            {
+                return Err(ResourceError::OperationFailed(
+                    "workspace sandbox identity denied".into(),
+                ));
+            }
+            request.sandbox_context = Some(context.sandbox());
+        }
+        let mut opened_scope = None;
         let gate_admission = match request.gate_admission.take() {
             Some(proof) => Some(proof.verify(&request)?),
             None if !self.require_gate_admission => None,
@@ -946,11 +999,15 @@ impl ResourceBroker for ResourceBrokerImpl {
                 permit
                     .take()
                     .expect("filesystem worker owns its admission permit"),
+                workspace_context.clone(),
             );
             match tokio::time::timeout(PROVIDER_EXECUTION_TIMEOUT, task.join()).await {
                 Ok(result) => {
                     task.handle.take();
-                    filesystem_join_result(result)
+                    filesystem_join_result(result).map(|result| {
+                        opened_scope = result.opened;
+                        result.data
+                    })
                 }
                 Err(_) => {
                     task.cancel_and_drain().await;
@@ -1037,10 +1094,13 @@ impl ResourceBroker for ResourceBrokerImpl {
                     AccessDecision::Allowed,
                     ActionOutcome::Success,
                 );
-                Ok(ResourceResponse {
-                    success: true,
-                    data,
-                    error: None,
+                Ok(WorkspaceBrokerResponse {
+                    response: ResourceResponse {
+                        success: true,
+                        data,
+                        error: None,
+                    },
+                    opened: opened_scope,
                 })
             }
             Err(e) => {
@@ -1051,13 +1111,25 @@ impl ResourceBroker for ResourceBrokerImpl {
                     AccessDecision::Allowed,
                     ActionOutcome::Failure,
                 );
-                Ok(ResourceResponse {
-                    success: false,
-                    data: serde_json::Value::Null,
-                    error: Some(bounded_resource_error(&e)),
+                Ok(WorkspaceBrokerResponse {
+                    response: ResourceResponse {
+                        success: false,
+                        data: serde_json::Value::Null,
+                        error: Some(bounded_resource_error(&e)),
+                    },
+                    opened: None,
                 })
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceBroker for ResourceBrokerImpl {
+    async fn execute(&self, request: ResourceRequest) -> Result<ResourceResponse, ResourceError> {
+        self.execute_inner(request, None)
+            .await
+            .map(|result| result.response)
     }
 
     fn list_capabilities(&self) -> Vec<ResourceCapability> {

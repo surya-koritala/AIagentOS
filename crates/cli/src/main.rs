@@ -314,7 +314,7 @@ async fn main() {
     );
     eprintln!(
         "\x1b[90mConversation: {} | /help for commands\x1b[0m\n",
-        &conversation
+        conversation
     );
 
     let stdin = io::stdin();
@@ -433,6 +433,17 @@ async fn run_cli_turn(
     output
 }
 
+/// Print a clean, user-facing startup error and exit non-zero.
+///
+/// Startup failures (config, persistence, provider) are operator errors, not
+/// bugs — surface them as a readable message instead of a panic backtrace.
+/// Returns `!` so it can stand in for any value at a `?`-less call site.
+fn fail(msg: impl std::fmt::Display) -> ! {
+    tracing::error!("{msg}");
+    eprintln!("\x1b[31magent: {msg}\x1b[0m");
+    std::process::exit(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::positional_prompt;
@@ -465,15 +476,4 @@ mod tests {
             assert_eq!(positional_prompt(&arguments), expected);
         }
     }
-}
-
-/// Print a clean, user-facing startup error and exit non-zero.
-///
-/// Startup failures (config, persistence, provider) are operator errors, not
-/// bugs — surface them as a readable message instead of a panic backtrace.
-/// Returns `!` so it can stand in for any value at a `?`-less call site.
-fn fail(msg: impl std::fmt::Display) -> ! {
-    tracing::error!("{msg}");
-    eprintln!("\x1b[31magent: {msg}\x1b[0m");
-    std::process::exit(1);
 }

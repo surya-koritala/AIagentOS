@@ -10176,6 +10176,12 @@ memory = ["remember this"]
             (Syscall::GateStats, AccessLevel::System),
             (Syscall::ListProviders, AccessLevel::ReadOnly),
             (
+                Syscall::ListProviderModels {
+                    provider_id: "catalog".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
                 Syscall::Hello {
                     protocol_version: 1,
                 },
@@ -10626,7 +10632,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 115);
+        assert_eq!(calls.len(), 116);
         assert_eq!(fixture_tags, schema_tags);
     }
 

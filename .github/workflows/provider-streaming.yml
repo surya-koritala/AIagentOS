@@ -57,7 +57,9 @@ jobs:
       - name: Early bounded model discovery and capability contracts
         run: cargo test -p adapters --all-features --locked model_discovery
       - name: System-only catalog authorization and third-party bounds
-        run: cargo test -p kernel --locked model_discovery
+        run: |
+          cargo test -p kernel --locked model_discovery
+          cargo test -p kernel --locked syscall_server::tests::authorization_policy_classifies_every_syscall_and_agent_resource -- --exact
       - name: Actual operator wire, SDK and agentctl model discovery
         run: |
           cargo test -p agent-sdk --test model_discovery --locked

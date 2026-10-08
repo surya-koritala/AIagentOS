@@ -20,6 +20,8 @@ jobs:
     name: Repeated voter transition (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    env:
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
     strategy:
       fail-fast: false
       matrix:

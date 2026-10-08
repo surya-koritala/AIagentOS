@@ -49,6 +49,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   stop their final actors/controller through the SDK. Relates #392; broader
   independent security/filesystem qualification remains open.
 
+- Check README capability rows and declared documentation statuses against the
+  existing evidence registry, with a complete public Markdown inventory and real
+  CI downgrade rejection. Clarify historical Linux analogies, crate roles and
+  component qualification boundaries. Repository framing changes remain a
+  reviewable proposal; no maturity tier is promoted. Relates #373.
+
 - Added public-wire VFS acceptance proof pairing stale descriptor rejection with
   fresh real reads by the same restored owner, and verifying that authorized COW
   cloning inherits no live tool/workspace/memory/KV/IPC handles or attenuated

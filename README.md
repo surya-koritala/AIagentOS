@@ -443,23 +443,55 @@ source. Standalone supporting modules are classified individually in the
 [secondary-capability disposition](docs/SECONDARY_CAPABILITIES.md); their mere
 presence in the Rust crate is not a v1 support claim.
 
-| Linux | AI Agent OS | Status |
-|-------|-------------|--------|
-| Capabilities | Validated declarations plus gate checks on every public tool path | Public-API E2E — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
-| SELinux / AppArmor | `MacEngine` and declarative policy | Public-API E2E — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
-| cgroups | Token and agent-count accounting/limits | Integrated — [#109](https://github.com/surya-koritala/AIagentOS/issues/109) |
-| `task_struct` | `AgentStruct` (Uuid + u64 PID translation) | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| Signals (SIGKILL, SIGSTOP) | Agent signal/state primitives | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| Unix sockets / IPC | Messaging, delegation, and discovery | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| systemd | Validated service files, dependencies, durable health/restart supervision, and rolling reload | Production-qualified — [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
-| syscall interface | Versioned JSON wire protocol; numbered table explicitly experimental | Public-API E2E — [#116](https://github.com/surya-koritala/AIagentOS/issues/116) |
-| `fork()/clone()` | `agent_clone(flags)` primitive | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| CFS-inspired scheduler | Cooperative weighted turn/provider admission, bounded aging, priority inheritance, and metrics | Production-qualified — [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |
-| Context pressure (not virtual memory) | Hierarchical active-prompt admission, durable-byte quotas, verified/retained spills, explicit backpressure | Production-qualified — [#115](https://github.com/surya-koritala/AIagentOS/issues/115) |
-| Namespaces | Tool and IPC visibility primitives | Unit-tested — [#107](https://github.com/surya-koritala/AIagentOS/issues/107) |
-| VFS + mount | Experimental descriptor/mount prototypes, excluded from v1 | Scaffolded — [ADR 0001](docs/ADR-0001-PUBLIC-ABI.md) |
-| `/proc` + sysctl analogue | Remote tenant-safe typed snapshot, scoped gate/package views, and durable audited tunables | Production-qualified — [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
-| apt/rpm | Signed data archives, tenant trust/revocation, semver lockfiles, durable registry, and transactional install/upgrade/rollback/remove | Production-qualified engineering path — [#119](https://github.com/surya-koritala/AIagentOS/issues/119) |
+<!-- capability-status:start -->
+| Capability | Recorded evidence tier | Qualification owner |
+|---|---|---|
+| <!-- capability-claim: durable-agent-cloning=public-api-e2e -->[Durable copy-on-write execution branches](https://github.com/surya-koritala/AIagentOS/issues/393) | Public-API E2E | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: rust-coding-userland=integrated -->[Bounded repository maintenance with speculative execution branches](https://github.com/surya-koritala/AIagentOS/issues/394) | Integrated | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: claim-integrity=public-api-e2e -->[Capability claim integrity](https://github.com/surya-koritala/AIagentOS/issues/106) | Public-API E2E | [#105](https://github.com/surya-koritala/AIagentOS/issues/105) |
+| <!-- capability-claim: tenant-authorization=public-api-e2e -->[Tenant ownership and RBAC](https://github.com/surya-koritala/AIagentOS/issues/107) | Public-API E2E | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: tool-governance=public-api-e2e -->[Tool capability, MAC, and policy enforcement](https://github.com/surya-koritala/AIagentOS/issues/108) | Public-API E2E | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: resource-accounting=integrated -->[Resource accounting, quotas, and pricing](https://github.com/surya-koritala/AIagentOS/issues/109) | Integrated | [#125](https://github.com/surya-koritala/AIagentOS/issues/125) |
+| <!-- capability-claim: quality-gates=production-qualified -->[Cross-platform CI and release gates](https://github.com/surya-koritala/AIagentOS/issues/110) | Production-qualified | [#110](https://github.com/surya-koritala/AIagentOS/issues/110) |
+| <!-- capability-claim: sandbox-isolation=public-api-e2e -->[Agent sandbox policy and capability-mediated I/O](https://github.com/surya-koritala/AIagentOS/issues/111) | Public-API E2E | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: agent-lifecycle=production-qualified -->[Coordinated agent lifecycle and cleanup](https://github.com/surya-koritala/AIagentOS/issues/112) | Production-qualified | [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
+| <!-- capability-claim: turn-checkpoints=production-qualified -->[Durable mid-generation pause and resume](https://github.com/surya-koritala/AIagentOS/issues/113) | Production-qualified | [#113](https://github.com/surya-koritala/AIagentOS/issues/113) |
+| <!-- capability-claim: scheduling-admission=production-qualified -->[Scheduling and resource admission](https://github.com/surya-koritala/AIagentOS/issues/114) | Production-qualified | [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |
+| <!-- capability-claim: context-pressure=production-qualified -->[Durable context spill and pressure handling](https://github.com/surya-koritala/AIagentOS/issues/115) | Production-qualified | [#115](https://github.com/surya-koritala/AIagentOS/issues/115) |
+| <!-- capability-claim: syscall-vfs=production-qualified -->[Coherent public syscall ABI; experimental VFS disposition](https://github.com/surya-koritala/AIagentOS/issues/116) | Production-qualified | [#116](https://github.com/surya-koritala/AIagentOS/issues/116) |
+| <!-- capability-claim: operator-control=production-qualified -->[Live authenticated operator control and introspection](https://github.com/surya-koritala/AIagentOS/issues/117) | Production-qualified | [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
+| <!-- capability-claim: init-supervisor=production-qualified -->[Durable init and service supervision](https://github.com/surya-koritala/AIagentOS/issues/118) | Production-qualified | [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
+| <!-- capability-claim: package-trust=production-qualified -->[Signed package supply chain and durable registry](https://github.com/surya-koritala/AIagentOS/issues/119) | Production-qualified | [#119](https://github.com/surya-koritala/AIagentOS/issues/119) |
+| <!-- capability-claim: llm-memory-backends=public-api-e2e -->[LLM adapters, model registry, and retrieval memory](https://github.com/surya-koritala/AIagentOS/issues/120) | Public-API E2E | [#120](https://github.com/surya-koritala/AIagentOS/issues/120) |
+| <!-- capability-claim: wire-protocol=public-api-e2e -->[Versioned wire protocol, Rust SDK, and MCP](https://github.com/surya-koritala/AIagentOS/issues/121) | Public-API E2E | [#125](https://github.com/surya-koritala/AIagentOS/issues/125) |
+| <!-- capability-claim: distributed-control-plane=integrated -->[Distributed ownership, consistency, and trust](https://github.com/surya-koritala/AIagentOS/issues/122) | Integrated | [#122](https://github.com/surya-koritala/AIagentOS/issues/122) |
+| <!-- capability-claim: durable-state=integrated -->[Durability, migrations, backup, restore, and deletion](https://github.com/surya-koritala/AIagentOS/issues/123) | Integrated | [#123](https://github.com/surya-koritala/AIagentOS/issues/123) |
+| <!-- capability-claim: resource-providers=integrated -->[Filesystem, network, application, browser, and peripheral providers](https://github.com/surya-koritala/AIagentOS/issues/124) | Integrated | [#124](https://github.com/surya-koritala/AIagentOS/issues/124) |
+| <!-- capability-claim: production-operations=unit-tested -->[SLOs, tracing, alerting, load, and chaos qualification](https://github.com/surya-koritala/AIagentOS/issues/125) | Unit-tested | [#125](https://github.com/surya-koritala/AIagentOS/issues/125) |
+| <!-- capability-claim: operator-clients=integrated -->[CLI, TUI, and desktop operator clients](https://github.com/surya-koritala/AIagentOS/issues/126) | Integrated | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: secondary-modules=unit-tested -->[Secondary modules and integrations](https://github.com/surya-koritala/AIagentOS/issues/128) | Unit-tested | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: release-governance=scaffolded -->[Independent security review and v1 release governance](https://github.com/surya-koritala/AIagentOS/issues/127) | Scaffolded | [#127](https://github.com/surya-koritala/AIagentOS/issues/127) |
+| <!-- capability-claim: tool-vfs=integrated -->[Agent-owned governed VFS handles](https://github.com/surya-koritala/AIagentOS/issues/392) | Integrated | [#392](https://github.com/surya-koritala/AIagentOS/issues/392) |
+<!-- capability-status:end -->
+
+The recorded tiers qualify the listed capability contracts, with the registry's
+platform limits and exclusions. They do not qualify the whole product or its
+public installers. The status block is checked row by row in CI; a registry
+change requires the corresponding documentation edit.
+
+Linux names below are analogies for the host user-space runtime:
+
+| Linux concept | Agent-runtime object or operation |
+|---|---|
+| Processes and signals | Agent lifecycle, cooperative turns and cancellation |
+| CFS | Weighted turn/provider admission, aging and priority inheritance |
+| Virtual memory | Prompt limits, durable context spills and backpressure |
+| Namespaces | Tenant, tool, mount and IPC visibility controls |
+| File descriptors and mounts | Ephemeral governed tool/workspace/memory/KV/IPC handles |
+| fork/clone | Authorized copy-on-write execution history with private live resources |
+| /proc and sysctl | Typed remote snapshots and revision-bound operator tunables |
+| systemd | Durable service supervision through the agent runtime |
+| apt/rpm | Signed data packages and transactional registry operations |
 
 ## How enforcement works in practice
 
@@ -610,14 +642,14 @@ contract](docs/PROVIDERS.md).
 |----------|--------|
 | Azure OpenAI | Fixture-qualified native SSE, tools, usage, typed errors; protected live evidence not yet run |
 | OpenAI | Fixture-qualified text/tools/usage, configured model, typed errors; protected live evidence not yet run |
-| Anthropic (Claude) | Fixture-qualified text/tools/usage, configured model, typed errors; protected live evidence not yet run |
-| Gemini | Fixture-qualified text/usage; native tools unsupported; protected live evidence not yet run |
+| Anthropic (Claude) | Fixture-qualified native Messages SSE, tools, usage and signed thinking replay; protected live evidence not yet run |
+| Gemini | Fixture-qualified native SSE, JSON-schema tools, usage and thought-signature replay; protected live evidence not yet run |
 | Groq | Fixture-qualified text/tools/usage; protected live evidence not yet run |
 | DeepSeek | Fixture-qualified text/tools/usage; protected live evidence not yet run |
-| Hugging Face | Fixture-qualified text; native tools and provider usage unsupported; protected live evidence not yet run |
+| Hugging Face | Fixture-qualified explicit chat-router tools/usage/SSE; legacy completions retain the governed shim; protected live evidence not yet run |
 | vLLM | Fixture-qualified OpenAI-compatible text/tools/usage; protected endpoint evidence not yet run |
-| Local (Ollama) | Fixture-qualified text/usage with explicit local-to-cloud failover protection; protected endpoint evidence not yet run |
-| On-device Candle/GGUF | CPU-only quantized Llama-family path with template, size, context, cancellation, and failure checks; provisioned real-model evidence not yet run |
+| Local (Ollama) | Fixture-qualified bounded native NDJSON and usage with explicit local-to-cloud failover protection; protected endpoint evidence not yet run |
+| On-device Candle/GGUF | CPU-only quantized path with bounded token progress, template/context checks and cancellable workers; provisioned real-model parity evidence not yet run |
 
 ## Contributing
 

@@ -1,5 +1,6 @@
 [package]
 name = "adapters"
+description = "LLM provider adapters and bounded streaming protocols for the governed AIagentOS runtime; live qualification remains provider-specific."
 version = "0.4.0-rc.1"
 edition = "2021"
 license.workspace = true

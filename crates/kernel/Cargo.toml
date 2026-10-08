@@ -1,5 +1,6 @@
 [package]
 name = "kernel"
+description = "Governed user-space agent runtime and control plane with lifecycle, durable state, quotas and tool authorization."
 version = "0.4.0-rc.1"
 edition = "2021"
 license.workspace = true

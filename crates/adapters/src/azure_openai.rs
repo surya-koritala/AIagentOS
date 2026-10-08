@@ -16,6 +16,7 @@ pub struct AzureOpenAiAdapter {
     endpoint: String,
     /// e.g. "gpt-4o"
     deployment: String,
+    image_profile: Option<ImageInputProfile>,
     /// e.g. "2024-08-01-preview"
     api_version: String,
 }
@@ -25,11 +26,17 @@ impl AzureOpenAiAdapter {
         Self {
             id: "azure-openai".to_string(),
             client: reqwest::Client::new(),
+            image_profile: None,
             api_key,
             endpoint,
             deployment,
             api_version: "2024-08-01-preview".to_string(),
         }
+    }
+
+    pub fn with_image_input_profile(mut self, profile: ImageInputProfile) -> Self {
+        self.image_profile = Some(profile);
+        self
     }
 
     pub fn with_api_version(mut self, version: String) -> Self {
@@ -50,6 +57,7 @@ impl AzureOpenAiAdapter {
 struct AzureSession {
     provider_id: ProviderId,
     model_id: String,
+    image_profile: Option<ImageInputProfile>,
     client: reqwest::Client,
     api_key: String,
     chat_url: String,
@@ -72,6 +80,10 @@ impl AzureSession {
 
 #[async_trait::async_trait]
 impl LlmSession for AzureSession {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.provider_id, &self.model_id, self.image_profile.as_ref(), messages)
+    }
+
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
         self.send_with_tools(messages, &[]).await
     }
@@ -91,11 +103,12 @@ impl LlmSession for AzureSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let msgs: Vec<serde_json::Value> =
             messages
                 .iter()
                 .map(|m| {
-                    let mut obj = serde_json::json!({"role": m.role, "content": m.content});
+                    let mut obj = serde_json::json!({"role": m.role, "content": crate::vision::openai_content(&m.content)});
                     if let Some(ref id) = m.tool_call_id {
                         obj["tool_call_id"] = serde_json::json!(id);
                     }
@@ -215,6 +228,7 @@ impl LlmSession for AzureSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         crate::streaming::send_openai_stream_controlled(
             &self.provider_id,
             self.streaming_request(&messages, tools, options),
@@ -233,6 +247,7 @@ impl LlmSession for AzureSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         crate::streaming::send_openai_stream_controlled(
             &self.provider_id,
             self.streaming_request(&messages, tools, options),
@@ -258,6 +273,11 @@ impl LlmSession for AzureSession {
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for AzureOpenAiAdapter {
+    fn image_input_profile(&self) -> Option<&ImageInputProfile> { self.image_profile.as_ref() }
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.id, &self.deployment, self.image_profile.as_ref(), messages)
+    }
+
     fn id(&self) -> &ProviderId {
         &self.id
     }
@@ -269,6 +289,7 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            vision: self.image_profile.is_some(),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
@@ -287,6 +308,7 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
         Ok(Box::new(AzureSession {
             provider_id: self.id.clone(),
             model_id: self.deployment.clone(),
+            image_profile: self.image_profile.clone(),
             client: self.client.clone(),
             api_key: self.api_key.clone(),
             chat_url: self.chat_url(),
@@ -304,7 +326,7 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
-                .to_string(),
+                .into(),
             tool_call_id: None,
             tool_calls: None,
             provider_metadata: None,

@@ -120,6 +120,7 @@ impl LlmSession for HuggingFaceSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         validate_provider_history(&messages, &self.provider_id, &self.model)?;
         if self.chat_completions {
             let response = self
@@ -220,6 +221,7 @@ impl LlmSession for HuggingFaceSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         if !self.chat_completions {
             return self
                 .send_controlled(messages, tools, options, cancellation)
@@ -244,6 +246,7 @@ impl LlmSession for HuggingFaceSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         if !self.chat_completions {
             let response = self
                 .send_controlled(messages, tools, options, cancellation)
@@ -357,7 +360,7 @@ impl LlmProviderAdapter for HuggingFaceAdapter {
                 .ok()?;
                 return Some(StandardMessage {
                     role: role.into(),
-                    content: response.content,
+                    content: response.content.into(),
                     tool_call_id: None,
                     tool_calls: (!response.tool_calls.is_empty()).then_some(response.tool_calls),
                     provider_metadata: None,
@@ -386,7 +389,7 @@ impl LlmProviderAdapter for HuggingFaceAdapter {
                 .or_else(|| value.get("content"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
-                .to_string(),
+                .into(),
             tool_call_id: None,
             tool_calls: None,
         })

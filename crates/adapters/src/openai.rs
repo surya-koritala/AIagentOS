@@ -9,6 +9,7 @@ pub struct OpenAiAdapter {
     api_key: String,
     base_url: String,
     model: String,
+    image_profile: Option<kernel::connector::ImageInputProfile>,
 }
 
 impl OpenAiAdapter {
@@ -16,10 +17,17 @@ impl OpenAiAdapter {
         Self {
             id: "openai".to_string(),
             client: reqwest::Client::new(),
+            image_profile: None,
             api_key,
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4".to_string(),
         }
+    }
+
+    /// Declare a conservative image-token bound for the exact selected model.
+    pub fn with_image_input_profile(mut self, profile: kernel::connector::ImageInputProfile) -> Self {
+        self.image_profile = Some(profile);
+        self
     }
 
     pub fn with_base_url(mut self, url: String) -> Self {
@@ -39,6 +47,7 @@ struct OpenAiSession {
     api_key: String,
     base_url: String,
     model: String,
+    image_profile: Option<kernel::connector::ImageInputProfile>,
 }
 
 impl OpenAiSession {
@@ -67,6 +76,10 @@ impl OpenAiSession {
 
 #[async_trait::async_trait]
 impl LlmSession for OpenAiSession {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.provider_id, &self.model, self.image_profile.as_ref(), messages)
+    }
+
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
         self.send_with_tools(messages, &[]).await
     }
@@ -86,6 +99,7 @@ impl LlmSession for OpenAiSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let body = crate::openai_chat::request(&messages, tools, options, Some(&self.model));
 
         let result = self
@@ -132,6 +146,7 @@ impl LlmSession for OpenAiSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         crate::streaming::send_openai_stream_controlled(
             &self.provider_id,
             self.streaming_request(&messages, tools, options),
@@ -150,6 +165,7 @@ impl LlmSession for OpenAiSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         crate::streaming::send_openai_stream_controlled(
             &self.provider_id,
             self.streaming_request(&messages, tools, options),
@@ -175,6 +191,11 @@ impl LlmSession for OpenAiSession {
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for OpenAiAdapter {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.id, &self.model, self.image_profile.as_ref(), messages)
+    }
+    fn image_input_profile(&self) -> Option<&kernel::connector::ImageInputProfile> { self.image_profile.as_ref() }
+
     fn id(&self) -> &ProviderId {
         &self.id
     }
@@ -186,6 +207,7 @@ impl LlmProviderAdapter for OpenAiAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            vision: self.image_profile.is_some(),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
@@ -209,6 +231,7 @@ impl LlmProviderAdapter for OpenAiAdapter {
         Ok(Box::new(OpenAiSession {
             provider_id: self.id.clone(),
             client: self.client.clone(),
+            image_profile: self.image_profile.clone(),
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             model: self.model.clone(),
@@ -223,7 +246,7 @@ impl LlmProviderAdapter for OpenAiAdapter {
         Some(StandardMessage {
             provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
-            content: value.get("content")?.as_str().unwrap_or("").to_string(),
+            content: value.get("content")?.as_str().unwrap_or("").into(),
             tool_call_id: None,
             tool_calls: None,
         })

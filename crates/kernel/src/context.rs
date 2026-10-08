@@ -4352,7 +4352,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let text_content: String = tail_messages
             .iter()
-            .map(|m| m.content.as_str())
+            .map(|m| m.content.text_projection())
             .collect::<Vec<_>>()
             .join(" ");
         transaction.execute(
@@ -11619,7 +11619,7 @@ mod tests {
                     context
                         .conversation_history
                         .first()
-                        .map(|message| message.content.as_str()),
+                        .map(|message| message.content.legacy_text().expect("legacy fixture text")),
                     Some(fixture.context_marker.as_str()),
                     "{} context was not retained",
                     fixture.tag

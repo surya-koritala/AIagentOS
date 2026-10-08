@@ -44,8 +44,11 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("AZURE_OPENAI_API_VERSION").ok())
                 .unwrap_or_else(|| "2024-08-01-preview".into());
             if !key.is_empty() {
-                let adapter =
+                let mut adapter =
                     AzureOpenAiAdapter::new(endpoint, deployment, key).with_api_version(version);
+                if let Some(profile) = config.image_input_profiles.get(&config.llm_provider) {
+                    adapter = adapter.with_image_input_profile(profile.clone());
+                }
                 register_and_report(kernel, adapter);
             }
         }
@@ -55,7 +58,10 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .map(|s| s.to_string())
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             {
-                let adapter = OpenAiAdapter::new(key).with_model(config.default_model.clone());
+                let mut adapter = OpenAiAdapter::new(key).with_model(config.default_model.clone());
+                if let Some(profile) = config.image_input_profiles.get(&config.llm_provider) {
+                    adapter = adapter.with_image_input_profile(profile.clone());
+                }
                 register_and_report(kernel, adapter);
             }
         }
@@ -65,7 +71,10 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .map(|s| s.to_string())
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             {
-                let adapter = AnthropicAdapter::new(key).with_model(config.default_model.clone());
+                let mut adapter = AnthropicAdapter::new(key).with_model(config.default_model.clone());
+                if let Some(profile) = config.image_input_profiles.get(&config.llm_provider) {
+                    adapter = adapter.with_image_input_profile(profile.clone());
+                }
                 register_and_report(kernel, adapter);
             }
         }
@@ -105,7 +114,10 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .map(|s| s.to_string())
                 .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             {
-                let adapter = GeminiAdapter::new(key).with_model(config.default_model.clone());
+                let mut adapter = GeminiAdapter::new(key).with_model(config.default_model.clone());
+                if let Some(profile) = config.image_input_profiles.get(&config.llm_provider) {
+                    adapter = adapter.with_image_input_profile(profile.clone());
+                }
                 register_and_report(kernel, adapter);
             }
         }

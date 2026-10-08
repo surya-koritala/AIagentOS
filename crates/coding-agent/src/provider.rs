@@ -113,7 +113,7 @@ impl LlmSession for ProposalSession {
         } else {
             let last = messages
                 .last()
-                .map_or("", |message| message.content.as_str());
+                .map_or_else(String::new, |message| message.content.text_projection());
             let content = if last.contains("candidate=0") {
                 BAD
             } else if last.contains("candidate=1") {

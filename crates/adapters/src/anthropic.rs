@@ -12,6 +12,7 @@ pub struct AnthropicAdapter {
     api_key: String,
     base_url: String,
     model: String,
+    image_profile: Option<kernel::connector::ImageInputProfile>,
 }
 
 impl AnthropicAdapter {
@@ -19,10 +20,17 @@ impl AnthropicAdapter {
         Self {
             id: "anthropic".to_string(),
             client: reqwest::Client::new(),
+            image_profile: None,
             api_key,
             base_url: "https://api.anthropic.com/v1".to_string(),
             model: "claude-3-5-sonnet-20241022".to_string(),
         }
+    }
+
+    /// Declare a conservative image-token bound for the exact selected model.
+    pub fn with_image_input_profile(mut self, profile: kernel::connector::ImageInputProfile) -> Self {
+        self.image_profile = Some(profile);
+        self
     }
 
     pub fn with_base_url(mut self, url: String) -> Self {
@@ -42,6 +50,7 @@ struct AnthropicSession {
     api_key: String,
     base_url: String,
     model: String,
+    image_profile: Option<kernel::connector::ImageInputProfile>,
 }
 
 impl AnthropicSession {
@@ -82,6 +91,10 @@ impl AnthropicSession {
 
 #[async_trait::async_trait]
 impl LlmSession for AnthropicSession {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.provider_id, &self.model, self.image_profile.as_ref(), messages)
+    }
+
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
         self.send_with_tools(messages, &[]).await
     }
@@ -101,6 +114,7 @@ impl LlmSession for AnthropicSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let body = protocol::request(
             &messages,
             tools,
@@ -204,6 +218,7 @@ impl LlmSession for AnthropicSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.stream(messages, tools, options, cancellation, None)
             .await
     }
@@ -216,6 +231,7 @@ impl LlmSession for AnthropicSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.stream(messages, tools, options, cancellation, Some(events))
             .await
     }
@@ -235,6 +251,11 @@ impl LlmSession for AnthropicSession {
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for AnthropicAdapter {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.id, &self.model, self.image_profile.as_ref(), messages)
+    }
+    fn image_input_profile(&self) -> Option<&kernel::connector::ImageInputProfile> { self.image_profile.as_ref() }
+
     fn id(&self) -> &ProviderId {
         &self.id
     }
@@ -246,6 +267,7 @@ impl LlmProviderAdapter for AnthropicAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            vision: self.image_profile.is_some(),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
@@ -264,6 +286,7 @@ impl LlmProviderAdapter for AnthropicAdapter {
         Ok(Box::new(AnthropicSession {
             provider_id: self.id.clone(),
             client: self.client.clone(),
+            image_profile: self.image_profile.clone(),
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             model: self.model.clone(),
@@ -278,7 +301,7 @@ impl LlmProviderAdapter for AnthropicAdapter {
         Some(StandardMessage {
             provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
-            content: value.get("content")?.as_str().unwrap_or("").to_string(),
+            content: value.get("content")?.as_str().unwrap_or("").into(),
             tool_call_id: None,
             tool_calls: None,
         })

@@ -20,6 +20,7 @@ pub struct GeminiAdapter {
     api_key: String,
     base_url: String,
     model: String,
+    image_profile: Option<kernel::connector::ImageInputProfile>,
 }
 
 impl GeminiAdapter {
@@ -27,10 +28,17 @@ impl GeminiAdapter {
         Self {
             id: "gemini".to_string(),
             client: reqwest::Client::new(),
+            image_profile: None,
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
         }
+    }
+
+    /// Declare a conservative image-token bound for the exact selected model.
+    pub fn with_image_input_profile(mut self, profile: kernel::connector::ImageInputProfile) -> Self {
+        self.image_profile = Some(profile);
+        self
     }
 
     pub fn with_base_url(mut self, url: String) -> Self {
@@ -50,6 +58,7 @@ struct GeminiSession {
     api_key: String,
     base_url: String,
     model: String,
+    image_profile: Option<kernel::connector::ImageInputProfile>,
 }
 
 impl GeminiSession {
@@ -89,6 +98,10 @@ impl GeminiSession {
 
 #[async_trait::async_trait]
 impl LlmSession for GeminiSession {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.provider_id, &self.model, self.image_profile.as_ref(), messages)
+    }
+
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
         self.send_with_tools(messages, &[]).await
     }
@@ -108,6 +121,7 @@ impl LlmSession for GeminiSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let mut body = protocol::request(&messages, tools, &self.provider_id, &self.model)?;
         if let Some(max_output_tokens) = options.max_output_tokens {
             body["generationConfig"] = serde_json::json!({
@@ -176,6 +190,7 @@ impl LlmSession for GeminiSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.stream(messages, tools, options, cancellation, None)
             .await
     }
@@ -188,6 +203,7 @@ impl LlmSession for GeminiSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.stream(messages, tools, options, cancellation, Some(events))
             .await
     }
@@ -207,6 +223,11 @@ impl LlmSession for GeminiSession {
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for GeminiAdapter {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::vision::preflight(&self.id, &self.model, self.image_profile.as_ref(), messages)
+    }
+    fn image_input_profile(&self) -> Option<&kernel::connector::ImageInputProfile> { self.image_profile.as_ref() }
+
     fn id(&self) -> &ProviderId {
         &self.id
     }
@@ -219,6 +240,7 @@ impl LlmProviderAdapter for GeminiAdapter {
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
             prompt_cancellation: true,
+            vision: self.image_profile.is_some(),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
@@ -242,6 +264,7 @@ impl LlmProviderAdapter for GeminiAdapter {
         Ok(Box::new(GeminiSession {
             provider_id: self.id.clone(),
             client: self.client.clone(),
+            image_profile: self.image_profile.clone(),
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             model: self.model.clone(),

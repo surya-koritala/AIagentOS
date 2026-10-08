@@ -19,7 +19,7 @@ fn arb_standard_message() -> impl Strategy<Value = StandardMessage> {
         .prop_map(|(role, content)| StandardMessage {
             provider_metadata: None,
             role: role.to_string(),
-            content,
+            content: content.into(),
             tool_call_id: None,
             tool_calls: None,
         })

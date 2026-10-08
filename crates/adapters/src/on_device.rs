@@ -733,6 +733,7 @@ impl LlmSession for OnDeviceSession {
         _tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         self.send_controlled(messages, _tools, options, &cancellation)
             .await
@@ -777,6 +778,7 @@ impl LlmSession for OnDeviceSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.run(messages, options, cancellation, None, true).await
     }
     async fn send_streaming_events_controlled(
@@ -787,6 +789,7 @@ impl LlmSession for OnDeviceSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.run(messages, options, cancellation, Some(events), true)
             .await
     }
@@ -845,7 +848,7 @@ impl LlmProviderAdapter for OnDeviceLlmAdapter {
         Some(StandardMessage {
             provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
-            content: value.get("content")?.as_str().unwrap_or("").to_string(),
+            content: value.get("content")?.as_str().unwrap_or("").into(),
             tool_call_id: None,
             tool_calls: None,
         })

@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       reviewed_utf8_task:
-        description: Confirm the fixed UTF-8 source/test task has been reviewed
+        description: Confirm the fixed UTF-8 task and all three strategies (up to two attempts each) have been reviewed
         type: boolean
         required: true
       model:
@@ -13,7 +13,7 @@ on:
         type: string
         required: true
       max_usd:
-        description: Authorized configured USD ceiling for this task
+        description: One authorized configured USD ceiling divided equally across all three strategies
         type: string
         required: true
       input_price_per_1k:
@@ -54,12 +54,13 @@ jobs:
           model = os.environ['CODING_MODEL'].strip()
           budget = float(os.environ['CODING_MAX_USD'])
           prices = [float(os.environ[key]) for key in ('CODING_INPUT_PRICE','CODING_OUTPUT_PRICE')]
-          if not model or len(model) > 256 or not math.isfinite(budget) or not 0 < budget <= 100 or any(not math.isfinite(price) or price <= 0 for price in prices):
+          if not model or len(model) > 256 or not math.isfinite(budget) or not 0.000003 <= budget <= 100 or any(not math.isfinite(price) or price <= 0 for price in prices):
               raise SystemExit('invalid reviewed model, budget or configured prices')
           available = bool(os.environ.get('OPENAI_API_KEY','').strip())
           pathlib.Path('target/coding-pilot/plan.json').write_text(json.dumps({
               'status':'planned' if available else 'not_run', 'model':model,
               'authorized_configured_max_usd':budget, 'reviewed_task':'utf8_byte_budget',
+              'strategy_count':3, 'max_attempts_per_strategy':2, 'configured_max_usd_per_strategy':budget/3,
               'provider_api_calls':0, 'production_claim_allowed':False,
               'reason':None if available else 'protected provider credential is not configured'
           },indent=2)+'\n')
@@ -91,16 +92,13 @@ jobs:
         run: |
           docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
           docker pull "$CODING_RUST_IMAGE"
-          cargo build -p coding-agent --bin agent-code --locked
-          mkdir -p "$RUNNER_TEMP/coding-reviewed-source"
-          cp -R fixtures/coding-agent/utf8-budget/. "$RUNNER_TEMP/coding-reviewed-source/"
-          target/debug/agent-code run --repo "$RUNNER_TEMP/coding-reviewed-source" \
-            --manifest target/coding-pilot/task.json --model "$CODING_MODEL" \
+          cargo build -p os-benchmark --bin coding-comparison --locked
+          target/debug/coding-comparison --model "$CODING_MODEL" --max-usd "$CODING_MAX_USD" \
             --input-price-per-1k "$CODING_INPUT_PRICE" --output-price-per-1k "$CODING_OUTPUT_PRICE" \
-            --image "$CODING_RUST_IMAGE" --data-dir "$RUNNER_TEMP/coding-reviewed-job" \
+            --image "$CODING_RUST_IMAGE" \
             > target/coding-pilot/result.json 2> target/coding-pilot/events.jsonl
-          diff -qr fixtures/coding-agent/utf8-budget "$RUNNER_TEMP/coding-reviewed-source"
-          jq -e '.status == "completed" and .original_repository_written == false and any(.branches[]; .test.exit_code == 0 and .test.kind == "isolated_process")' target/coding-pilot/result.json
+          git diff --exit-code -- fixtures/coding-agent/utf8-budget
+          jq -e '.evidence_class == "reviewed_live_comparison" and .status == "completed" and .containment_in_every_strategy == true and (.results | length == 3) and all(.results[]; .completed == true and any(.tests[]; .exit_code == 0 and .kind == "isolated_process"))' target/coding-pilot/result.json
           test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
       - name: Missing provider credentials are not a passing task
         if: steps.plan.outputs.run_live != 'true'

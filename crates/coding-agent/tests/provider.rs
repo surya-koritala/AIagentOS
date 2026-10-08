@@ -1,4 +1,4 @@
-use coding_agent::provider::ProposalProvider;
+use coding_agent::provider::{ProposalProvider, ProviderAudit};
 use kernel::config::TokenPricing;
 use kernel::connector::{LlmProviderAdapter, LlmRequestOptions, StandardMessage};
 use std::sync::Arc;
@@ -37,7 +37,9 @@ async fn response(
     let adapter = adapters::openai::OpenAiAdapter::new("fixture-key".into())
         .with_base_url(server.uri())
         .with_model("coding-contract-model".into());
-    let provider = ProposalProvider::real(Arc::new(adapter), budget(limit));
+    let audit = Arc::new(ProviderAudit::default());
+    let provider =
+        ProposalProvider::real(Arc::new(adapter), budget(limit)).with_audit(audit.clone());
     let session = provider.create_session().await.unwrap();
     let result = session
         .send_with_options(
@@ -49,6 +51,10 @@ async fn response(
             },
         )
         .await;
+    assert_eq!(
+        audit.api_calls(),
+        server.received_requests().await.unwrap().len() as u64
+    );
     (result, server)
 }
 fn reply(content: &str) -> serde_json::Value {

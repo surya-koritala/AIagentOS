@@ -60,7 +60,7 @@ impl TaskSpec {
             || !(32..=4096).contains(&self.max_steps)
             || !(30..=1800).contains(&self.deadline_seconds)
             || !self.max_usd.is_finite()
-            || self.max_usd <= 0.0
+            || self.max_usd < 0.000001
             || self.max_usd > 100.0
             || !(64..=8192).contains(&self.max_output_tokens)
             || self.test_target.is_empty()

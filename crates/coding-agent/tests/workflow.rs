@@ -280,6 +280,15 @@ fn proposals_cannot_change_tests_credentials_dependencies_or_unknown_files() {
     assert!(wrong.validate(&task, &files()).is_err());
 }
 
+#[test]
+fn a_budget_that_rounds_to_the_unlimited_sentinel_is_rejected() {
+    let mut task = spec();
+    task.max_usd = 0.000000001;
+    assert!(task.validate().is_err());
+    task.max_usd = 0.000001;
+    task.validate().unwrap();
+}
+
 #[tokio::test]
 async fn managed_application_bootstrap_never_claims_the_supplied_operator_directory() {
     let original = std::env::temp_dir().join(format!("coding-original-{}", Uuid::new_v4()));

@@ -137,3 +137,18 @@ help before running the isolated task and two fresh-process resumes. Candidate
 artifacts are downloadable from that workflow's run. They remain development
 candidates; this check does not replace signed-release publication or the
 independent qualification gates.
+
+For a reviewed live comparison, `coding-comparison` additionally requires
+`--model`, `--max-usd`, `--input-price-per-1k` and `--output-price-per-1k`, with
+the operator's `OPENAI_API_KEY` environment credential. The single configured
+campaign ceiling is divided equally among all three strategies. The kernel
+accounts governed charges; the direct contained baseline retains the same
+proposal admission guard and explicitly records returned usage. Upstream
+attempts are counted. An uncertain direct outcome preserves unknown total cost
+instead of reporting it as zero. Live outcomes may differ and remain recorded;
+the fixture's identical-output assertion is not applied to real-model quality.
+
+The reviewed pilot is manual only and uses the protected `provider-qualification`
+environment. Its review checkbox covers the fixed task and three strategies,
+each with up to two attempts. Missing credentials are retained as `not_run` and
+fail the live-task gate. No scheduled or PR workflow can initiate those paid runs.

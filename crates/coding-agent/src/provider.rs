@@ -7,7 +7,18 @@ use kernel::connector::{
     ProviderType, StandardMessage, ToolDefinition,
 };
 use kernel::ConnectorError;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+#[derive(Default)]
+pub struct ProviderAudit {
+    calls: AtomicU64,
+}
+impl ProviderAudit {
+    pub fn api_calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
 
 const BAD: &str =
     include_str!("../../../fixtures/coding-agent/utf8-budget/bad-character-budget.json");
@@ -18,6 +29,7 @@ pub struct ProposalProvider {
     id: String,
     inner: Option<Arc<dyn LlmProviderAdapter>>,
     budget: Option<Arc<kernel::budget::BudgetEnforcer>>,
+    audit: Arc<ProviderAudit>,
 }
 impl ProposalProvider {
     pub fn fixture() -> Self {
@@ -25,6 +37,7 @@ impl ProposalProvider {
             id: "coding".into(),
             inner: None,
             budget: None,
+            audit: Arc::new(ProviderAudit::default()),
         }
     }
     pub fn real(
@@ -35,13 +48,19 @@ impl ProposalProvider {
             id: "coding".into(),
             inner: Some(adapter),
             budget: Some(budget),
+            audit: Arc::new(ProviderAudit::default()),
         }
+    }
+    pub fn with_audit(mut self, audit: Arc<ProviderAudit>) -> Self {
+        self.audit = audit;
+        self
     }
 }
 struct ProposalSession {
     id: String,
     inner: Option<Box<dyn LlmSession>>,
     budget: Option<Arc<kernel::budget::BudgetEnforcer>>,
+    audit: Arc<ProviderAudit>,
 }
 
 #[async_trait]
@@ -89,6 +108,7 @@ impl LlmSession for ProposalSession {
             }
             // The upstream receives no executable tool declarations. Reject
             // native calls as well as text-shim calls before executor parsing.
+            self.audit.calls.fetch_add(1, Ordering::Relaxed);
             inner.send_with_options(messages, &[], options).await?
         } else {
             let last = messages
@@ -183,6 +203,7 @@ impl LlmProviderAdapter for ProposalProvider {
             id: self.id.clone(),
             inner,
             budget: self.budget.clone(),
+            audit: self.audit.clone(),
         }))
     }
     fn capabilities(&self) -> ProviderCapabilities {

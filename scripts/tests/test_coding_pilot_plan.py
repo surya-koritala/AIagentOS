@@ -45,11 +45,19 @@ class CodingPilotPlanTests(unittest.TestCase):
         self.assertFalse(plan['production_claim_allowed'])
 
     def test_invalid_reviewed_bounds_fail_before_a_plan_is_published(self):
-        for values in [{'CODING_MAX_USD':'nan'}, {'CODING_MAX_USD':'0'}, {'CODING_MAX_USD':'101'}, {'CODING_MODEL':''}, {'CODING_INPUT_PRICE':'-1'}]:
+        for values in [{'CODING_MAX_USD':'nan'}, {'CODING_MAX_USD':'0'}, {'CODING_MAX_USD':'0.000000001'}, {'CODING_MAX_USD':'101'}, {'CODING_MODEL':''}, {'CODING_INPUT_PRICE':'-1'}]:
             with self.subTest(values=values):
                 result, plan = self.plan(values)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIsNone(plan)
+
+    def test_one_authorized_ceiling_is_partitioned_across_the_entire_comparison(self):
+        result, plan = self.plan({'OPENAI_API_KEY':'fixture-key','CODING_MAX_USD':'3'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(plan['authorized_configured_max_usd'], 3)
+        self.assertEqual(plan['configured_max_usd_per_strategy'], 1)
+        self.assertEqual(plan['strategy_count'], 3)
+        self.assertEqual(plan['max_attempts_per_strategy'], 2)
 
 
 if __name__ == '__main__':

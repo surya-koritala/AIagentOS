@@ -167,7 +167,7 @@ impl SqliteContextManager {
     pub(super) fn cached_query_memory(
         &self,
         agent: AgentId,
-        query: &str,
+        query_vector: &[f32],
     ) -> Result<Vec<Fact>, ContextError> {
         let mut conn = self.locked_conn();
         let transaction = conn
@@ -189,6 +189,10 @@ impl SqliteContextManager {
             {
                 cache.remove(agent);
                 let facts = self.load_index_facts(&transaction, agent, None)?;
+                if generation(&transaction, agent)? != current_generation {
+                    let tenant = Self::agent_tenant_locked(&transaction, agent)?;
+                    self.enforce_context_storage_locked(&transaction, agent, &tenant, 0, 0)?;
+                }
                 #[cfg(test)]
                 {
                     cache.warm_rows += facts.len();
@@ -234,8 +238,7 @@ impl SqliteContextManager {
                 None => cache.agents.get_mut(&agent).expect("published cache entry"),
             };
             entry.used = serial;
-            let vector = self.embedder.embed(query);
-            let hits = entry.index.search_with_tiebreak(&vector, 16, &|a, b| {
+            let hits = entry.index.search_with_tiebreak(query_vector, 16, &|a, b| {
                 let a = &entry.facts[a as usize];
                 let b = &entry.facts[b as usize];
                 b.fact
@@ -266,6 +269,124 @@ impl SqliteContextManager {
             cache.remove(agent);
         }
         outcome
+    }
+
+    /// Network-only work can outlive an abandoned async request; database work
+    /// stays on the owning request after revision verification, never on a
+    /// detached blocking task. Warm caches skip this entire scan.
+    pub(super) async fn prepare_remote_embeddings(
+        &self,
+        agent: AgentId,
+    ) -> Result<(), ContextError> {
+        let (captured, pending) = {
+            let conn = self.locked_conn();
+            let captured = generation(&conn, agent)?;
+            if self
+                .fact_cache
+                .lock()
+                .map_err(|_| failed("fact cache lock poisoned"))?
+                .agents
+                .get(&agent)
+                .is_some_and(|entry| entry.generation == captured)
+            {
+                return Ok(());
+            }
+            let mut statement=conn.prepare("SELECT id,content,embedding_model,embedding_version,embedding_dim,content_hash,embedding_blob,embedding_json FROM facts WHERE agent_id=?1 ORDER BY rowid").map_err(failed)?;
+            let rows = statement
+                .query_map([agent.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })
+                .map_err(failed)?;
+            let mut pending = Vec::new();
+            let mut old_bytes = 0_u64;
+            for row in rows {
+                let (id, content, model, version, dim, stored_hash, blob, legacy) =
+                    row.map_err(failed)?;
+                let valid = model == self.embedder.model_id()
+                    && version == i64::from(self.embedder.version())
+                    && dim == self.embedder.dim() as i64
+                    && stored_hash == memory_content_hash(&content)
+                    && legacy.is_none()
+                    && blob
+                        .as_deref()
+                        .and_then(decode)
+                        .is_some_and(|vector| vector.len() == self.embedder.dim());
+                if !valid {
+                    old_bytes = old_bytes
+                        .saturating_add(blob.as_ref().map_or(0, |blob| blob.len()) as u64)
+                        .saturating_add(legacy.as_ref().map_or(0, |json| json.len()) as u64);
+                    pending.push((id, content));
+                }
+            }
+            if !pending.is_empty() {
+                let tenant = Self::agent_tenant_locked(&conn, agent)?;
+                let new_bytes = pending
+                    .len()
+                    .saturating_mul(8 + self.embedder.dim().saturating_mul(4))
+                    as u64;
+                self.enforce_context_storage_locked(&conn, agent, &tenant, new_bytes, old_bytes)?;
+            }
+            (captured, pending)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut repaired = Vec::with_capacity(pending.len());
+        for batch in pending.chunks(32) {
+            let embedder = Arc::clone(&self.embedder);
+            let texts = batch
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>();
+            let vectors = tokio::task::spawn_blocking(move || {
+                let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+                embedder.embed_batch(&refs)
+            })
+            .await
+            .map_err(|_| crate::memory_manager::EmbeddingError::Transport)??;
+            if vectors.len() != batch.len() {
+                return Err(crate::memory_manager::EmbeddingError::InvalidResponse(
+                    "batch count mismatch",
+                )
+                .into());
+            }
+            for ((id, content), vector) in batch.iter().zip(vectors) {
+                if vector.len() != self.embedder.dim() {
+                    return Err(crate::memory_manager::EmbeddingError::InvalidResponse(
+                        "dimension mismatch",
+                    )
+                    .into());
+                }
+                repaired.push((id.clone(), memory_content_hash(content), encode(&vector)?));
+            }
+        }
+        let mut conn = self.locked_conn();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        if generation(&transaction, agent)? != captured {
+            return Err(crate::memory_manager::EmbeddingError::StoreChanged.into());
+        }
+        for (id, content_hash, blob) in repaired {
+            transaction.execute("UPDATE facts SET embedding_blob=?1,embedding_json=NULL,embedding_model=?2,embedding_version=?3,embedding_dim=?4,content_hash=?5 WHERE id=?6 AND agent_id=?7",params![blob,self.embedder.model_id(),self.embedder.version(),self.embedder.dim() as i64,content_hash,id,agent.to_string()]).map_err(failed)?;
+        }
+        let tenant = Self::agent_tenant_locked(&transaction, agent)?;
+        self.enforce_context_storage_locked(&transaction, agent, &tenant, 0, 0)?;
+        transaction.commit().map_err(failed)?;
+        self.fact_cache
+            .lock()
+            .map_err(|_| failed("fact cache lock poisoned"))?
+            .remove(agent);
+        Ok(())
     }
 
     /// Reconcile a normal committed-intent write while the store transaction
@@ -394,13 +515,7 @@ impl SqliteContextManager {
                 && vector
                     .as_ref()
                     .is_some_and(|vector| vector.len() == self.embedder.dim());
-            let embedding = if valid {
-                vector.expect("validated vector")
-            } else {
-                let rebuilt = self.embedder.embed(&content);
-                conn.execute("UPDATE facts SET embedding_blob=?1,embedding_json=NULL,embedding_model=?2,embedding_version=?3,embedding_dim=?4,content_hash=?5 WHERE id=?6 AND agent_id=?7",params![encode(&rebuilt)?,self.embedder.model_id(),self.embedder.version(),self.embedder.dim() as i64,expected_hash,id,agent.to_string()]).map_err(failed)?;
-                rebuilt
-            };
+            let embedding = if valid { vector } else { None };
             facts.push(IndexedFact {
                 row_id,
                 fact: Fact {
@@ -413,9 +528,42 @@ impl SqliteContextManager {
                     last_accessed_at: DateTime::parse_from_rfc3339(&accessed)
                         .map_err(failed)?
                         .with_timezone(&Utc),
-                    embedding: Some(embedding),
+                    embedding,
                 },
             });
+        }
+        drop(statement);
+        let pending = facts
+            .iter()
+            .enumerate()
+            .filter_map(|(position, indexed)| indexed.fact.embedding.is_none().then_some(position))
+            .collect::<Vec<_>>();
+        if self.embedder.is_remote() && !pending.is_empty() {
+            return Err(crate::memory_manager::EmbeddingError::StoreChanged.into());
+        }
+        for batch in pending.chunks(32) {
+            let texts = batch
+                .iter()
+                .map(|position| facts[*position].fact.content.as_str())
+                .collect::<Vec<_>>();
+            let vectors = self.embedder.embed_batch(&texts)?;
+            if vectors.len() != batch.len() {
+                return Err(crate::memory_manager::EmbeddingError::InvalidResponse(
+                    "batch count mismatch",
+                )
+                .into());
+            }
+            for (&position, vector) in batch.iter().zip(vectors) {
+                if vector.len() != self.embedder.dim() {
+                    return Err(crate::memory_manager::EmbeddingError::InvalidResponse(
+                        "dimension mismatch",
+                    )
+                    .into());
+                }
+                let fact = &mut facts[position].fact;
+                conn.execute("UPDATE facts SET embedding_blob=?1,embedding_json=NULL,embedding_model=?2,embedding_version=?3,embedding_dim=?4,content_hash=?5 WHERE id=?6 AND agent_id=?7",params![encode(&vector)?,self.embedder.model_id(),self.embedder.version(),self.embedder.dim() as i64,memory_content_hash(&fact.content),fact.id.to_string(),agent.to_string()]).map_err(failed)?;
+                fact.embedding = Some(vector);
+            }
         }
         Ok(facts)
     }
@@ -453,7 +601,7 @@ mod tests {
 
     struct CountingEmbedder(Arc<AtomicUsize>);
     impl Embedder for CountingEmbedder {
-        fn embed(&self, text: &str) -> Vec<f32> {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, crate::memory_manager::EmbeddingError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             BlendedEmbedder::default().embed(text)
         }
@@ -580,7 +728,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 result[0].embedding.as_ref().unwrap(),
-                &manager.embedder.embed(&result[0].content)
+                &manager.embedder.embed(&result[0].content).unwrap()
             );
             assert_eq!(manager.fact_cache.lock().unwrap().warm_rows, before + 2);
         }
@@ -662,7 +810,7 @@ mod tests {
                         id % 11
                     ),
                 );
-                fact.embedding = Some(embedder.embed(&fact.content));
+                fact.embedding = Some(embedder.embed(&fact.content).unwrap());
                 conn.execute(
                     "INSERT INTO facts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
@@ -717,7 +865,7 @@ mod tests {
                     .then_with(|| a.id.cmp(&b.id))
             });
             let expected = crate::memory_manager::rank_topk(
-                &manager.embedder.embed(query),
+                &manager.embedder.embed(query).unwrap(),
                 oracle
                     .iter()
                     .map(|f| (f.id, f.embedding.clone().unwrap()))
@@ -839,10 +987,13 @@ mod tests {
             }
             conn.execute(
                 "UPDATE facts SET embedding_json=?1",
-                [
-                    serde_json::to_string(&manager.embedder.embed("schema nine preserved content"))
+                [serde_json::to_string(
+                    &manager
+                        .embedder
+                        .embed("schema nine preserved content")
                         .unwrap(),
-                ],
+                )
+                .unwrap()],
             )
             .unwrap();
             conn.execute_batch("DROP TABLE fact_index_generations; ALTER TABLE facts DROP COLUMN embedding_blob; DELETE FROM schema_migrations WHERE version=10; UPDATE storage_meta SET schema_version=9,min_reader_schema_version=9; PRAGMA user_version=9;").unwrap();
@@ -1024,7 +1175,7 @@ mod tests {
         assert_eq!(result[0].content, "original");
         assert_eq!(
             result[0].embedding.as_ref().unwrap(),
-            &manager.embedder.embed("original")
+            &manager.embedder.embed("original").unwrap()
         );
     }
 
@@ -1032,7 +1183,10 @@ mod tests {
     async fn fact_replacements_and_updates_enforce_utf8_logical_byte_limits() {
         let manager = SqliteContextManager::in_memory().unwrap();
         let owner = uuid::Uuid::new_v4();
-        let limit = encode(&manager.embedder.embed("seed")).unwrap().len() as u64 + 4;
+        let limit = encode(&manager.embedder.embed("seed").unwrap())
+            .unwrap()
+            .len() as u64
+            + 4;
         manager
             .set_context_storage_limits(ContextStorageLimits {
                 per_agent_bytes: limit,

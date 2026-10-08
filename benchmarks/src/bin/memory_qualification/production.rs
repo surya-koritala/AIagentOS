@@ -127,7 +127,7 @@ fn prepare(path: &Path, items: usize) -> Result<BruteForceIndex, String> {
         let mut statement=tx.prepare("INSERT INTO facts(id,agent_id,content,category,created_at,last_accessed_at,embedding_json,embedding_model,embedding_version,embedding_dim,content_hash) VALUES(?1,?2,?3,'\"Fact\"',?4,?4,?5,?6,?7,?8,?9)").map_err(|e|e.to_string())?;
         for id in 0..items {
             let content = text(id);
-            let vector = embedder.embed(&content);
+            let vector = embedder.embed(&content).unwrap();
             statement
                 .execute(params![
                     fact_id(id).to_string(),
@@ -144,7 +144,7 @@ fn prepare(path: &Path, items: usize) -> Result<BruteForceIndex, String> {
             exact.add(id as u64, vector);
         }
         let content = "foreign confidential memory marker";
-        let vector = embedder.embed(content);
+        let vector = embedder.embed(content).unwrap();
         statement
             .execute(params![
                 Uuid::from_u128(u128::MAX).to_string(),
@@ -364,7 +364,7 @@ fn quality_phase(
     let mut overlap = 0_f64;
     let mut top1 = 0usize;
     for (_, query) in inputs {
-        let expected = exact.search(&embedder.embed(query), 10);
+        let expected = exact.search(&embedder.embed(query).unwrap(), 10);
         let expected_ids = expected
             .iter()
             .map(|(id, _)| fact_id(*id as usize))
@@ -538,7 +538,7 @@ pub(super) fn run(items: usize, queries: usize) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let (reads, writes, elapsed) = concurrent(&manager, items, seconds)?;
     for (&id, content) in &writes.updates {
-        exact.add(id as u64, embedder.embed(content));
+        exact.add(id as u64, embedder.embed(content).unwrap());
     }
     let post_inputs = writes
         .updates

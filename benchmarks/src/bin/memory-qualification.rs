@@ -3,6 +3,8 @@
 //! Compares the production LSH index against exact cosine search over the same
 //! corpus. CI fails closed when top-k recall or top-1 agreement regresses.
 
+#[path = "memory_qualification/embedding_compare.rs"]
+mod embedding_compare;
 #[path = "memory_qualification/production.rs"]
 mod production;
 
@@ -65,6 +67,13 @@ fn resident_memory_kib() -> Option<u64> {
 }
 
 fn main() {
+    if let Ok(path) = std::env::var("MEMORY_BENCH_EMBEDDING_CONFIG") {
+        if let Err(error) = embedding_compare::run(std::path::Path::new(&path)) {
+            eprintln!("embedding comparison failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let items = env_usize("MEMORY_BENCH_ITEMS", DEFAULT_ITEMS);
     let queries = env_usize("MEMORY_BENCH_QUERIES", DEFAULT_QUERIES).min(items);
     if items >= 100_000 || std::env::var("MEMORY_BENCH_MODE").is_ok_and(|mode| mode == "production")
@@ -85,7 +94,7 @@ fn main() {
         .map(|query| query.saturating_mul(7_919) % items)
         .collect();
     for id in 0..items {
-        let vector = embedder.embed(&corpus_item(id));
+        let vector = embedder.embed(&corpus_item(id)).unwrap();
         if selected.contains(&id) {
             query_vectors.push((id, vector.clone()));
         }

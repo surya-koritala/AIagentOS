@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added opt-in OpenAI-compatible/Ollama embedding transports, typed failures,
+  bounded request/response handling, configured boot selection, atomic model and
+  dimension repair, and a labelled-corpus comparison. Default offline vectors
+  stay unchanged. Rust embedding methods now return Result; wire fact schemas
+  remain unchanged. Relates #359.
+
 - Added a bounded 100k-fact context-manager qualification mode with cold/warm
   latency, concurrent updates/queries, before/after retrieval quality, whole-store
   integrity and peak RSS gates. Normal fact writes now reconcile retained indexes

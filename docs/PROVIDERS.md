@@ -151,7 +151,10 @@ without damaging another tenant or deleting durable agent identity history.
 
 The default offline embedding is `blended-feature-hash` version 2 at 256
 dimensions. It is deterministic and dependency-free; it is not a neural
-embedding model and should not be described as equivalent to one.
+embedding model and should not be described as equivalent to one. An
+[opt-in HTTP embedding backend](HTTP_EMBEDDINGS.md) supports configured
+OpenAI-compatible/Ollama services with typed failures, model/dimension repair and
+same-corpus comparison. Actual neural-model quality remains not run.
 
 ### Exact-vs-ANN gate
 

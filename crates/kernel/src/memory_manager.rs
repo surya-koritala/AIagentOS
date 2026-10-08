@@ -27,6 +27,10 @@
 
 use std::sync::Arc;
 
+#[path = "memory_manager/http_embeddings.rs"]
+mod http_embeddings;
+pub use http_embeddings::{HttpEmbedder, HttpEmbeddingConfig, HttpEmbeddingProtocol};
+
 /// Dimensionality of the embedding space. Fixed so stored vectors stay
 /// comparable across runs and process restarts.
 pub const EMBED_DIM: usize = 256;
@@ -94,6 +98,32 @@ fn normalize(mut acc: [f32; EMBED_DIM]) -> Vec<f32> {
     acc.to_vec()
 }
 
+/// Typed failures from optional embedding services. Diagnostics never contain
+/// request text, credential values, response bodies or endpoint URLs.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EmbeddingError {
+    #[error("invalid embedding configuration: {0}")]
+    Configuration(&'static str),
+    #[error("invalid embedding input: {0}")]
+    InvalidInput(&'static str),
+    #[error("embedding service is busy")]
+    Busy,
+    #[error("embedding request timed out")]
+    Timeout,
+    #[error("embedding transport failed")]
+    Transport,
+    #[error("fact store changed during embedding; retry the read")]
+    StoreChanged,
+    #[error("embedding service authentication failed")]
+    Authentication,
+    #[error("embedding service rate limit reached")]
+    RateLimited,
+    #[error("embedding service returned HTTP {0}")]
+    Upstream(u16),
+    #[error("invalid embedding response: {0}")]
+    InvalidResponse(&'static str),
+}
+
 /// An object-safe text → vector embedder.
 ///
 /// Implementations must be **deterministic**: the same input text always
@@ -101,9 +131,30 @@ fn normalize(mut acc: [f32; EMBED_DIM]) -> Vec<f32> {
 /// behind `Arc<dyn Embedder>` so the embedding strategy is injectable.
 pub trait Embedder: Send + Sync {
     /// Embed `text` into a vector of length [`Embedder::dim`].
-    fn embed(&self, text: &str) -> Vec<f32>;
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
     /// The dimensionality of vectors produced by [`Embedder::embed`].
     fn dim(&self) -> usize;
+    /// Validate declared dimensions before a vector is persisted or ranked.
+    fn embed_checked(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let vector = self.embed(text)?;
+        if vector.len() != self.dim()
+            || vector.is_empty()
+            || vector.iter().any(|value| !value.is_finite())
+        {
+            return Err(EmbeddingError::InvalidResponse(
+                "dimension or finite-vector contract mismatch",
+            ));
+        }
+        Ok(vector)
+    }
+    /// Fallible batches preserve input order; remote implementations may batch I/O.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
+    /// Remote work is offloaded from asynchronous context entry points.
+    fn is_remote(&self) -> bool {
+        false
+    }
     /// Stable persistence identifier. Changing the embedding algorithm requires
     /// a new model id or version so stale rows are rebuilt deterministically.
     fn model_id(&self) -> &str {
@@ -121,7 +172,7 @@ pub trait Embedder: Send + Sync {
 pub struct FeatureHashEmbedder;
 
 impl Embedder for FeatureHashEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         let tokens = tokenize(text);
         let mut acc = [0.0f32; EMBED_DIM];
 
@@ -135,7 +186,7 @@ impl Embedder for FeatureHashEmbedder {
             }
         }
 
-        normalize(acc)
+        Ok(normalize(acc))
     }
 
     fn dim(&self) -> usize {
@@ -187,7 +238,7 @@ impl BlendedEmbedder {
 }
 
 impl Embedder for BlendedEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         use std::collections::HashMap;
 
         let tokens = tokenize(text);
@@ -236,7 +287,7 @@ impl Embedder for BlendedEmbedder {
             }
         }
 
-        normalize(acc)
+        Ok(normalize(acc))
     }
 
     fn dim(&self) -> usize {
@@ -264,7 +315,9 @@ pub fn default_embedder() -> Arc<dyn Embedder> {
 /// Backwards-compatible free function: existing call sites in [`crate::context`]
 /// keep working unchanged. Empty or token-free input yields an all-zero vector.
 pub fn embed(text: &str) -> Vec<f32> {
-    BlendedEmbedder::default().embed(text)
+    BlendedEmbedder::default()
+        .embed(text)
+        .expect("offline embedding is infallible")
 }
 
 /// Cosine similarity between two vectors.
@@ -793,15 +846,19 @@ impl MemoryManager {
     }
 
     /// Embed `text` with this manager's embedder.
-    pub fn embed(&self, text: &str) -> Vec<f32> {
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         self.embedder.embed(text)
     }
 
     /// Rank `(item, embedding)` pairs by cosine similarity to `query` text,
     /// embedding the query with this manager's embedder. Best-first.
-    pub fn rank_by_query<T>(&self, query: &str, items: Vec<(T, Vec<f32>)>) -> Vec<(T, f32)> {
-        let q = self.embed(query);
-        rank(&q, items)
+    pub fn rank_by_query<T>(
+        &self,
+        query: &str,
+        items: Vec<(T, Vec<f32>)>,
+    ) -> Result<Vec<(T, f32)>, EmbeddingError> {
+        let q = self.embed(query)?;
+        Ok(rank(&q, items))
     }
 }
 
@@ -1035,7 +1092,7 @@ mod tests {
                 add_feature(&mut acc, fnv1a(bigram.as_bytes()), 1.0);
             }
         }
-        assert_eq!(e.embed("the quick brown fox"), normalize(acc));
+        assert_eq!(e.embed("the quick brown fox").unwrap(), normalize(acc));
         assert_eq!(e.dim(), EMBED_DIM);
     }
 
@@ -1047,10 +1104,10 @@ mod tests {
         let blended = BlendedEmbedder::default();
         let words = FeatureHashEmbedder;
 
-        let a_b = blended.embed("editor settings");
-        let b_b = blended.embed("editing settings");
-        let a_w = words.embed("editor settings");
-        let b_w = words.embed("editing settings");
+        let a_b = blended.embed("editor settings").unwrap();
+        let b_b = blended.embed("editing settings").unwrap();
+        let a_w = words.embed("editor settings").unwrap();
+        let b_w = words.embed("editing settings").unwrap();
 
         let sim_blended = cosine_similarity(&a_b, &b_b);
         let sim_words = cosine_similarity(&a_w, &b_w);
@@ -1222,7 +1279,7 @@ mod tests {
     #[test]
     fn memory_manager_default_uses_blended() {
         let mm = MemoryManager::default();
-        assert_eq!(mm.embed("hello world"), embed("hello world"));
+        assert_eq!(mm.embed("hello world").unwrap(), embed("hello world"));
         assert_eq!(mm.embedder().dim(), EMBED_DIM);
     }
 
@@ -1230,8 +1287,8 @@ mod tests {
     fn memory_manager_accepts_custom_embedder() {
         let mm = MemoryManager::new(Arc::new(FeatureHashEmbedder));
         assert_eq!(
-            mm.embed("hello world"),
-            FeatureHashEmbedder.embed("hello world")
+            mm.embed("hello world").unwrap(),
+            FeatureHashEmbedder.embed("hello world").unwrap()
         );
     }
 }

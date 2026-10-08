@@ -352,6 +352,9 @@ pub enum SchedulerError {
 /// Errors related to context and memory management.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ContextError {
+    #[error("Embedding failed: {0}")]
+    Embedding(#[from] crate::memory_manager::EmbeddingError),
+
     #[error("Context persistence failed: {0}")]
     PersistenceFailed(String),
 
@@ -1383,7 +1386,13 @@ impl AgentKernelImpl {
     ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
-        let context_manager = Arc::new(match config.storage_encryption.key_path.as_deref() {
+        let embedding = config
+            .embeddings
+            .clone()
+            .map(crate::memory_manager::HttpEmbedder::new)
+            .transpose()
+            .map_err(|error| KernelError::Context(ContextError::Embedding(error)))?;
+        let mut context_store = match config.storage_encryption.key_path.as_deref() {
             Some(key_path) => {
                 let key = crate::storage_encryption::load_storage_encryption_key(key_path)
                     .map_err(KernelError::Context)?;
@@ -1412,7 +1421,11 @@ impl AgentKernelImpl {
             }
             None => SqliteContextManager::new_without_storage_lease(&db_path)
                 .map_err(KernelError::Context)?,
-        });
+        };
+        if let Some(embedding) = embedding {
+            context_store = context_store.with_embedder(Arc::new(embedding));
+        }
+        let context_manager = Arc::new(context_store);
         tracing::info!(
             target: "agentos::storage",
             storage_encryption_enabled = context_manager.storage_encryption_key_id().is_some(),

@@ -1298,6 +1298,23 @@ impl SqliteContextManager {
     /// Swap the embedder used by the long-term-memory store/query path. Returns
     /// `self` for builder-style chaining. The seam where a different
     /// [`Embedder`] can drop in without changing persistence.
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, ContextError> {
+        if self.embedder.is_remote() {
+            let embedder = Arc::clone(&self.embedder);
+            let text = text.to_owned();
+            tokio::task::spawn_blocking(move || embedder.embed_checked(&text))
+                .await
+                .map_err(|_| {
+                    ContextError::Embedding(crate::memory_manager::EmbeddingError::Transport)
+                })?
+                .map_err(ContextError::Embedding)
+        } else {
+            self.embedder
+                .embed_checked(text)
+                .map_err(ContextError::Embedding)
+        }
+    }
+
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.fact_cache
             .get_mut()
@@ -4158,6 +4175,7 @@ impl ContextManager for SqliteContextManager {
     }
 
     async fn store_fact(&self, agent_id: AgentId, fact: Fact) -> Result<(), ContextError> {
+        let embedding = self.embed_text(&fact.content).await?;
         let mut conn = self.locked_conn();
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4165,7 +4183,6 @@ impl ContextManager for SqliteContextManager {
         let previous_generation = fact_index::generation(&transaction, agent_id)?;
         // Persistence owns the embedding: caller-supplied vectors are not
         // trusted because they may have the wrong model, dimension, or tenant.
-        let embedding = self.embedder.embed(&fact.content);
         let embedding_blob = fact_index::encode(&embedding)?;
         let embedding_model = self.embedder.model_id();
         let embedding_version = self.embedder.version();
@@ -4244,7 +4261,26 @@ impl ContextManager for SqliteContextManager {
         agent_id: AgentId,
         query: &str,
     ) -> Result<Vec<Fact>, ContextError> {
-        self.cached_query_memory(agent_id, query)
+        if self.embedder.is_remote() {
+            let has_facts = self
+                .locked_conn()
+                .query_row(
+                    "SELECT 1 FROM facts WHERE agent_id=?1 LIMIT 1",
+                    [agent_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .is_some();
+            if !has_facts {
+                return Ok(Vec::new());
+            }
+        }
+        if self.embedder.is_remote() {
+            self.prepare_remote_embeddings(agent_id).await?;
+        }
+        let query_vector = self.embed_text(query).await?;
+        self.cached_query_memory(agent_id, &query_vector)
     }
 }
 
@@ -7145,31 +7181,64 @@ impl SqliteContextManager {
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|error| ContextError::StorageError(error.to_string()))?
         };
+        let old_bytes=conn.query_row("SELECT COALESCE(SUM(COALESCE(LENGTH(CAST(embedding_json AS BLOB)),0)+COALESCE(LENGTH(embedding_blob),0)),0) FROM facts WHERE agent_id=?1",[agent_id.to_string()],|row|row.get::<_,i64>(0)).map_err(|error|ContextError::StorageError(error.to_string()))?;
+        let tenant = Self::agent_tenant_locked(&conn, agent_id)?;
+        let new_bytes = facts
+            .len()
+            .saturating_mul(8 + self.embedder.dim().saturating_mul(4))
+            as u64;
+        self.enforce_context_storage_locked(
+            &conn,
+            agent_id,
+            &tenant,
+            new_bytes,
+            old_bytes.max(0) as u64,
+        )?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
-        for (id, content) in &facts {
-            let embedding = self.embedder.embed(content);
-            let embedding_blob = fact_index::encode(&embedding)?;
-            transaction
-                .execute(
-                    "UPDATE facts
+        for batch in facts.chunks(32) {
+            let texts = batch
+                .iter()
+                .map(|(_, content)| content.as_str())
+                .collect::<Vec<_>>();
+            let vectors = self.embedder.embed_batch(&texts)?;
+            if vectors.len() != batch.len() {
+                return Err(crate::memory_manager::EmbeddingError::InvalidResponse(
+                    "batch count mismatch",
+                )
+                .into());
+            }
+            for ((id, content), embedding) in batch.iter().zip(vectors) {
+                if embedding.len() != self.embedder.dim() {
+                    return Err(crate::memory_manager::EmbeddingError::InvalidResponse(
+                        "dimension mismatch",
+                    )
+                    .into());
+                }
+                let embedding_blob = fact_index::encode(&embedding)?;
+                transaction
+                    .execute(
+                        "UPDATE facts
                      SET embedding_json = NULL, embedding_blob = ?1, embedding_model = ?2,
                          embedding_version = ?3, embedding_dim = ?4,
                          content_hash = ?5
                      WHERE id = ?6 AND agent_id = ?7",
-                    params![
-                        embedding_blob,
-                        self.embedder.model_id(),
-                        i64::from(self.embedder.version()),
-                        i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
-                        memory_content_hash(content),
-                        id,
-                        agent_id.to_string(),
-                    ],
-                )
-                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+                        params![
+                            embedding_blob,
+                            self.embedder.model_id(),
+                            i64::from(self.embedder.version()),
+                            i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
+                            memory_content_hash(content),
+                            id,
+                            agent_id.to_string(),
+                        ],
+                    )
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            }
         }
+        let tenant = Self::agent_tenant_locked(&transaction, agent_id)?;
+        self.enforce_context_storage_locked(&transaction, agent_id, &tenant, 0, 0)?;
         transaction
             .commit()
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
@@ -7183,7 +7252,7 @@ impl SqliteContextManager {
         fact_id: uuid::Uuid,
         content: &str,
     ) -> Result<bool, ContextError> {
-        let embedding = self.embedder.embed(content);
+        let embedding = self.embedder.embed_checked(content)?;
         let embedding_blob = fact_index::encode(&embedding)?;
         let mut conn = self.locked_conn();
         let transaction = conn

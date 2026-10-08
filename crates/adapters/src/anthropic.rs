@@ -246,6 +246,7 @@ impl LlmProviderAdapter for AnthropicAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            model_discovery: true,
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
@@ -253,6 +254,12 @@ impl LlmProviderAdapter for AnthropicAdapter {
             api_family: "anthropic-messages-v1".into(),
             ..Default::default()
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
+        crate::model_discovery::discover(
+            &self.id, &self.base_url, crate::model_discovery::DiscoveryApi::Anthropic, &self.api_key,
+        ).await
     }
 
     async fn is_available(&self) -> bool {

@@ -343,6 +343,7 @@ impl LlmProviderAdapter for LocalLlmAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            model_discovery: true,
             native_streaming: true,
             prompt_cancellation: true,
             tool_calls: true,
@@ -354,6 +355,12 @@ impl LlmProviderAdapter for LocalLlmAdapter {
 
     fn max_provider_attempts(&self) -> u32 {
         2
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
+        crate::model_discovery::discover(
+            &self.id, &self.base_url, crate::model_discovery::DiscoveryApi::Ollama, "",
+        ).await
     }
 
     async fn is_available(&self) -> bool {

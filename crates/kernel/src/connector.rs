@@ -51,7 +51,8 @@ pub fn is_transient(err: &ConnectorError) -> bool {
         | ConnectorError::Authorization(_)
         | ConnectorError::InvalidRequest(_)
         | ConnectorError::ContentFiltered(_)
-        | ConnectorError::Cancelled(_) => false,
+        | ConnectorError::Cancelled(_)
+        | ConnectorError::UnsupportedFeature(_) => false,
     }
 }
 
@@ -646,6 +647,28 @@ pub trait LlmProviderAdapter: Send + Sync {
     fn provider_type(&self) -> ProviderType;
     async fn is_available(&self) -> bool;
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError>;
+    /// Explicit discovery using this adapter's configured endpoint/credential.
+    /// Older and on-device adapters conservatively report unsupported.
+    async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
+        Err(ConnectorError::unsupported_feature(
+            self.id().clone(),
+            "model discovery is not supported by this adapter",
+        ))
+    }
+    /// Dropping the discovery future stops transport I/O. Catalog lookup does
+    /// not retry, fail over, create a session, or execute any model.
+    async fn list_models_controlled(
+        &self,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<String>, ConnectorError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ConnectorError::cancelled(self.id().clone(), None)),
+            result = tokio::time::timeout(crate::model_discovery::MODEL_DISCOVERY_TIMEOUT, self.list_models()) => {
+                result.map_err(|_| ConnectorError::timeout(self.id().clone(), "model discovery deadline exceeded", None))?
+            }
+        }
+    }
     /// Conservative HTTP/inference attempts one adapter session may start.
     /// Protocol negotiation retries must be reserved before provider I/O.
     fn max_provider_attempts(&self) -> u32 {
@@ -748,6 +771,33 @@ impl AgentConnectorImpl {
             circuit_breakers: DashMap::new(),
             routing_policies: DashMap::new(),
         }
+    }
+
+    /// Retrieve only a registered provider's identifier catalog. Release the
+    /// registry guard before I/O and recheck bounds for third-party adapters.
+    pub async fn list_provider_models(
+        &self,
+        provider_id: &ProviderId,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model_discovery::ModelCatalog, ConnectorError> {
+        let adapter = self.providers.get(provider_id).map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| ConnectorError::ProviderUnavailable("configured provider not registered".into()))?;
+        if !adapter.capabilities().model_discovery {
+            return Err(ConnectorError::unsupported_feature(
+                adapter.id().clone(), "model discovery is not supported by this adapter",
+            ));
+        }
+        let models = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ConnectorError::cancelled(adapter.id().clone(), None)),
+            result = tokio::time::timeout(crate::model_discovery::MODEL_DISCOVERY_TIMEOUT, adapter.list_models_controlled(cancellation)) => {
+                result.map_err(|_| ConnectorError::timeout(adapter.id().clone(), "model discovery deadline exceeded", None))??
+            }
+        };
+        Ok(crate::model_discovery::ModelCatalog {
+            provider_id: adapter.id().clone(),
+            models: crate::model_discovery::normalize_model_ids(models)?,
+        })
     }
 
     /// Override the retry/backoff policy (builder-style).

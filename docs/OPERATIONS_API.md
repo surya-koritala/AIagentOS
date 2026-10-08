@@ -108,8 +108,15 @@ trust/revocation, publish/fetch/search, install/upgrade/rollback/remove, and
 verified run. Marketplace ratings/download counters are not part of the v1
 surface.
 
-Provider health is currently availability plus timeout evidence; provider
-error taxonomies, circuit breakers, model discovery, and external contract
-tests remain tracked by issue #120. Per-agent gate counters reset on restart,
+Provider health is availability plus timeout evidence. Explicit model discovery
+uses the system-only `list_provider_models` syscall, SDK
+`KernelClient::list_provider_models`, and `agentctl models PROVIDER_ID`; tenant
+API keys, including Admin keys, cannot enumerate configured credential-backed
+catalogs. The response contains a provider ID and bounded normalized model IDs;
+unsupported adapters return the typed `unsupported` error. See
+[provider endpoints and limits](PROVIDERS.md#explicit-model-discovery). The
+ordinary provider view reports capabilities without automatically listing
+models. Live provider contracts remain tracked by issue #120.
+Per-agent gate counters reset on restart,
 and this API is an agent-runtime control surface rather than a Linux `/proc`
 mount or a claim of Linux-kernel equivalence.

@@ -218,6 +218,7 @@ impl LlmProviderAdapter for GeminiAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            model_discovery: true,
             prompt_cancellation: true,
             native_streaming: true,
             tool_calls: true,
@@ -225,6 +226,12 @@ impl LlmProviderAdapter for GeminiAdapter {
             api_family: "gemini-generate-content-v1beta".into(),
             ..Default::default()
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
+        crate::model_discovery::discover(
+            &self.id, &self.base_url, crate::model_discovery::DiscoveryApi::Gemini, &self.api_key,
+        ).await
     }
 
     async fn is_available(&self) -> bool {

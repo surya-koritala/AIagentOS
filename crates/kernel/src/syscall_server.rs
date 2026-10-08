@@ -475,6 +475,11 @@ pub enum Syscall {
     /// backends an agent can be created against and driven through
     /// [`SendMessage`](Self::SendMessage).
     ListProviders,
+    /// Explicit system-scoped lookup using one configured provider. Tenant
+    /// credentials cannot enumerate credential-backed model catalogs.
+    ListProviderModels {
+        provider_id: String,
+    },
     /// Store a fact in an agent's long-term memory (the durable SQLite facts
     /// store). `category` is one of `preference` / `learned_pattern` / `fact` /
     /// `instruction`; it defaults to `fact`.
@@ -1118,6 +1123,7 @@ pub enum WireErrorCode {
     Cancelled,
     IncompatibleVersion,
     Provider,
+    Unsupported,
     Lifecycle,
     Internal,
 }
@@ -1349,6 +1355,10 @@ pub enum SyscallReply {
     /// The LLM providers registered with the kernel (reply to [`Syscall::ListProviders`]).
     Providers {
         providers: Vec<ProviderSummary>,
+    },
+    /// Identifier-only catalog from one configured provider.
+    ProviderModels {
+        catalog: crate::model_discovery::ModelCatalog,
     },
     /// A fact was stored (reply to [`Syscall::MemoryStore`]); carries its id.
     MemoryStored {
@@ -1779,6 +1789,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::GateStats => (AccessLevel::System, "system.gate_stats", None),
         Syscall::AgentInfo { agent_id } => (AccessLevel::ReadOnly, "agent.info", Some(agent_id)),
         Syscall::ListProviders => (AccessLevel::ReadOnly, "provider.list", None),
+        Syscall::ListProviderModels { .. } => (AccessLevel::System, "provider.models", None),
         Syscall::MemoryStore { agent_id, .. } => {
             (AccessLevel::User, "memory.store", Some(agent_id))
         }
@@ -1940,6 +1951,26 @@ fn authorization_error() -> SyscallReply {
     SyscallReply::Error {
         message: AUTHORIZATION_DENIED.to_string(),
     }
+}
+
+fn model_discovery_error_reply(error: crate::ConnectorError) -> SyscallReply {
+    use crate::ConnectorError;
+    // Third-party adapters may include secrets in prose, so never forward
+    // their detail even when the built-in transport already redacts it.
+    let (code, message, retryable) = match error {
+        ConnectorError::UnsupportedFeature(_) => (WireErrorCode::Unsupported, "model discovery is unsupported", false),
+        ConnectorError::ProviderUnavailable(_) => (WireErrorCode::NotFound, "configured provider not registered", false),
+        ConnectorError::Authentication(_) => (WireErrorCode::AuthenticationFailed, "model discovery provider authentication failed", false),
+        ConnectorError::Authorization(_) => (WireErrorCode::AuthorizationDenied, "model discovery provider authorization failed", false),
+        ConnectorError::Timeout(_) => (WireErrorCode::Timeout, "model discovery deadline exceeded", true),
+        ConnectorError::Cancelled(_) => (WireErrorCode::Cancelled, "model discovery cancelled", false),
+        ConnectorError::RateLimited(_) => (WireErrorCode::Provider, "model discovery provider rate limited the request", true),
+        ConnectorError::ConnectionFailed(_) | ConnectorError::ServiceUnavailable(_)
+        | ConnectorError::StreamError(_) => (WireErrorCode::Unavailable, "model discovery provider unavailable", true),
+        ConnectorError::ProtocolError(_) | ConnectorError::InvalidRequest(_)
+        | ConnectorError::ContentFiltered(_) | ConnectorError::PartialStream(_) => (WireErrorCode::InvalidRequest, "model discovery returned an invalid response", false),
+    };
+    SyscallReply::TypedError { code, message: message.into(), retryable }
 }
 
 fn audit_authorization_denial(
@@ -3502,6 +3533,22 @@ async fn dispatch_scoped_inner_with_fence(
                 })
                 .collect();
             SyscallReply::Providers { providers }
+        }
+        Syscall::ListProviderModels { provider_id } => {
+            if provider_id.is_empty() || provider_id.len() > 128
+                || !provider_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return SyscallReply::TypedError {
+                    code: WireErrorCode::InvalidArgument,
+                    message: "invalid configured provider identifier".into(),
+                    retryable: false,
+                };
+            }
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            match kernel.connector.list_provider_models(&provider_id, &cancellation).await {
+                Ok(catalog) => SyscallReply::ProviderModels { catalog },
+                Err(error) => model_discovery_error_reply(error),
+            }
         }
         Syscall::MemoryStore {
             agent_id,
@@ -6671,6 +6718,7 @@ impl SyscallServer {
                         && matches!(
                             &call,
                             Syscall::SendMessageStream { .. }
+                                | Syscall::ListProviderModels { .. }
                                 | Syscall::CancelRequest { .. }
                                 | Syscall::CreateAgent {
                                     agent_id: Some(_),

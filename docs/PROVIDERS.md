@@ -34,9 +34,8 @@ plaintext tool shim is separate.
 | Ollama | Yes | Yes, NDJSON | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
 | Candle/GGUF | Controlled decoder/drain fixtures; gated real-model test | Yes, token decode | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
 
-No adapter currently advertises vision, audio, or a supported model-discovery
-API. Those fields default to false, so callers cannot infer support from a
-provider name.
+No adapter currently advertises vision or audio. Model discovery is supported
+only by the adapters listed below; callers must inspect the capability flag.
 
 A green nightly run with an empty provider set retains a dated `not_run` plan
 and skips live contracts. It verifies fixture contracts only; it is not live
@@ -55,6 +54,58 @@ ceiling, structured credential/prompt fields are redacted recursively, and
 unstructured bodies fail closed to a generic message. Tests cover retry
 classification, content-filter handling, oversized usage counters, and secret
 redaction.
+
+### Explicit model discovery
+
+`agentctl [SERVER OPTIONS] providers` displays configured providers and their
+capability flags without enumerating a provider account. A trusted system
+operator can explicitly request one catalog with
+`agentctl [SERVER OPTIONS] models PROVIDER_ID`. The SDK method
+`KernelClient::list_provider_models` uses the v2 `list_provider_models` syscall
+and returns `{ "provider_id": "...", "models": ["..."] }`. Tenant API keys,
+including tenant Admin keys, are denied before provider I/O because configured
+credentials can expose account-specific model identifiers.
+
+| Adapter | Configured endpoint suffix | Identifier and pagination contract |
+|---|---|---|
+| OpenAI | `/models` | [`data[].id`](https://developers.openai.com/api/reference/resources/models/methods/list) |
+| Groq | `/models` | [`data[].id`](https://console.groq.com/docs/api-reference#models) |
+| DeepSeek | `/models` | [`data[].id`](https://api-docs.deepseek.com/api/list-models/) |
+| vLLM | `/models` | [`data[].id` from its OpenAI server](https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/models/api_router.py) |
+| Anthropic | `/models` | [`data[].id`, `has_more` and `after_id`](https://platform.claude.com/docs/en/api/models/list) |
+| Gemini | `/v1beta/models` | [`models[].name`, `nextPageToken` and `pageToken`](https://ai.google.dev/api/models); remove the `models/` prefix for configured generation IDs |
+| Ollama | `/api/tags` | [`models[].model`, with `name` compatibility](https://docs.ollama.com/api/tags) |
+
+Azure deployment discovery, the legacy Hugging Face inference adapter, and
+Candle have no implemented catalog endpoint. They retain
+`model_discovery = false` and return `ConnectorError::UnsupportedFeature`;
+the wire/SDK category is `unsupported`, not an empty success. A valid empty
+provider catalog is a successful empty array. Listing does not prove a model
+supports chat, tools, or a particular generation method, and does not load,
+download, execute, select, or change a model.
+
+Catalogs preserve identifier spelling, sort and deduplicate it, and include no
+owners, account fields, endpoints, credentials, display metadata, or local
+paths. IDs must be 1–256 ASCII bytes with a leading alphanumeric character and
+only alphanumerics, `_`, `-`, `.`, `:`, `/`; URL schemes and empty/dot path
+segments are rejected. The raw catalog is capped at 1024 entries, 1 MiB across
+all response bodies, 16 pages, and a ten-second total deadline. Pagination is
+same-endpoint only, cursors are bounded and repeated cursors fail. Exceeding a
+bound or encountering malformed data fails the whole lookup, without a partial
+or silently truncated catalog.
+
+Built-in HTTP listing disables redirects, carries credentials only in headers,
+and never echoes provider bodies, request IDs, URLs or cursor values in errors.
+Diagnostics stay below the existing 8 KiB error ceiling. The connector applies
+the public ID/count bounds again to third-party adapters; the wire maps even
+their error prose to fixed typed messages. In-process callers can use
+`list_models_controlled` with a cancellation token; cancellation drops the
+transport future. Wire calls use the same total deadline and existing transport
+limits. Listing has no inference retry/failover; the SDK retains its ordinary
+bounded reconnect behavior for read operations. This does not prove vendor
+server-side compute cancellation. Keyless catalog, capability, pagination,
+authorization, SDK and actual CLI fixtures run in GitHub CI. Live listing
+qualification remains **Not run**.
 
 ### Native streaming conformance
 

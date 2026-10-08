@@ -50,6 +50,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "namespace_mounts",
     "data_vfs",
     "durable_cloning",
+    "model_discovery",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -410,6 +411,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "list_providers",
         fields: &[],
+    },
+    Variant {
+        tag: "list_provider_models",
+        fields: &[Field::required("provider_id", S)],
     },
     Variant {
         tag: "memory_store",
@@ -870,6 +875,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                 || !matches!(
                     variant.tag,
                     "send_message_stream"
+                        | "list_provider_models"
                         | "cancel_request"
                         | "enforce_storage_backup_retention"
                         | "storage_backup_status"
@@ -1128,6 +1134,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "providers",
         fields: &[Field::required("providers", A)],
+    },
+    Variant {
+        tag: "provider_models",
+        fields: &[Field::required("catalog", O)],
     },
     Variant {
         tag: "memory_stored",
@@ -1711,8 +1721,23 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 84);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 115);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 116);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
+    }
+
+    #[test]
+    fn model_discovery_wire_contract_is_v2_typed_and_identifier_only() {
+        let description = protocol_description();
+        assert!(description.features.contains(&"model_discovery".into()));
+        assert!(tags(&description.request_schema, "op").contains(&"list_provider_models"));
+        assert!(tags(&description.reply_schema, "status").contains(&"provider_models"));
+        let catalog: crate::syscall_server::SyscallReply = serde_json::from_str(include_str!("../../../protocol/v2/provider-models.json")).unwrap();
+        assert!(matches!(catalog, crate::syscall_server::SyscallReply::ProviderModels { catalog }
+            if catalog.provider_id == "openai" && catalog.models == ["fixture-model"]));
+        let unsupported: crate::syscall_server::SyscallReply = serde_json::from_str(include_str!("../../../protocol/v2/unsupported-model-discovery.json")).unwrap();
+        assert!(matches!(unsupported, crate::syscall_server::SyscallReply::TypedError {
+            code: crate::syscall_server::WireErrorCode::Unsupported, retryable: false, ..
+        }));
     }
 }

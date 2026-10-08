@@ -53,6 +53,7 @@ pub use kernel::cluster_control::{
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
+pub use kernel::model_discovery::ModelCatalog;
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::package::{
     InstallPolicy, InstalledPackage, LockedPackage, PackageArchive, PackageDep, PackageFile,
@@ -2606,6 +2607,18 @@ impl KernelClient {
         }
     }
 
+    /// Explicit configured-provider discovery. Requires a trusted system
+    /// connection; tenant users and tenant admins cannot enumerate catalogs.
+    pub async fn list_provider_models(
+        &mut self,
+        provider_id: impl Into<String>,
+    ) -> Result<ModelCatalog, SdkError> {
+        match self.call(Syscall::ListProviderModels { provider_id: provider_id.into() }).await? {
+            SyscallReply::ProviderModels { catalog } => Ok(catalog),
+            other => Err(unexpected("ProviderModels", &other)),
+        }
+    }
+
     /// Store a fact in an agent's long-term memory. `category` is one of
     /// `preference` / `learned_pattern` / `fact` / `instruction` (defaults to
     /// `fact` when `None`). Returns the new fact's id.
@@ -3434,6 +3447,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::GateStats
             | Syscall::AgentInfo { .. }
             | Syscall::ListProviders
+            | Syscall::ListProviderModels { .. }
             | Syscall::MemoryQuery { .. }
             | Syscall::StorageGet { .. }
             | Syscall::StorageList { .. }

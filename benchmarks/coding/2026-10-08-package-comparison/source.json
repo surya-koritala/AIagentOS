@@ -1,0 +1,20 @@
+{
+  "evidence_class": "deterministic_fixture_and_clean_runner_candidate",
+  "production_claim_allowed": false,
+  "head_commit": "06d13a1fc03b833a9a7a2300d0099a27d394ce06",
+  "tested_merge_commit": "fd40eabf61f377e1d6baed287e7c15ec0a79576c",
+  "run_id": 37750182669,
+  "candidate_artifact_id": 11537254363,
+  "candidate_artifact_name": "coding-cli-candidate-fd40eabf61f377e1d6baed287e7c15ec0a79576c",
+  "install_artifact_id": 11537936141,
+  "fixture_artifact_id": 11537731338,
+  "provider_api_calls": 0,
+  "sha256": {
+    "comparison-events.jsonl": "6bb4715ba238c78fd59bfaf3546d707ea6f2cd80d557c5bdcab66c82af850307",
+    "comparison.json": "e92374b0814f3ea9bb88f219ff229bfee8835448de41a2394edfb851ee1307ff",
+    "install-report.json": "00f3f55243a62625055df182d20bf46603223b20eb1d229af50d6883cafab313",
+    "installed-completed.json": "bf13e4032bfd65e84941c3005cb15961fee3e07c93dba1eb4d2aacd98807e94e",
+    "installed-paused.json": "92f801a9ff8c641ccbd201f520776788642108d166b6d9ee0067720b437867e0",
+    "installed-repeated.json": "bf13e4032bfd65e84941c3005cb15961fee3e07c93dba1eb4d2aacd98807e94e"
+  }
+}

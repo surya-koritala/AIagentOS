@@ -41,6 +41,30 @@ struct OpenAiSession {
     model: String,
 }
 
+impl OpenAiSession {
+    fn streaming_request(
+        &self,
+        messages: &[StandardMessage],
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> reqwest::RequestBuilder {
+        let body =
+            crate::streaming::openai_streaming_body(messages, tools, options, Some(&self.model));
+        let request = self
+            .client
+            .post(format!(
+                "{}/chat/completions",
+                self.base_url.trim_end_matches('/')
+            ))
+            .json(&body);
+        if self.api_key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.api_key)
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl LlmSession for OpenAiSession {
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
@@ -62,40 +86,7 @@ impl LlmSession for OpenAiSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
-        let msgs: Vec<serde_json::Value> =
-            messages
-                .iter()
-                .map(|m| {
-                    let mut obj = serde_json::json!({"role": m.role, "content": m.content});
-                    if let Some(ref id) = m.tool_call_id {
-                        obj["tool_call_id"] = serde_json::json!(id);
-                    }
-                    if let Some(ref tcs) = m.tool_calls {
-                        obj["tool_calls"] =
-                            serde_json::json!(tcs.iter().map(|tc| serde_json::json!({
-                    "id": tc.id, "type": "function",
-                    "function": {"name": tc.name, "arguments": tc.arguments.to_string()}
-                })).collect::<Vec<_>>());
-                    }
-                    obj
-                })
-                .collect();
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": msgs,
-        });
-
-        if !tools.is_empty() {
-            let tool_defs: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({
-                "type": "function",
-                "function": {"name": t.name, "description": t.description, "parameters": t.parameters}
-            })).collect();
-            body["tools"] = serde_json::json!(tool_defs);
-        }
-        if let Some(max_output_tokens) = options.max_output_tokens {
-            body["max_tokens"] = serde_json::json!(max_output_tokens);
-        }
+        let body = crate::openai_chat::request(&messages, tools, options, Some(&self.model));
 
         let result = self
             .client
@@ -107,58 +98,66 @@ impl LlmSession for OpenAiSession {
 
         match result {
             Ok(resp) if resp.status().is_success() => {
-                let json: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                if let Some(error) = crate::content_filter_error(
-                    &self.provider_id,
-                    json["choices"][0]["finish_reason"].as_str(),
-                ) {
-                    return Err(error);
-                }
-                let content = json["choices"][0]["message"]["content"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let tokens = crate::json_usage_u32(&json["usage"]["total_tokens"]);
-                let tool_calls = json["choices"][0]["message"]["tool_calls"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|tc| {
-                                Some(ToolCall {
-                                    id: tc["id"].as_str()?.to_string(),
-                                    name: tc["function"]["name"].as_str()?.to_string(),
-                                    arguments: serde_json::from_str(
-                                        tc["function"]["arguments"].as_str()?,
-                                    )
-                                    .unwrap_or(serde_json::Value::Null),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(LlmResponse {
-                    provider_metadata: None,
-                    content,
-                    finish_reason: json["choices"][0]["finish_reason"]
-                        .as_str()
-                        .map(|s| s.to_string()),
-                    tokens_used: tokens,
-                    usage: kernel::connector::LlmUsage::reported(
-                        crate::json_usage_u32(&json["usage"]["prompt_tokens"]),
-                        crate::json_usage_u32(&json["usage"]["completion_tokens"]),
-                        crate::json_usage_u32(
-                            &json["usage"]["prompt_tokens_details"]["cached_tokens"],
-                        ),
-                    ),
-                    tool_calls,
-                })
+                crate::openai_chat::response(resp, &self.provider_id).await
             }
             Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
+    }
+
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.send_streaming_controlled(messages, tools, options, &cancellation)
+            .await
+    }
+
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        crate::streaming::send_openai_stream_controlled(
+            &self.provider_id,
+            self.streaming_request(&messages, tools, options),
+            options,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        crate::streaming::send_openai_stream_controlled(
+            &self.provider_id,
+            self.streaming_request(&messages, tools, options),
+            options,
+            cancellation,
+            Some(events),
+        )
+        .await
     }
 
     fn enforces_max_output_tokens(&self) -> bool {
@@ -187,6 +186,7 @@ impl LlmProviderAdapter for OpenAiAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
             prompt_cancellation: true,

@@ -461,6 +461,9 @@ pub enum ConnectorError {
     #[error("Provider rejected request: {0:?}")]
     InvalidRequest(ProviderErrorContext),
 
+    #[error("Primary provider tool incompatibility: {0:?}")]
+    ToolIncompatiblePrimary(ProviderErrorContext),
+
     #[error("Provider content filter blocked request: {0:?}")]
     ContentFiltered(ProviderErrorContext),
 
@@ -558,6 +561,7 @@ impl ConnectorError {
             | Self::Authorization(context)
             | Self::ServiceUnavailable(context)
             | Self::InvalidRequest(context)
+            | Self::ToolIncompatiblePrimary(context)
             | Self::ContentFiltered(context)
             | Self::Timeout(context)
             | Self::Cancelled(context) => context.request_id.as_deref(),
@@ -1457,6 +1461,11 @@ impl AgentKernelImpl {
             Some(storage_lease),
         )?;
         kernel.backup_maintenance.configure(config.backup.clone())?;
+        for (provider, policy) in &config.provider_routing {
+            kernel
+                .connector
+                .set_routing_policy(provider, policy.clone());
+        }
         if let Some(service_dir) = &config.service_dir {
             *kernel
                 .service_directory
@@ -1580,6 +1589,8 @@ impl AgentKernelImpl {
         // decisions (and denials) are recorded in the agent activity log.
         let observability = Arc::new(ObservabilityEngineImpl::new());
         syscall_gate.set_audit_sink(observability.clone());
+        let connector = Arc::new(AgentConnectorImpl::new());
+        connector.set_degradation_audit_sink(observability.clone());
         // Cumulative USD spend ceiling (inert unless price + ceiling configured).
         // Rehydrate exact fixed-point charges before any agent can be admitted;
         // resetting a configured lifetime ceiling on restart would fail open.
@@ -1643,7 +1654,7 @@ impl AgentKernelImpl {
             sandbox_manager,
             ipc,
             observability,
-            connector: Arc::new(AgentConnectorImpl::new()),
+            connector,
             resource_broker,
             tool_registry,
             tool_vfs: crate::vfs::ToolVfs::default(),
@@ -1744,6 +1755,28 @@ impl AgentKernelImpl {
     /// Create agent with full subsystem coordination.
     pub async fn create_agent_full(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
         self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT, None)
+            .await
+    }
+
+    /// Trusted application bootstrap with a freshly allocated owned workspace.
+    /// The supplied workspace path is replaced; it cannot claim or overwrite an
+    /// operator directory. Lifecycle cleanup owns filesystem/container roots.
+    pub async fn create_agent_with_managed_sandbox(
+        &self,
+        mut config: AgentConfig,
+        mut sandbox: SandboxConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        if !matches!(
+            sandbox.isolation_level,
+            IsolationLevel::Filesystem | IsolationLevel::Container
+        ) {
+            return Err(KernelError::Policy(
+                "managed application bootstrap requires an isolated backend".into(),
+            ));
+        }
+        sandbox.workspace_dir = SandboxManagerImpl::default_config().workspace_dir;
+        config.sandbox_config = Some(sandbox);
+        self.create_agent_grouped_owned(config, None, crate::context::DEFAULT_TENANT, None, true)
             .await
     }
 
@@ -2281,10 +2314,22 @@ impl AgentKernelImpl {
 
     async fn create_agent_grouped(
         &self,
+        config: AgentConfig,
+        group: Option<&str>,
+        tenant_id: &str,
+        requested_agent_id: Option<AgentId>,
+    ) -> Result<AgentHandle, KernelError> {
+        self.create_agent_grouped_owned(config, group, tenant_id, requested_agent_id, false)
+            .await
+    }
+
+    async fn create_agent_grouped_owned(
+        &self,
         mut config: AgentConfig,
         group: Option<&str>,
         tenant_id: &str,
         requested_agent_id: Option<AgentId>,
+        owned_sandbox: bool,
     ) -> Result<AgentHandle, KernelError> {
         let _operator_mutation = self.operator_control.mutation_guard().await;
         let max_agents = self.operator_control.max_agents();
@@ -2299,8 +2344,8 @@ impl AgentKernelImpl {
         // Absence means the secure managed default, never host-unconfined. Only
         // in-process operator code can explicitly request IsolationLevel::Trusted;
         // the wire and package formats do not expose that bypass.
-        let managed_sandbox = config.sandbox_config.is_none();
-        if managed_sandbox {
+        let managed_sandbox = config.sandbox_config.is_none() || owned_sandbox;
+        if config.sandbox_config.is_none() {
             config.sandbox_config = Some(SandboxManagerImpl::default_config());
         }
         // 1. Create agent via agent manager
@@ -5215,6 +5260,12 @@ impl AgentKernelImpl {
             .agent_manager
             .get_agent_provider(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
+        let tools = self
+            .tool_registry
+            .definitions_for_agent(&self.syscall_gate, agent_id);
+        self.connector
+            .validate_primary_tool_policy(&provider_id, &tools)
+            .map_err(KernelError::Connector)?;
         let restored_history = self.context_manager.latest_execution_history(agent_id)?;
         let session = self
             .connector
@@ -5297,6 +5348,18 @@ impl AgentKernelImpl {
                 .usage
                 .charged_cost_micros
                 .saturating_sub(baseline_usage.charged_cost_micros),
+            degraded_requests: output
+                .usage
+                .degraded_requests
+                .saturating_sub(baseline_usage.degraded_requests),
+            dropped_native_tool_definitions: output
+                .usage
+                .dropped_native_tool_definitions
+                .saturating_sub(baseline_usage.dropped_native_tool_definitions),
+            shim_recovered_tool_calls: output
+                .usage
+                .shim_recovered_tool_calls
+                .saturating_sub(baseline_usage.shim_recovered_tool_calls),
         };
         self.agent_manager.record_activity(agent_id);
         ObservabilityEngine::record_metrics(

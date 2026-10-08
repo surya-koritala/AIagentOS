@@ -18,13 +18,35 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   GitHub CI checks shipped binary restart, rule isolation, tool denial,
   planning bounds, quota admission, and cancellation. Relates #338.
 
-- Added trusted first-operator tenant bootstrap and tenant-admin user/key
-  administration through the public wire, Rust SDK, and `agentctl`. Key
-  inventory and revocation use non-secret IDs, issuance prints the secret once,
-  and mutations emit actor/target audit events. Keyless CI drives shipped
-  binaries through multi-tenant isolation, permission/quota denials, credential
-  revocation, and process restart. Relates #329 and #330.
-### Persistence
+- Added explicitly configured Hugging Face chat-router requests with shared
+  native function, usage and SSE decoding. Legacy completions reject direct
+  native tools, retain the audited governed shim and mark usage estimated.
+  Dated upstream compatibility references and keyless CI fixtures cover both
+  modes; live qualification remains not run. Relates #355.
+
+- Added explicit native-tool policy for an incompatible primary provider.
+  Operators can reject before request/failover I/O or retain the default governed
+  plaintext shim with one per-session degradation audit and per-turn counters.
+  Prompt overhead is included in context and token admission. Relates #356.
+
+- Added bounded native Ollama NDJSON and per-token Candle progress through a
+  stateful tokenizer and cancellable bounded worker bridge. Ollama template
+  retries are admitted and counted; real-model stream/batch parity and
+  mid-decode cleanup are mandatory protected qualification checks. Controlled
+  fixtures run in CI; real-model evidence remains not run. Relates #353.
+
+- Added bounded native Anthropic Messages and Gemini SSE streams with shared
+  byte framing, cancellation, usage and tool assembly. Signed thinking and
+  Gemini streamed Content boundaries survive durable history; schema 12 refuses
+  readers that would flatten signatures. Keyless conformance and restart
+  fixtures run on CI; real-service qualification remains pending. Relates #352.
+
+- Added native bounded SSE streaming for OpenAI, Groq, DeepSeek and vLLM,
+  using Azure's shared byte-safe reader. Keyless nine-provider conformance
+  fixtures cover capability declarations, parallel tool argument assembly,
+  usage, cancellation, deadlines, wire ceilings and partial-output replay
+  suppression. Real-service qualification remains pending. Closes #351.
+
 - Add protected current-user Windows DACLs at private file/directory creation,
   handle-based ownership and reparse rejection, write-through storage publication,
   and native permission/durability CI regressions. Physical power-loss and final
@@ -57,6 +79,21 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   durable mutation revisions, bounded cache eviction and erasure cleanup. LSH
   candidate compression and partial selection preserve search results; the 10k
   qualification also requires ANN p95 below exact search. Relates #357.
+- Add native Linux and macOS arm64 release targets, architecture-bound desktop
+  updater assets, fail-closed platform documentation checks, and fresh-runner ARM
+  CLI installation evidence. Native desktop signing and public installer
+  qualification remain open (#344, #346).
+- Added trusted first-operator tenant bootstrap and tenant-admin user/key
+  administration through the public wire, Rust SDK, and `agentctl`. Key
+  inventory and revocation use non-secret IDs, issuance prints the secret once,
+  and mutations emit actor/target audit events. Keyless CI drives shipped
+  binaries through multi-tenant isolation, permission/quota denials, credential
+  revocation, and process restart. Relates #329 and #330.
+
+- Added native ARM64/Intel macOS App Sandbox feasibility probes and exact-source
+  evidence. Documented actual temporary-directory, executable, process-group,
+  and resource-limit gaps; untrusted native process execution stays unavailable.
+  Issue #335 remains open pending a supported complete boundary.
 
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,
@@ -1522,7 +1559,6 @@ end-to-end. (64 commits since 0.1.0.)
 - **First-class multi-tenancy** — a tenant model atop namespaces/cgroups/auth;
   cross-tenant tool/IPC/state access is denied at the gate (#93).
 
-### Persistence
 
 - **Durable agent registry** — agents (and conversations/memory/KV/snapshots)
   survive a process restart; enforcement is re-armed on rehydrate (#92).

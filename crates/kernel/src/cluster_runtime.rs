@@ -5038,9 +5038,13 @@ mod tests {
                 .expect("node 3")
                 .ensure_configured_membership(false),
         );
-        first.expect("settle generation one on node 1");
-        second.expect("settle generation one on node 2");
-        third.expect("settle generation one on removed voter");
+        assert!(
+            first.is_ok() && second.is_ok() && third.is_ok(),
+            "generation-one settlement failed: node 1={first:?}, node 2={second:?}, node 3={third:?}; metrics: node 1={:?}, node 2={:?}, node 3={:?}",
+            reconfigured[0].as_ref().unwrap().metrics().borrow().clone(),
+            reconfigured[1].as_ref().unwrap().metrics().borrow().clone(),
+            reconfigured[2].as_ref().unwrap().metrics().borrow().clone(),
+        );
 
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {

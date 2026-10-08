@@ -1,0 +1,13 @@
+{"at":"2026-10-08T07:45:27.024454744Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:27.024454744Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:27.024454744Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:27.024454744Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:27.024454744Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:27.024454744Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:27.024454744Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:30.754359957Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T07:45:30.754359957Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T07:45:31.547068970Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"patch","detail":"src/lib.rs"}
+{"at":"2026-10-08T07:45:32.462081811Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"test_started","detail":"dbbcc9ef-ec6d-4772-a0b2-0ae29478d806"}
+{"at":"2026-10-08T07:45:34.698046252Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"test_completed","detail":"0"}
+{"at":"2026-10-08T07:45:34.866040106Z","agent":"465b0610-4fd7-4025-86f2-cd25d487eef8","action":"selected","detail":"explicit first passing candidate policy"}

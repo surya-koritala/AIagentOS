@@ -197,7 +197,7 @@ fn registry_is_complete_and_honest() {
     }
     assert_eq!(
         registry.capability.len(),
-        25,
+        26,
         "every roadmap child issue must have a capability decision"
     );
 
@@ -248,7 +248,7 @@ fn registry_is_complete_and_honest() {
         "adding or removing a public kernel module requires a capability classification"
     );
 
-    let expected_issues: BTreeSet<u64> = (106..=128).chain([392, 393]).collect();
+    let expected_issues: BTreeSet<u64> = (106..=128).chain([392, 393, 394]).collect();
     assert_eq!(
         issues, expected_issues,
         "every child roadmap issue must be represented exactly once"
@@ -1588,7 +1588,9 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         .join(" ");
     for contract in [
         "**qualification artifacts only**",
-        "Production requirement still open",
+        "Support tier",
+        "CI candidate; native signing and clean-host qualification pending",
+        "SUPPORTED_PLATFORMS.md",
         "do not replace native platform signing",
         "signed-updater foundation",
         "TAURI_SIGNING_PRIVATE_KEY",

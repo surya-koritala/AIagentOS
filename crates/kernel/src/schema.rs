@@ -12,11 +12,11 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 12;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
-// Older readers cannot preserve native assistant replay state, binary fact
-// embeddings, or clone security.
-pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 11;
+// Older adapters flatten streamed native Content boundaries even when they
+// retain opaque metadata. Refuse them before they can mutate this history.
+pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 12;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
@@ -30,6 +30,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (9, "add-atomic-agent-clone-lifecycle"),
     (10, "retain-fact-indexes-with-binary-embeddings"),
     (11, "preserve-native-provider-history-metadata"),
+    (12, "preserve-streamed-native-content-boundaries"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

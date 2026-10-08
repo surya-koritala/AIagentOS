@@ -73,12 +73,17 @@ jobs:
           cp target/qualification/public-claims/registry.original docs/capabilities.toml
           git diff --exit-code docs/capabilities.toml
           printf '%s\n' 'real downgrade rejected; repository tiers restored' > target/qualification/public-claims/downgrade-result.txt
-      - name: Retain external repository framing without changing it
+      - name: Verify and retain actual external repository framing
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_RUNTIME_DESCRIPTION: 'A governed user-space runtime and control plane for long-lived AI agents, with lifecycle, scheduling, durable context, tool authorization, quotas and operator interfaces.'
         run: |
           gh api repos/${{ github.repository }} --jq '{description,topics}' > target/qualification/public-claims/external-metadata.json
-          printf '%s\n' 'External metadata is read-only; proposed update remains an open acceptance item.' > target/qualification/public-claims/external-metadata-status.txt
+          jq -e --arg description "$EXPECTED_RUNTIME_DESCRIPTION" '
+            .description == $description and
+            (.topics | sort) == (["agent-runtime","control-plane","ai-agents","multi-agent","llm","rust"] | sort)
+          ' target/qualification/public-claims/external-metadata.json
+          printf '%s\n' 'Runtime description and topics verified against the recorded framing.' > target/qualification/public-claims/external-metadata-status.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

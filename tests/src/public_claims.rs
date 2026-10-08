@@ -181,21 +181,21 @@ fn claim_errors(registry: &Registry, path: &str, text: &str) -> Vec<String> {
                             })
                     })
                 }) && ![
-                        "not ",
-                        "pending",
-                        "requires",
-                        "until",
-                        "remain",
-                        "future",
-                        "conditional",
-                    ]
-                    .iter()
-                    .any(|condition| lower.contains(condition))
+                    "not ",
+                    "pending",
+                    "requires",
+                    "until",
+                    "remain",
+                    "future",
+                    "conditional",
+                ]
+                .iter()
+                .any(|condition| lower.contains(condition))
                 {
-                        errors.push(format!(
-                            "{path}:{}: unbound current evidence status {cell:?}",
-                            index + 1
-                        ));
+                    errors.push(format!(
+                        "{path}:{}: unbound current evidence status {cell:?}",
+                        index + 1
+                    ));
                 }
             }
         } else {

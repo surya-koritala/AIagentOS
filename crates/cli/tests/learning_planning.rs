@@ -811,6 +811,8 @@ async fn planning_quota_denial_happens_before_provider_io() {
 }
 
 fn binary_command(home: &Path) -> Command {
+    let child_temporary = home.join("process-temp");
+    std::fs::create_dir_all(&child_temporary).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent"));
     #[cfg(windows)]
     child
@@ -824,6 +826,11 @@ fn binary_command(home: &Path) -> Command {
         "LOCALAPPDATA",
     ] {
         child.env(name, home);
+    }
+    // Preserve this child's managed workspace root across actual restarts,
+    // independently of concurrent kernels and the private database parent.
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        child.env(name, &child_temporary);
     }
     child.env("RUST_LOG", "error");
     child

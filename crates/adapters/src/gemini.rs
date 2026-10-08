@@ -54,17 +54,36 @@ struct GeminiSession {
 
 impl GeminiSession {
     async fn stream(
-        &self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions,
-        cancellation: &tokio_util::sync::CancellationToken, events: Option<ProviderEventSink>,
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: Option<ProviderEventSink>,
     ) -> Result<LlmResponse, ConnectorError> {
         let mut body = protocol::request(&messages, tools, &self.provider_id, &self.model)?;
         if let Some(max_output_tokens) = options.max_output_tokens {
             body["generationConfig"] = serde_json::json!({"maxOutputTokens": max_output_tokens});
         }
-        let request = self.client.post(format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", self.base_url.trim_end_matches('/'), self.model))
-            .header("x-goog-api-key", &self.api_key).json(&body);
+        let request = self
+            .client
+            .post(format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.base_url.trim_end_matches('/'),
+                self.model
+            ))
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body);
         let state = protocol::GeminiStream::new(self.provider_id.clone(), self.model.clone());
-        crate::streaming::send_native_sse_controlled(&self.provider_id, request, state, options, cancellation, events).await
+        crate::streaming::send_native_sse_controlled(
+            &self.provider_id,
+            request,
+            state,
+            options,
+            cancellation,
+            events,
+        )
+        .await
     }
 }
 
@@ -126,29 +145,51 @@ impl LlmSession for GeminiSession {
     }
 
     async fn send_streaming(
-        &self, messages: Vec<StandardMessage>, tools: &[ToolDefinition],
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
-        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default()).await
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
     }
 
     async fn send_streaming_with_options(
-        &self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions,
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
-        self.stream(messages, tools, options, &tokio_util::sync::CancellationToken::new(), None).await
+        self.stream(
+            messages,
+            tools,
+            options,
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
     }
 
     async fn send_streaming_controlled(
-        &self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions,
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
-        self.stream(messages, tools, options, cancellation, None).await
+        self.stream(messages, tools, options, cancellation, None)
+            .await
     }
 
     async fn send_streaming_events_controlled(
-        &self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions,
-        cancellation: &tokio_util::sync::CancellationToken, events: ProviderEventSink,
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
-        self.stream(messages, tools, options, cancellation, Some(events)).await
+        self.stream(messages, tools, options, cancellation, Some(events))
+            .await
     }
 
     fn enforces_max_output_tokens(&self) -> bool {

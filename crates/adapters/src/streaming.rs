@@ -402,16 +402,18 @@ pub(crate) async fn send_native_sse_controlled<D: NativeSseProtocol>(
         if !response.status().is_success() {
             return Err(crate::provider_http_error(provider, response).await);
         }
-        if response.content_length().is_some_and(|size| size > MAX_OPENAI_STREAM_BYTES as u64) {
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_OPENAI_STREAM_BYTES as u64)
+        {
             return Err(protocol("response exceeded the 8 MiB wire ceiling"));
         }
         let mut bytes = response.bytes_stream();
         let mut total = 0_usize;
         let mut decoder = SseDecoder::default();
         while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(|_| {
-                ConnectorError::StreamError("native SSE transport failed".into())
-            })?;
+            let chunk = chunk
+                .map_err(|_| ConnectorError::StreamError("native SSE transport failed".into()))?;
             total = total.saturating_add(chunk.len());
             if total > MAX_OPENAI_STREAM_BYTES {
                 return Err(protocol("response exceeded the 8 MiB wire ceiling"));
@@ -438,7 +440,9 @@ pub(crate) async fn send_native_sse_controlled<D: NativeSseProtocol>(
         }
         // An unfinished line/event is a broken wire frame, not a clean EOF.
         if !decoder.line.is_empty() || decoder.has_data {
-            return Err(ConnectorError::StreamError("native SSE ended inside an event".into()));
+            return Err(ConnectorError::StreamError(
+                "native SSE ended inside an event".into(),
+            ));
         }
         state.finish()
     };

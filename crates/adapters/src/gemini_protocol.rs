@@ -272,7 +272,11 @@ fn assistant_parts(
         let ids = payload["tool_call_ids"]
             .as_array()
             .ok_or_else(|| invalid("missing saved function call ids"))?;
-        let max_parts = if stream_chunk_counts(payload)?.is_some() { 4096 } else { MAX_PARTS };
+        let max_parts = if stream_chunk_counts(payload)?.is_some() {
+            4096
+        } else {
+            MAX_PARTS
+        };
         let parsed = parse_bounded_parts(&payload["parts"], Some(ids), max_parts, false)?;
         (payload["parts"].clone(), parsed)
     } else {
@@ -380,14 +384,21 @@ pub(super) fn request(
                     }
                     pending.insert(call.id.clone(), (call.name.clone(), native_id, order));
                 }
-                if let Some(counts) = message.provider_metadata.as_ref()
+                if let Some(counts) = message
+                    .provider_metadata
+                    .as_ref()
                     .map(|metadata| stream_chunk_counts(metadata.payload()))
-                    .transpose()?.flatten()
+                    .transpose()?
+                    .flatten()
                 {
-                    let parts = parts.as_array().ok_or_else(|| invalid("invalid streamed replay parts"))?;
+                    let parts = parts
+                        .as_array()
+                        .ok_or_else(|| invalid("invalid streamed replay parts"))?;
                     let mut offset = 0;
                     for count in counts {
-                        contents.push(json!({"role": "model", "parts": &parts[offset..offset + count]}));
+                        contents.push(
+                            json!({"role": "model", "parts": &parts[offset..offset + count]}),
+                        );
                         offset += count;
                     }
                 } else {
@@ -455,13 +466,19 @@ pub(super) fn request(
 }
 
 fn stream_chunk_counts(payload: &Value) -> Result<Option<Vec<usize>>, ConnectorError> {
-    let Some(raw) = payload.get("chunk_part_counts") else { return Ok(None); };
-    let values = raw.as_array().filter(|values| !values.is_empty() && values.len() <= 2048)
+    let Some(raw) = payload.get("chunk_part_counts") else {
+        return Ok(None);
+    };
+    let values = raw
+        .as_array()
+        .filter(|values| !values.is_empty() && values.len() <= 2048)
         .ok_or_else(|| invalid("invalid streamed replay chunk counts"))?;
     let mut counts = Vec::with_capacity(values.len());
     let mut total = 0_usize;
     for value in values {
-        let count = value.as_u64().and_then(|value| usize::try_from(value).ok())
+        let count = value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0 && *value <= MAX_PARTS)
             .ok_or_else(|| invalid("invalid streamed replay part count"))?;
         total = total.saturating_add(count);
@@ -487,8 +504,16 @@ pub(super) struct GeminiStream {
 
 impl GeminiStream {
     pub(super) fn new(provider: ProviderId, model: String) -> Self {
-        Self { provider, model, parts: Vec::new(), chunk_part_counts: Vec::new(), retained_bytes: 0,
-            usage: Value::Null, finish_reason: None, has_calls: false }
+        Self {
+            provider,
+            model,
+            parts: Vec::new(),
+            chunk_part_counts: Vec::new(),
+            retained_bytes: 0,
+            usage: Value::Null,
+            finish_reason: None,
+            has_calls: false,
+        }
     }
 }
 
@@ -499,19 +524,31 @@ impl crate::streaming::NativeSseProtocol for GeminiStream {
         }
         if let Some(reason) = json["promptFeedback"]["blockReason"].as_str() {
             if reason != "BLOCK_REASON_UNSPECIFIED" {
-                return Err(ConnectorError::content_filtered(self.provider.clone(), "Gemini blocked the streamed prompt", None));
+                return Err(ConnectorError::content_filtered(
+                    self.provider.clone(),
+                    "Gemini blocked the streamed prompt",
+                    None,
+                ));
             }
         }
         let mut texts = Vec::new();
         if let Some(candidates) = json["candidates"].as_array() {
-            if candidates.len() > 1 { return Err(invalid("multiple streamed candidates are unsupported")); }
+            if candidates.len() > 1 {
+                return Err(invalid("multiple streamed candidates are unsupported"));
+            }
             if let Some(candidate) = candidates.first() {
                 if candidate["index"].as_u64().unwrap_or(0) != 0 {
                     return Err(invalid("unexpected streamed candidate index"));
                 }
                 if let Some(reason) = candidate["finishReason"].as_str() {
-                    if let Some(error) = crate::content_filter_error(&self.provider, Some(reason)) { return Err(error); }
-                    if self.finish_reason.as_deref().is_some_and(|previous| previous != reason) {
+                    if let Some(error) = crate::content_filter_error(&self.provider, Some(reason)) {
+                        return Err(error);
+                    }
+                    if self
+                        .finish_reason
+                        .as_deref()
+                        .is_some_and(|previous| previous != reason)
+                    {
                         return Err(invalid("stream changed its finish reason"));
                     }
                     self.finish_reason = Some(reason.to_string());
@@ -520,21 +557,33 @@ impl crate::streaming::NativeSseProtocol for GeminiStream {
                     if content["role"].as_str().is_some_and(|role| role != "model") {
                         return Err(invalid("stream content must have the model role"));
                     }
-                    let parts = content["parts"].as_array().filter(|parts| !parts.is_empty() && parts.len() <= MAX_PARTS)
+                    let parts = content["parts"]
+                        .as_array()
+                        .filter(|parts| !parts.is_empty() && parts.len() <= MAX_PARTS)
                         .ok_or_else(|| invalid("invalid streamed parts"))?;
-                    if self.parts.len().saturating_add(parts.len()) > 4096 || self.chunk_part_counts.len() >= 2048 {
+                    if self.parts.len().saturating_add(parts.len()) > 4096
+                        || self.chunk_part_counts.len() >= 2048
+                    {
                         return Err(invalid("streamed replay part or chunk limit exceeded"));
                     }
                     // Validate an entire chunk before publishing any text from it.
                     parse_bounded_parts(&content["parts"], None, MAX_PARTS, true)?;
                     for part in parts {
                         self.retained_bytes = self.retained_bytes.saturating_add(
-                            serde_json::to_vec(part).map_err(|_| invalid("invalid streamed part"))?.len() + 1);
+                            serde_json::to_vec(part)
+                                .map_err(|_| invalid("invalid streamed part"))?
+                                .len()
+                                + 1,
+                        );
                         if self.retained_bytes > ProviderMessageMetadata::MAX_BYTES - 16 * 1024 {
                             return Err(invalid("stream exceeds the replay byte limit"));
                         }
                         if part["thought"].as_bool() != Some(true) {
-                            if let Some(text) = part["text"].as_str().filter(|text| !text.is_empty()) { texts.push(text.to_string()); }
+                            if let Some(text) =
+                                part["text"].as_str().filter(|text| !text.is_empty())
+                            {
+                                texts.push(text.to_string());
+                            }
                         }
                         self.has_calls |= part.get("functionCall").is_some();
                         self.parts.push(part.clone());
@@ -546,8 +595,12 @@ impl crate::streaming::NativeSseProtocol for GeminiStream {
             return Err(invalid("stream has no candidates or usage"));
         }
         if let Some(usage) = json.get("usageMetadata") {
-            if !usage.is_object() { return Err(invalid("invalid streamed usage")); }
-            if !self.usage.is_object() { self.usage = json!({}); }
+            if !usage.is_object() {
+                return Err(invalid("invalid streamed usage"));
+            }
+            if !self.usage.is_object() {
+                self.usage = json!({});
+            }
             for (key, value) in usage.as_object().expect("validated usage object") {
                 self.usage[key] = value.clone();
             }
@@ -562,21 +615,42 @@ impl crate::streaming::NativeSseProtocol for GeminiStream {
 
     fn finish(self) -> Result<LlmResponse, ConnectorError> {
         if self.has_calls && self.finish_reason.is_none() {
-            return Err(ConnectorError::StreamError("Gemini stream ended before native calls completed".into()));
+            return Err(ConnectorError::StreamError(
+                "Gemini stream ended before native calls completed".into(),
+            ));
         }
         let parts = Value::Array(self.parts);
         let parsed = parse_bounded_parts(&parts, None, 4096, false)?;
-        if parsed.calls.len() > 64 { return Err(invalid("stream contains too many function calls")); }
+        if parsed.calls.len() > 64 {
+            return Err(invalid("stream contains too many function calls"));
+        }
         let ids: Vec<_> = parsed.calls.iter().map(|call| call.id.clone()).collect();
-        let metadata = ProviderMessageMetadata::new(self.provider, self.model,
-            json!({"parts": parts, "tool_call_ids": ids, "chunk_part_counts": self.chunk_part_counts}))?;
+        let metadata = ProviderMessageMetadata::new(
+            self.provider,
+            self.model,
+            json!({"parts": parts, "tool_call_ids": ids, "chunk_part_counts": self.chunk_part_counts}),
+        )?;
         let usage = if self.usage.is_object() {
-            LlmUsage::reported(crate::json_usage_u32(&self.usage["promptTokenCount"]),
-                crate::json_usage_u32(&self.usage["candidatesTokenCount"]).saturating_add(crate::json_usage_u32(&self.usage["thoughtsTokenCount"])),
-                crate::json_usage_u32(&self.usage["cachedContentTokenCount"]))
-        } else { LlmUsage::default() };
-        Ok(LlmResponse { content: parsed.content, finish_reason: self.finish_reason,
-            tokens_used: self.usage.get("totalTokenCount").map(crate::json_usage_u32).unwrap_or_else(|| usage.total()),
-            usage, tool_calls: parsed.calls, provider_metadata: Some(metadata) })
+            LlmUsage::reported(
+                crate::json_usage_u32(&self.usage["promptTokenCount"]),
+                crate::json_usage_u32(&self.usage["candidatesTokenCount"])
+                    .saturating_add(crate::json_usage_u32(&self.usage["thoughtsTokenCount"])),
+                crate::json_usage_u32(&self.usage["cachedContentTokenCount"]),
+            )
+        } else {
+            LlmUsage::default()
+        };
+        Ok(LlmResponse {
+            content: parsed.content,
+            finish_reason: self.finish_reason,
+            tokens_used: self
+                .usage
+                .get("totalTokenCount")
+                .map(crate::json_usage_u32)
+                .unwrap_or_else(|| usage.total()),
+            usage,
+            tool_calls: parsed.calls,
+            provider_metadata: Some(metadata),
+        })
     }
 }

@@ -116,13 +116,25 @@ async fn nine_network_adapters_conform_to_declared_streaming() {
             .mount(&server)
             .await;
     }
-    Mock::given(method("POST")).and(path("/messages"))
+    Mock::given(method("POST"))
+        .and(path("/messages"))
         .and(body_partial_json(json!({"stream": true, "max_tokens": 41})))
-        .respond_with(ResponseTemplate::new(200).set_body_string(crate::native_messages_streaming_tests::anthropic_text_fixture()))
-        .expect(1).mount(&server).await;
-    Mock::given(method("POST")).and(path("/v1beta/models/fixture:streamGenerateContent"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(crate::native_messages_streaming_tests::gemini_text_fixture()))
-        .expect(1).mount(&server).await;
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(crate::native_messages_streaming_tests::anthropic_text_fixture()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/fixture:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(crate::native_messages_streaming_tests::gemini_text_fixture()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let fallback_fixtures = [
         ("/models/fixture", json!([{"generated_text": "Hello 🌐"}])),
         (

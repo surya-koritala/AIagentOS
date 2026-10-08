@@ -14,6 +14,8 @@ one entry name; atomic replacement updates that entry, so the handle reads its
 current contents rather than preserving an old inode snapshot. A changed or
 renamed directory binding and a replaced sandbox revoke existing references.
 Operations never fall back to resolving an ambient host path.
+On Windows, retained native directory capabilities prevent directory rename or
+deletion until all references close; fresh opens then resolve the new binding.
 
 Rights are explicit: `read`, `write`, `list`, and `stat`. `open_at` and `dup`
 can only preserve or remove the parent's rights. Duplicate descriptors close

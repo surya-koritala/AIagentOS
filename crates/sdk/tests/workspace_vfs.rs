@@ -316,7 +316,52 @@ async fn workspace_capabilities_never_follow_a_replaced_directory_binding() {
         )
         .await
         .unwrap();
-    std::fs::rename(f.root.join("project"), f.root.join("original")).unwrap();
+    let renamed = std::fs::rename(f.root.join("project"), f.root.join("original"));
+    #[cfg(not(windows))]
+    renamed.unwrap();
+    #[cfg(windows)]
+    if let Err(error) = renamed {
+        // cap-primitives deliberately omits FILE_SHARE_DELETE for directories.
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &file.id, 0, 64)
+                .await
+                .unwrap()
+                .bytes,
+            [0u8, 255, 1, 2, 3, 128]
+        );
+        client.vfs_close(&agent, &file.id).await.unwrap();
+        client.vfs_close(&agent, &dir.id).await.unwrap();
+        std::fs::rename(f.root.join("project"), f.root.join("original")).unwrap();
+        std::fs::create_dir(f.root.join("project")).unwrap();
+        std::fs::write(f.root.join("project/file.bin"), b"different binding").unwrap();
+        assert!(client
+            .vfs_read_bytes(&agent, &file.id, 0, 64)
+            .await
+            .is_err());
+        assert!(client.vfs_list_workspace(&agent, &dir.id).await.is_err());
+        let fresh = client
+            .vfs_open_workspace(
+                &agent,
+                request(
+                    "/workspace/project/file.bin",
+                    WorkspaceKind::File,
+                    &[WorkspaceRight::Read],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .vfs_read_bytes(&agent, &fresh.id, 0, 64)
+                .await
+                .unwrap()
+                .bytes,
+            b"different binding"
+        );
+        return;
+    }
     std::fs::create_dir(f.root.join("project")).unwrap();
     std::fs::write(f.root.join("project/file.bin"), b"different binding").unwrap();
     assert!(client

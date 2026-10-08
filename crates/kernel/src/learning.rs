@@ -160,7 +160,7 @@ impl RuleStore {
 
     pub fn remove_rule(&self, id: &str) -> io::Result<bool> {
         self.check_health()?;
-        uuid::Uuid::parse_str(id).map_err(|_| invalid("rule id must be a UUID"))?;
+        let id = uuid::Uuid::parse_str(id).map_err(|_| invalid("rule id must be a UUID"))?.to_string();
         let mut rules = self.rules.lock().map_err(|_| invalid("correction store lock failed"))?;
         self.check_health()?;
         let mut updated = rules.clone();

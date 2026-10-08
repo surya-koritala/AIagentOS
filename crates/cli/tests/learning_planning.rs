@@ -102,6 +102,9 @@ async fn persisted_rules_reach_actual_request_but_not_other_agents_or_tenants() 
     store.add_rule("rust".into(), "Private operator preference".into(), RuleScope::local_cli()).unwrap();
     let peer = kernel.create_agent_full(agent_config("peer-agent")).await.unwrap();
     kernel.send_message(peer.id, "write rust code").await.unwrap();
+    let foreign_conversation = kernel.context_manager.list_conversations().into_iter().find(|(_, owner, _)| owner == &peer.id.to_string()).unwrap().0;
+    assert!(kernel.configure_local_cli_agent(local.id, store.clone(), "bad".into(), Some(&foreign_conversation)).await.is_err());
+    assert!(kernel.configure_local_cli_agent(local.id, Arc::new(RuleStore::for_scope(RuleScope::local_cli(), "forged operator")), "bad".into(), None).await.is_err());
     let tenant = kernel.create_tenant("foreign tenant").await.unwrap();
     let foreign = kernel.create_agent_for_tenant(&tenant, agent_config("foreign-agent")).await.unwrap();
     assert!(kernel.configure_local_cli_agent(foreign.id, store, "bad".into(), None).await.is_err());
@@ -167,7 +170,7 @@ async fn planning_cancellation_drains_provider_admission() {
     let running_kernel = kernel.clone();
     let running = tokio::spawn(async move { running_kernel.generate_plan(local.id, "plan slowly").await });
     tokio::time::timeout(Duration::from_secs(5), async {
-        while requests.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        while requests.lock().unwrap().is_empty() { tokio::time::sleep(Duration::from_millis(5)).await; }
     }).await.unwrap();
     assert!(kernel.cancel_local_turn(local.id));
     assert!(tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap().is_err());

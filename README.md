@@ -102,6 +102,9 @@ cargo run --package os-benchmark --bin governance-demo --locked
 
 Durable pause/resume semantics and their hosted-provider limitations are
 documented in [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md).
+Durable agent cloning, capability attenuation, fresh workspace/handle semantics
+and explicit retry reconciliation are documented in
+[docs/DURABLE_EXECUTION_HISTORY.md](docs/DURABLE_EXECUTION_HISTORY.md).
 The scheduling states, fairness unit, queue bounds, and Linux EEVDF differences
 are documented in [docs/SCHEDULER.md](docs/SCHEDULER.md).
 The token estimate, pinned-state, durable spill, page-in, and backpressure

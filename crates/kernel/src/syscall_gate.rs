@@ -298,6 +298,21 @@ pub struct AgentGateInfo {
     pub namespaces: Vec<NamespaceId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloneGateSnapshot {
+    pub capabilities: CapabilitySet,
+    pub cgroup: CgroupId,
+    pub namespaces: Vec<NamespaceId>,
+    pub mac_label: String,
+    authorization_revision: u64,
+}
+
+pub(crate) fn capability_bit(name: &str) -> Option<u64> {
+    CAPABILITY_NAMES
+        .iter()
+        .find_map(|(bit, label)| (*label == name).then_some(*bit))
+}
+
 /// All known capability bits paired with their human-readable name. The single
 /// source of truth for [`capability_names`]; kept in sync with the
 /// `CapabilitySet::CAP_*` constants.
@@ -443,6 +458,62 @@ pub struct SyscallGate {
 }
 
 impl SyscallGate {
+    pub(crate) async fn capture_clone_security(
+        &self,
+        agent: uuid::Uuid,
+    ) -> Result<CloneGateSnapshot, String> {
+        let mac = self.mac.lock().await;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| "clone gate lock poisoned".to_string())?;
+        let record = self
+            .records
+            .get(&agent)
+            .ok_or_else(|| "clone parent is not registered".to_string())?;
+        if self.cgroups.has_active_agent_tool_calls(record.pid) {
+            return Err("clone parent has live tool execution".into());
+        }
+        let label = mac
+            .get_label(record.pid)
+            .ok_or_else(|| "clone parent MAC label unavailable".to_string())?;
+        Ok(CloneGateSnapshot {
+            capabilities: record.caps.clone(),
+            cgroup: record.cgroup,
+            namespaces: record.namespaces.clone(),
+            mac_label: label.into(),
+            authorization_revision: record.authorization_revision,
+        })
+    }
+
+    pub(crate) async fn with_clone_security<T>(
+        &self,
+        agent: uuid::Uuid,
+        captured: &CloneGateSnapshot,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let mac = self.mac.lock().await;
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| "clone gate lock poisoned".to_string())?;
+        let current = self
+            .records
+            .get(&agent)
+            .ok_or_else(|| "clone parent registration was revoked".to_string())?;
+        if self.cgroups.has_active_agent_tool_calls(current.pid) {
+            return Err("clone parent has live tool execution".into());
+        }
+        if current.caps != captured.capabilities
+            || current.cgroup != captured.cgroup
+            || current.namespaces != captured.namespaces
+            || current.authorization_revision != captured.authorization_revision
+            || mac.get_label(current.pid) != Some(captured.mac_label.as_str())
+        {
+            return Err("clone parent authorization changed during creation".into());
+        }
+        Ok(commit())
+    }
     fn tool_namespace_state(&self, tool_name: &str) -> ToolNamespaceState {
         ToolNamespaceState {
             namespace: self.tool_namespaces.get(tool_name).map(|state| *state),
@@ -711,12 +782,32 @@ impl SyscallGate {
         self.try_register_agent_with_cgroup_policy(kid, caps, Some(cgroup), true)
     }
 
+    pub(crate) fn try_register_managed_agent_closed(
+        &self,
+        kid: uuid::Uuid,
+        caps: CapabilitySet,
+        cgroup: CgroupId,
+    ) -> Result<Pid, GateMutationError> {
+        self.try_register_agent_with_admission(kid, caps, Some(cgroup), true, false)
+    }
+
     fn try_register_agent_with_cgroup_policy(
         &self,
         kid: uuid::Uuid,
         caps: CapabilitySet,
         cgroup: Option<CgroupId>,
         managed_cgroup: bool,
+    ) -> Result<Pid, GateMutationError> {
+        self.try_register_agent_with_admission(kid, caps, cgroup, managed_cgroup, true)
+    }
+
+    fn try_register_agent_with_admission(
+        &self,
+        kid: uuid::Uuid,
+        caps: CapabilitySet,
+        cgroup: Option<CgroupId>,
+        managed_cgroup: bool,
+        accepting: bool,
     ) -> Result<Pid, GateMutationError> {
         let _mutation = self.mutation_lock.lock().unwrap();
         if self.records.contains_key(&kid) {
@@ -740,7 +831,7 @@ impl SyscallGate {
                 cgroup_revision,
                 cgroup_changes,
                 registration_revision: authorization_revision,
-                accepting_tool_calls: true,
+                accepting_tool_calls: accepting,
                 namespaces: Vec::new(),
                 authorization_revision,
                 namespace_revision: authorization_revision,

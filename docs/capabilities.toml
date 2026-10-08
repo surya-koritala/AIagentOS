@@ -14,7 +14,7 @@
 # one platform, must be named explicitly in `limitations`.
 
 schema_version = 1
-updated = "2026-10-07"
+updated = "2026-10-08"
 model = [
   "scaffolded",
   "unit-tested",
@@ -32,6 +32,22 @@ verification_commands = [
   "cargo clippy --workspace --exclude tauri-app --all-targets -- -D warnings",
   "cargo run --package os-benchmark --bin os-benchmark",
 ]
+
+[[capability]]
+id = "durable-agent-cloning"
+title = "Durable copy-on-write execution branches"
+owner = "runtime"
+maturity = "public-api-e2e"
+release = "v0.4"
+tracking_issue = 393
+qualification_issue = 127
+kernel_modules = ["cloning"]
+source_paths = ["crates/kernel/src/cloning.rs", "crates/kernel/src/context/clone_store.rs", "crates/kernel/src/context/branching.rs", "crates/kernel/src/context/shared_spills.rs", "docs/DURABLE_EXECUTION_HISTORY.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::CloneAgent", "crates/sdk/src/lib.rs::KernelClient::clone_agent", "crates/sdk/src/lib.rs::KernelClient::clone_agent_fenced", "crates/cli/src/bin/agentctl.rs::clone"]
+runtime_call_paths = ["crates/kernel/src/cloning.rs::AgentKernelImpl::clone_agent", "crates/kernel/src/lib.rs::AgentKernelImpl::ensure_executor"]
+test_evidence = ["crates/kernel/src/cloning.rs::tests", "crates/kernel/src/context/branching.rs::tests", "crates/kernel/src/context/shared_spills.rs::tests", "crates/sdk/tests/durable_conversation.rs", "crates/cli/tests/runtime_commands.rs", "benchmarks/cloning/2026-10-08-macos-arm64/README.md"]
+platforms = ["linux", "macos", "windows"]
+limitations = ["Public fixture regressions cover actual execution, durable spills, isolation, cleanup and restart; independent security review and target soak evidence remain pending under #127. Retained performance measurements are macOS arm64 fixtures, including first-promotion cost, and do not qualify production performance. Clones require idle Running or Paused parents with no retained generation checkpoint, moved cgroup or transient namespace membership. Workspaces, VFS handles, approvals, credentials, private facts/KV and live effects are not inherited; provider execution still materializes resolved history."]
 
 [[capability]]
 id = "claim-integrity"

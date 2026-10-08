@@ -627,6 +627,18 @@ impl AgentExecutor {
         self
     }
 
+    /// Seed a freshly created executor from history already verified and
+    /// resolved for its owning agent by the kernel context store.
+    pub(crate) fn with_restored_history(
+        mut self,
+        conversation_id: String,
+        messages: Vec<StandardMessage>,
+    ) -> Self {
+        self.conversation_id = conversation_id;
+        self.messages = messages;
+        self
+    }
+
     /// Set an event channel for streaming events to the caller.
     pub fn set_event_channel(&mut self, tx: mpsc::Sender<StreamEvent>) {
         self.event_tx = Some(tx);

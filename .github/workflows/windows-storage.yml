@@ -58,6 +58,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Bash resolves its own incomplete MSYS Perl before Strawberry Perl.
+      # Vendored SQLCipher/OpenSSL must use the native Windows distribution.
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
     defaults:
       run:
         shell: bash

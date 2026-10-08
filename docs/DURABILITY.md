@@ -28,8 +28,12 @@ DACL containing one `FILE_ALL_ACCESS` ACE. Private directory ACEs inherit to
 children while the protected DACL prevents permissive ancestors from adding
 trustees. `CREATE_NEW` and `CreateDirectoryW` receive their security descriptor
 at creation; key and configuration bytes are never written before the descriptor
-is attached. Narrowing an existing permissive object requires that exact current
-user owner. Foreign and administrator-group ownership is not silently adopted.
+is attached. An existing object's owner must match this process's exact
+`TokenUser` or its OS-selected `TokenOwner`; elevated Windows tokens can select
+an owner group by default. That owner is preserved while the DACL is narrowed
+to one current-`TokenUser` ACE. No arbitrary group or foreign user/SYSTEM owner
+is accepted, and production code never takes ownership or requests restoration
+privileges. New private objects explicitly receive `TokenUser` ownership.
 
 Windows reads inspect the opened handle with `FILE_FLAG_OPEN_REPARSE_POINT`,
 reject reparse objects and reparse ancestors, and validate private-key ownership

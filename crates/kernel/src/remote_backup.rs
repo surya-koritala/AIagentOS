@@ -670,7 +670,8 @@ impl<'a> S3Client<'a> {
         #[cfg(not(windows))]
         let opened = options.open(destination).await;
         #[cfg(windows)]
-        let opened = crate::windows_private_fs::create_new_file(destination).map(tokio::fs::File::from_std);
+        let opened =
+            crate::windows_private_fs::create_new_file(destination).map(tokio::fs::File::from_std);
         let mut output = opened.map_err(|error| {
             remote_error(format!(
                 "failed to create remote-backup staging file {}: {error}",
@@ -1222,24 +1223,37 @@ fn require_real_directory(path: &Path, label: &str) -> Result<(), ContextError> 
 
 fn create_private_directory(path: impl AsRef<Path>) -> std::io::Result<()> {
     #[cfg(windows)]
-    { crate::windows_private_fs::create_directory(path.as_ref()) }
+    {
+        crate::windows_private_fs::create_directory(path.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::create_dir(path) }
+    {
+        fs::create_dir(path)
+    }
 }
 
 fn rename_durable(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
     #[cfg(windows)]
-    { crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref()) }
+    {
+        crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::rename(source, destination) }
+    {
+        fs::rename(source, destination)
+    }
 }
 
 fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
     #[cfg(windows)]
-    crate::windows_private_fs::protect_path(path, true)
-        .map_err(|error| remote_error(format!("failed to protect remote-backup directory: {error}")))?;
+    crate::windows_private_fs::protect_path(path, true).map_err(|error| {
+        remote_error(format!(
+            "failed to protect remote-backup directory: {error}"
+        ))
+    })?;
     #[cfg(not(any(unix, windows)))]
-    return Err(remote_error("private remote-backup directory protection is unsupported"));
+    return Err(remote_error(
+        "private remote-backup directory protection is unsupported",
+    ));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1267,13 +1281,18 @@ fn sync_directory(path: &Path) -> Result<(), ContextError> {
 
 #[cfg(windows)]
 fn sync_directory(path: &Path) -> Result<(), ContextError> {
-    crate::windows_private_fs::sync_directory(path)
-        .map_err(|error| remote_error(format!("failed to persist remote-backup directory metadata: {error}")))
+    crate::windows_private_fs::sync_directory(path).map_err(|error| {
+        remote_error(format!(
+            "failed to persist remote-backup directory metadata: {error}"
+        ))
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
 fn sync_directory(_path: &Path) -> Result<(), ContextError> {
-    Err(remote_error("remote-backup directory durability is unsupported"))
+    Err(remote_error(
+        "remote-backup directory durability is unsupported",
+    ))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

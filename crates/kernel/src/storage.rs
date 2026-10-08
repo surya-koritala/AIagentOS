@@ -1216,31 +1216,47 @@ fn bounded_text(value: &str) -> String {
 
 fn create_private_directory(path: impl AsRef<Path>) -> std::io::Result<()> {
     #[cfg(windows)]
-    { crate::windows_private_fs::create_directory(path.as_ref()) }
+    {
+        crate::windows_private_fs::create_directory(path.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::create_dir(path) }
+    {
+        fs::create_dir(path)
+    }
 }
 
 fn create_private_directory_all(path: impl AsRef<Path>) -> std::io::Result<()> {
     #[cfg(windows)]
-    { crate::windows_private_fs::ensure_directory(path.as_ref()) }
+    {
+        crate::windows_private_fs::ensure_directory(path.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::create_dir_all(path) }
+    {
+        fs::create_dir_all(path)
+    }
 }
 
 #[cfg(test)]
 fn copy_private(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<u64> {
     #[cfg(windows)]
-    { crate::windows_private_fs::copy_private(source.as_ref(), destination.as_ref()) }
+    {
+        crate::windows_private_fs::copy_private(source.as_ref(), destination.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::copy(source, destination) }
+    {
+        fs::copy(source, destination)
+    }
 }
 
 fn rename_durable(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
     #[cfg(windows)]
-    { crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref()) }
+    {
+        crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::rename(source, destination) }
+    {
+        fs::rename(source, destination)
+    }
 }
 
 fn storage_error(message: impl Into<String>) -> ContextError {
@@ -1311,11 +1327,11 @@ pub(crate) fn acquire_storage_lease(database_path: &Path) -> Result<StorageLease
     #[cfg(windows)]
     let opened = crate::windows_private_fs::open_private_rw(&lock_path);
     let lock = opened.map_err(|error| {
-            storage_error(format!(
-                "failed to open storage lease {}: {error}",
-                lock_path.display()
-            ))
-        })?;
+        storage_error(format!(
+            "failed to open storage lease {}: {error}",
+            lock_path.display()
+        ))
+    })?;
     set_owner_only_file(&lock_path)?;
     lock.try_lock().map_err(|error| {
         storage_error(format!(
@@ -1394,8 +1410,8 @@ fn acquire_backup_publication_lock(root: &Path) -> Result<File, ContextError> {
     #[cfg(windows)]
     let opened = crate::windows_private_fs::open_private_rw(&publication_lock_path);
     let publication_lock = opened.map_err(|error| {
-            storage_error(format!("failed to open backup publication lock: {error}"))
-        })?;
+        storage_error(format!("failed to open backup publication lock: {error}"))
+    })?;
     let metadata = fs::symlink_metadata(&publication_lock_path).map_err(|error| {
         storage_error(format!(
             "failed to inspect opened backup publication lock: {error}"
@@ -1431,8 +1447,13 @@ fn reject_existing_path(path: &Path, label: &str) -> Result<(), ContextError> {
 
 fn require_regular_file(path: &Path, label: &str) -> Result<u64, ContextError> {
     #[cfg(windows)]
-    drop(crate::windows_private_fs::open_read(path, false)
-        .map_err(|error| storage_error(format!("{label} must be a regular non-reparse file: {error}")))?);
+    drop(
+        crate::windows_private_fs::open_read(path, false).map_err(|error| {
+            storage_error(format!(
+                "{label} must be a regular non-reparse file: {error}"
+            ))
+        })?,
+    );
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         storage_error(format!(
             "failed to inspect {label} {}: {error}",
@@ -1450,8 +1471,11 @@ fn require_regular_file(path: &Path, label: &str) -> Result<u64, ContextError> {
 
 fn require_real_directory(path: &Path, label: &str) -> Result<(), ContextError> {
     #[cfg(windows)]
-    crate::windows_private_fs::check_directory(path)
-        .map_err(|error| storage_error(format!("{label} must be a real non-reparse directory: {error}")))?;
+    crate::windows_private_fs::check_directory(path).map_err(|error| {
+        storage_error(format!(
+            "{label} must be a real non-reparse directory: {error}"
+        ))
+    })?;
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         storage_error(format!(
             "failed to inspect {label} {}: {error}",
@@ -1518,18 +1542,15 @@ fn write_manifest(path: &Path, manifest: &BackupManifest) -> Result<(), ContextE
         .map_err(|error| storage_error(format!("failed to serialize backup manifest: {error}")))?;
     bytes.push(b'\n');
     #[cfg(not(windows))]
-    let opened = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path);
+    let opened = OpenOptions::new().create_new(true).write(true).open(path);
     #[cfg(windows)]
     let opened = crate::windows_private_fs::create_new_file(path);
     let mut file = opened.map_err(|error| {
-            storage_error(format!(
-                "failed to create backup manifest {}: {error}",
-                path.display()
-            ))
-        })?;
+        storage_error(format!(
+            "failed to create backup manifest {}: {error}",
+            path.display()
+        ))
+    })?;
     set_owner_only_file(path)?;
     file.write_all(&bytes).map_err(|error| {
         storage_error(format!(
@@ -2530,8 +2551,15 @@ impl SqliteContextManager {
                     .lock()
                     .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
                 #[cfg(windows)]
-                drop(crate::windows_private_fs::create_new_file(&database_path)
-                    .map_err(|error| storage_error(format!("failed to create private backup database: {error}")))?);
+                drop(
+                    crate::windows_private_fs::create_new_file(&database_path).map_err(
+                        |error| {
+                            storage_error(format!(
+                                "failed to create private backup database: {error}"
+                            ))
+                        },
+                    )?,
+                );
                 let mut destination = Connection::open(&database_path).map_err(|error| {
                     storage_error(format!("failed to create backup database: {error}"))
                 })?;
@@ -3000,7 +3028,11 @@ fn checkpoint_existing_database(
 fn copy_to_new_file(source: &Path, destination: &Path) -> Result<(), ContextError> {
     crate::windows_private_fs::copy_private(source, destination)
         .map(|_| ())
-        .map_err(|error| storage_error(format!("failed to copy private restore staging file: {error}")))
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to copy private restore staging file: {error}"
+            ))
+        })
 }
 
 #[cfg(not(windows))]
@@ -3849,13 +3881,18 @@ fn verify_owner_only_directory(path: &Path) -> Result<(), ContextError> {
 
 #[cfg(windows)]
 fn verify_owner_only_directory(path: &Path) -> Result<(), ContextError> {
-    crate::windows_private_fs::verify_path(path, true)
-        .map_err(|error| storage_error(format!("recovery quarantine must be current-owner-only: {error}")))
+    crate::windows_private_fs::verify_path(path, true).map_err(|error| {
+        storage_error(format!(
+            "recovery quarantine must be current-owner-only: {error}"
+        ))
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
 fn verify_owner_only_directory(_path: &Path) -> Result<(), ContextError> {
-    Err(storage_error("private recovery directory verification is unsupported"))
+    Err(storage_error(
+        "private recovery directory verification is unsupported",
+    ))
 }
 
 fn restore_backup_internal<T>(
@@ -4054,7 +4091,9 @@ fn set_owner_only_file(path: &Path) -> Result<(), ContextError> {
 
 #[cfg(not(any(unix, windows)))]
 fn set_owner_only_file(_path: &Path) -> Result<(), ContextError> {
-    Err(storage_error("private storage file protection is unsupported"))
+    Err(storage_error(
+        "private storage file protection is unsupported",
+    ))
 }
 
 #[cfg(unix)]
@@ -4070,13 +4109,18 @@ fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
 
 #[cfg(windows)]
 fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
-    crate::windows_private_fs::protect_path(path, true)
-        .map_err(|error| storage_error(format!("failed to protect private storage directory: {error}")))
+    crate::windows_private_fs::protect_path(path, true).map_err(|error| {
+        storage_error(format!(
+            "failed to protect private storage directory: {error}"
+        ))
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
 fn set_owner_only_directory(_path: &Path) -> Result<(), ContextError> {
-    Err(storage_error("private storage directory protection is unsupported"))
+    Err(storage_error(
+        "private storage directory protection is unsupported",
+    ))
 }
 
 #[cfg(unix)]
@@ -4093,8 +4137,11 @@ fn sync_directory(path: &Path) -> Result<(), ContextError> {
 
 #[cfg(windows)]
 fn sync_directory(path: &Path) -> Result<(), ContextError> {
-    crate::windows_private_fs::sync_directory(path)
-        .map_err(|error| storage_error(format!("failed to persist storage directory metadata: {error}")))
+    crate::windows_private_fs::sync_directory(path).map_err(|error| {
+        storage_error(format!(
+            "failed to persist storage directory metadata: {error}"
+        ))
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -6056,32 +6103,40 @@ mod tests {
         export_portable_storage(&source, &bundle, None).unwrap();
         #[cfg(unix)]
         {
-        assert_eq!(
-            fs::metadata(&bundle).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(bundle.join(PORTABLE_STORAGE_DATABASE_FILE))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(
-            fs::metadata(bundle.join(PORTABLE_STORAGE_MANIFEST_FILE))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+            assert_eq!(
+                fs::metadata(&bundle).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(bundle.join(PORTABLE_STORAGE_DATABASE_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(bundle.join(PORTABLE_STORAGE_MANIFEST_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
         #[cfg(windows)]
         {
             crate::windows_private_fs::verify_path(&bundle, true).unwrap();
-            crate::windows_private_fs::verify_path(&bundle.join(PORTABLE_STORAGE_DATABASE_FILE), false).unwrap();
-            crate::windows_private_fs::verify_path(&bundle.join(PORTABLE_STORAGE_MANIFEST_FILE), false).unwrap();
+            crate::windows_private_fs::verify_path(
+                &bundle.join(PORTABLE_STORAGE_DATABASE_FILE),
+                false,
+            )
+            .unwrap();
+            crate::windows_private_fs::verify_path(
+                &bundle.join(PORTABLE_STORAGE_MANIFEST_FILE),
+                false,
+            )
+            .unwrap();
         }
 
         let database = bundle.join(PORTABLE_STORAGE_DATABASE_FILE);

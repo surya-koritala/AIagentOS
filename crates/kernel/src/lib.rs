@@ -58,8 +58,6 @@ pub mod scheduler;
 mod schema;
 pub mod storage;
 pub mod storage_encryption;
-#[cfg(windows)]
-pub(crate) mod windows_private_fs;
 pub mod syscall_gate;
 pub mod syscall_server;
 pub mod sysctl;
@@ -68,6 +66,8 @@ pub mod tool_registry_share;
 pub mod tools;
 pub mod vfs;
 pub mod vision;
+#[cfg(windows)]
+pub(crate) mod windows_private_fs;
 pub mod wire_contract;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]

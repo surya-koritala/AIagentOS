@@ -60,3 +60,6 @@ proptest = { workspace = true }
 rcgen = { workspace = true }
 wiremock = { workspace = true }
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_NetworkManagement_NetManagement"] }

@@ -1584,7 +1584,10 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> 
 
 #[cfg(not(any(unix, windows)))]
 fn write_owner_only(_path: &Path, _contents: &[u8]) -> Result<(), std::io::Error> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "private configuration storage is unsupported"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private configuration storage is unsupported",
+    ))
 }
 
 #[cfg(unix)]
@@ -1600,7 +1603,10 @@ fn set_owner_only_directory(path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(not(any(unix, windows)))]
 fn set_owner_only_directory(_path: &Path) -> Result<(), std::io::Error> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "private directory protection is unsupported"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private directory protection is unsupported",
+    ))
 }
 
 /// Get the platform-appropriate config directory.
@@ -1963,7 +1969,10 @@ mod tests {
         crate::windows_private_fs::grant_world_read_for_test(&path, false);
         config.save_to(&path).unwrap();
         crate::windows_private_fs::verify_path(&path, false).unwrap();
-        assert_eq!(Config::load_from(&path).get_api_key("private-fixture"), Some("fixture-value-no-live-provider"));
+        assert_eq!(
+            Config::load_from(&path).get_api_key("private-fixture"),
+            Some("fixture-value-no-live-provider")
+        );
     }
 
     #[test]

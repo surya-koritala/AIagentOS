@@ -16,27 +16,29 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INVALID_FUNCTION,
-    ERROR_INVALID_HANDLE, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE, LocalFree,
+    LocalFree, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::Authorization::{
+    GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
+};
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AddAccessAllowedAceEx,
-    AclSizeInformation, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
-    InitializeAcl, InitializeSecurityDescriptor, IsValidSid, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    AclSizeInformation, AddAccessAllowedAceEx, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+    IsValidSid, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    SetSecurityDescriptorOwner, TokenOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_READ_ATTRIBUTES,
-    FileAttributeTagInfo, FlushFileBuffers, GetFileInformationByHandleEx, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FlushFileBuffers,
+    GetFileInformationByHandleEx, MoveFileExW, CREATE_NEW, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -47,7 +49,11 @@ fn denied(message: &'static str) -> io::Error {
 }
 
 fn bool_result(result: i32) -> io::Result<()> {
-    if result == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn local_path(path: &Path) -> io::Result<Vec<u16>> {
@@ -55,47 +61,66 @@ fn local_path(path: &Path) -> io::Result<Vec<u16>> {
     for component in absolute.components() {
         match component {
             Component::Prefix(prefix) => match prefix.kind() {
-                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {},
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
                 _ => return Err(denied("private storage requires a local drive path")),
             },
             Component::ParentDir => return Err(denied("private storage rejects parent traversal")),
             Component::Normal(name) if name.encode_wide().any(|unit| unit == b':' as u16) => {
                 return Err(denied("private storage rejects alternate data streams"));
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
     let mut wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
-    if wide.contains(&0) { return Err(denied("private storage rejects NUL paths")); }
+    if wide.contains(&0) {
+        return Err(denied("private storage rejects NUL paths"));
+    }
     wide.push(0);
     Ok(wide)
 }
 
 struct UserSid {
     user: Vec<usize>,
+    default_owner: Vec<usize>,
 }
 
 impl UserSid {
     fn current() -> io::Result<Self> {
         let mut token = null_mut();
         // SAFETY: OpenProcessToken writes one owned handle; OwnedHandle closes it.
-        unsafe { bool_result(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token))?; }
+        unsafe {
+            bool_result(OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY,
+                &mut token,
+            ))?;
+        }
         let token = unsafe { OwnedHandle::from_raw_handle(token) };
         let read = |class| -> io::Result<Vec<usize>> {
             let mut bytes = 0;
             // SAFETY: the zero-length query reports the required token buffer size.
-            unsafe { GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &mut bytes); }
+            unsafe {
+                GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &mut bytes);
+            }
             if bytes == 0 || bytes as usize > MAX_TOKEN_BYTES {
                 return Err(denied("invalid current-user token size"));
             }
             let mut buffer = vec![0_usize; (bytes as usize).div_ceil(size_of::<usize>())];
             unsafe {
-                bool_result(GetTokenInformation(token.as_raw_handle(), class,
-                    buffer.as_mut_ptr().cast(), bytes, &mut bytes))?;
+                bool_result(GetTokenInformation(
+                    token.as_raw_handle(),
+                    class,
+                    buffer.as_mut_ptr().cast(),
+                    bytes,
+                    &mut bytes,
+                ))?;
             }
             Ok(buffer)
         };
-        Ok(Self { user: read(TokenUser)? })
+        Ok(Self {
+            user: read(TokenUser)?,
+            default_owner: read(TokenOwner)?,
+        })
     }
 
     fn user(&self) -> PSID {
@@ -103,6 +128,10 @@ impl UserSid {
         unsafe { (*(self.user.as_ptr().cast::<TOKEN_USER>())).User.Sid }
     }
 
+    fn default_owner(&self) -> PSID {
+        // Exact OS-selected owner for this token, never an arbitrary group SID.
+        unsafe { (*(self.default_owner.as_ptr().cast::<TOKEN_OWNER>())).Owner }
+    }
 }
 
 struct PrivateDescriptor {
@@ -114,23 +143,52 @@ struct PrivateDescriptor {
 impl PrivateDescriptor {
     fn new(directory: bool) -> io::Result<Self> {
         let user = UserSid::current()?;
-        unsafe { bool_result(IsValidSid(user.user()))?; }
+        unsafe {
+            bool_result(IsValidSid(user.user()))?;
+        }
         let sid_bytes = unsafe { GetLengthSid(user.user()) } as usize;
-        let acl_bytes = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_bytes;
+        let acl_bytes =
+            size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_bytes;
         let mut acl = vec![0_usize; acl_bytes.div_ceil(size_of::<usize>())];
         let mut descriptor = Box::new(unsafe { zeroed::<SECURITY_DESCRIPTOR>() });
-        let inheritance = if directory { CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE } else { 0 };
+        let inheritance = if directory {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        };
         unsafe {
-            bool_result(InitializeAcl(acl.as_mut_ptr().cast(), acl_bytes as u32, ACL_REVISION))?;
-            bool_result(AddAccessAllowedAceEx(acl.as_mut_ptr().cast(), ACL_REVISION,
-                inheritance, FILE_ALL_ACCESS, user.user()))?;
+            bool_result(InitializeAcl(
+                acl.as_mut_ptr().cast(),
+                acl_bytes as u32,
+                ACL_REVISION,
+            ))?;
+            bool_result(AddAccessAllowedAceEx(
+                acl.as_mut_ptr().cast(),
+                ACL_REVISION,
+                inheritance,
+                FILE_ALL_ACCESS,
+                user.user(),
+            ))?;
             let security = (&mut *descriptor as *mut SECURITY_DESCRIPTOR).cast();
             bool_result(InitializeSecurityDescriptor(security, 1))?;
             bool_result(SetSecurityDescriptorOwner(security, user.user(), 0))?;
-            bool_result(SetSecurityDescriptorDacl(security, 1, acl.as_ptr().cast(), 0))?;
-            bool_result(SetSecurityDescriptorControl(security, SE_DACL_PROTECTED, SE_DACL_PROTECTED))?;
+            bool_result(SetSecurityDescriptorDacl(
+                security,
+                1,
+                acl.as_ptr().cast(),
+                0,
+            ))?;
+            bool_result(SetSecurityDescriptorControl(
+                security,
+                SE_DACL_PROTECTED,
+                SE_DACL_PROTECTED,
+            ))?;
         }
-        Ok(Self { user, acl, descriptor })
+        Ok(Self {
+            user,
+            acl,
+            descriptor,
+        })
     }
 
     fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
@@ -144,14 +202,22 @@ impl PrivateDescriptor {
 
 struct SecurityInfo(PSECURITY_DESCRIPTOR);
 impl Drop for SecurityInfo {
-    fn drop(&mut self) { unsafe { LocalFree(self.0); } }
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
 }
 
 fn attributes(file: &File) -> io::Result<u32> {
     let mut info = unsafe { zeroed::<FILE_ATTRIBUTE_TAG_INFO>() };
     unsafe {
-        bool_result(GetFileInformationByHandleEx(file.as_raw_handle(), FileAttributeTagInfo,
-            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(), size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32))?;
+        bool_result(GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        ))?;
     }
     if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(denied("private storage rejects reparse points"));
@@ -163,10 +229,20 @@ fn reject_reparse_ancestors(path: &Path) -> io::Result<()> {
     let absolute = std::path::absolute(path)?;
     for parent in absolute.ancestors().skip(1) {
         let wide = local_path(parent)?;
-        let raw = unsafe { CreateFileW(wide.as_ptr(), FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null(), OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
-        if raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
         let file = unsafe { File::from_raw_handle(raw) };
         if attributes(&file)? & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(denied("private storage parent is not a regular directory"));
@@ -178,13 +254,30 @@ fn reject_reparse_ancestors(path: &Path) -> io::Result<()> {
 fn open(path: &Path, directory: bool, access: u32) -> io::Result<File> {
     reject_reparse_ancestors(path)?;
     let wide = local_path(path)?;
-    let raw = unsafe { CreateFileW(wide.as_ptr(), access | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null(), OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 }, null_mut()) };
-    if raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                },
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
     let file = unsafe { File::from_raw_handle(raw) };
     let actual = attributes(&file)? & FILE_ATTRIBUTE_DIRECTORY != 0;
-    if actual != directory { return Err(denied("private storage object has the wrong type")); }
+    if actual != directory {
+        return Err(denied("private storage object has the wrong type"));
+    }
     Ok(file)
 }
 
@@ -193,32 +286,73 @@ fn owner_and_acl(file: &File, user: &UserSid, strict: bool) -> io::Result<()> {
     let mut owner = null_mut();
     let mut acl = null_mut();
     let mut descriptor = null_mut();
-    let result = unsafe { GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT,
-        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &mut owner, null_mut(),
-        &mut acl, null_mut(), &mut descriptor) };
-    if result != 0 { return Err(io::Error::from_raw_os_error(result as i32)); }
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut acl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
     let _descriptor = SecurityInfo(descriptor);
-    let owner_matches = unsafe { IsValidSid(owner) != 0 && EqualSid(owner, user.user()) != 0 };
-    if !owner_matches { return Err(denied("private storage is not owned by the current process user")); }
-    if !strict { return Ok(()); }
+    let owner_matches = unsafe {
+        IsValidSid(owner) != 0
+            && (EqualSid(owner, user.user()) != 0 || EqualSid(owner, user.default_owner()) != 0)
+    };
+    if !owner_matches {
+        return Err(denied(
+            "private storage is not owned by the current process user",
+        ));
+    }
+    if !strict {
+        return Ok(());
+    }
     let mut control = 0;
     let mut revision = 0;
-    unsafe { bool_result(GetSecurityDescriptorControl(descriptor, &mut control, &mut revision))?; }
+    unsafe {
+        bool_result(GetSecurityDescriptorControl(
+            descriptor,
+            &mut control,
+            &mut revision,
+        ))?;
+    }
     if acl.is_null() || control & SE_DACL_PROTECTED == 0 {
         return Err(denied("private storage requires a protected non-null DACL"));
     }
     let mut size = unsafe { zeroed::<ACL_SIZE_INFORMATION>() };
-    unsafe { bool_result(GetAclInformation(acl, (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
-        size_of::<ACL_SIZE_INFORMATION>() as u32, AclSizeInformation))?; }
-    if size.AceCount != 1 { return Err(denied("private storage requires exactly one owner ACE")); }
+    unsafe {
+        bool_result(GetAclInformation(
+            acl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ))?;
+    }
+    if size.AceCount != 1 {
+        return Err(denied("private storage requires exactly one owner ACE"));
+    }
     let mut ace: *mut c_void = null_mut();
-    unsafe { bool_result(GetAce(acl, 0, &mut ace))?; }
+    unsafe {
+        bool_result(GetAce(acl, 0, &mut ace))?;
+    }
     let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
     let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
     // ACCESS_ALLOWED_ACE_TYPE is zero in the Win32 ACL wire structure.
-    if allowed.Header.AceType != 0 || allowed.Header.AceFlags & 0x10 != 0
-        || allowed.Mask != FILE_ALL_ACCESS || unsafe { IsValidSid(sid) == 0 || EqualSid(sid, user.user()) == 0 } {
-        return Err(denied("private storage DACL grants access beyond its current owner"));
+    if allowed.Header.AceType != 0
+        || allowed.Header.AceFlags & 0x10 != 0
+        || allowed.Mask != FILE_ALL_ACCESS
+        || unsafe { IsValidSid(sid) == 0 || EqualSid(sid, user.user()) == 0 }
+    {
+        return Err(denied(
+            "private storage DACL grants access beyond its current owner",
+        ));
     }
     Ok(())
 }
@@ -226,7 +360,9 @@ fn owner_and_acl(file: &File, user: &UserSid, strict: bool) -> io::Result<()> {
 /// Validate the opened object before any key or manifest bytes are read.
 pub(crate) fn open_read(path: &Path, owner_only: bool) -> io::Result<File> {
     let file = open(path, false, FILE_GENERIC_READ | READ_CONTROL)?;
-    if owner_only { owner_and_acl(&file, &UserSid::current()?, true)?; }
+    if owner_only {
+        owner_and_acl(&file, &UserSid::current()?, true)?;
+    }
     Ok(file)
 }
 
@@ -249,13 +385,23 @@ pub(crate) fn check_directory(path: &Path) -> io::Result<()> {
 pub(crate) fn protect_path(path: &Path, directory: bool) -> io::Result<()> {
     let file = open(path, directory, READ_CONTROL | WRITE_DAC)?;
     let descriptor = PrivateDescriptor::new(directory)?;
-    // A permissive current-user-owned object may be narrowed. Ownership stays
-    // immutable: no administrator-group or foreign-owner adoption is allowed.
+    // A permissive object owned by the exact current TokenUser/TokenOwner may
+    // be narrowed. The object owner stays unchanged; foreign owners are rejected.
     owner_and_acl(&file, &descriptor.user, false)?;
-    let result = unsafe { SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-        null_mut(), null_mut(), descriptor.acl.as_ptr().cast(), null()) };
-    if result != 0 { return Err(io::Error::from_raw_os_error(result as i32)); }
+    let result = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            descriptor.acl.as_ptr().cast(),
+            null(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
     verify_file(&file, directory)
 }
 
@@ -264,10 +410,20 @@ pub(crate) fn create_new_file(path: &Path) -> io::Result<File> {
     let wide = local_path(path)?;
     let mut descriptor = PrivateDescriptor::new(false)?;
     let security = descriptor.attributes();
-    let raw = unsafe { CreateFileW(wide.as_ptr(), FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security, CREATE_NEW,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, null_mut()) };
-    if raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &security,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
     let file = unsafe { File::from_raw_handle(raw) };
     verify_file(&file, false)?;
     Ok(file)
@@ -278,10 +434,14 @@ pub(crate) fn open_private_rw(path: &Path) -> io::Result<File> {
         Ok(file) => Ok(file),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             protect_path(path, false)?;
-            let file = open(path, false, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL)?;
+            let file = open(
+                path,
+                false,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
+            )?;
             verify_file(&file, false)?;
             Ok(file)
-        },
+        }
         Err(error) => Err(error),
     }
 }
@@ -291,19 +451,25 @@ pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
     let wide = local_path(path)?;
     let mut descriptor = PrivateDescriptor::new(true)?;
     let security = descriptor.attributes();
-    unsafe { bool_result(CreateDirectoryW(wide.as_ptr(), &security))?; }
+    unsafe {
+        bool_result(CreateDirectoryW(wide.as_ptr(), &security))?;
+    }
     verify_path(path, true)
 }
 
 pub(crate) fn ensure_directory(path: &Path) -> io::Result<()> {
     match create_directory(path) {
         Ok(()) => Ok(()),
-        Err(error) if matches!(error.raw_os_error(), Some(code) if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32) => protect_path(path, true),
+        Err(error) if matches!(error.raw_os_error(), Some(code) if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32) => {
+            protect_path(path, true)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let parent = path.parent().ok_or_else(|| denied("private directory has no parent"))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| denied("private directory has no parent"))?;
             ensure_directory(parent)?;
             create_directory(path)
-        },
+        }
         Err(error) => Err(error),
     }
 }
@@ -319,18 +485,28 @@ pub(crate) fn durable_rename(source: &Path, destination: &Path) -> io::Result<()
     let destination = local_path(destination)?;
     // No COPY_ALLOWED: cross-volume publication must fail rather than silently
     // becoming a non-atomic copy/delete operation.
-    unsafe { bool_result(MoveFileExW(source.as_ptr(), destination.as_ptr(),
-        MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING)) }
+    unsafe {
+        bool_result(MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING,
+        ))
+    }
 }
 
 /// A real directory flush, or a flushed write-through metadata barrier.
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     let directory = open(path, true, FILE_GENERIC_WRITE | READ_CONTROL)?;
-    if unsafe { FlushFileBuffers(directory.as_raw_handle()) } != 0 { return Ok(()); }
+    if unsafe { FlushFileBuffers(directory.as_raw_handle()) } != 0 {
+        return Ok(());
+    }
     let error = io::Error::last_os_error();
     if !matches!(error.raw_os_error(), Some(code) if code == ERROR_INVALID_HANDLE as i32
         || code == ERROR_INVALID_FUNCTION as i32 || code == ERROR_NOT_SUPPORTED as i32
-        || code == ERROR_ACCESS_DENIED as i32) { return Err(error); }
+        || code == ERROR_ACCESS_DENIED as i32)
+    {
+        return Err(error);
+    }
     // The fallback must itself perform and persist metadata I/O. It never
     // accepts a failure to create, flush, or write-through rename its marker.
     let stage = path.join(format!(".agentos-sync-{}.stage", uuid::Uuid::new_v4()));
@@ -344,14 +520,22 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
         std::fs::remove_file(&published)?;
         Ok(())
     })();
-    if result.is_err() { let _ = std::fs::remove_file(&stage); let _ = std::fs::remove_file(&published); }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&stage);
+        let _ = std::fs::remove_file(&published);
+    }
     result
 }
 
 pub(crate) fn write_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     ensure_directory(parent)?;
-    if path.try_exists()? { protect_path(path, false)?; }
+    if path.try_exists()? {
+        protect_path(path, false)?;
+    }
     let stage: PathBuf = parent.join(format!(".agentos-config-{}.stage", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut output = create_new_file(&stage)?;
@@ -361,7 +545,9 @@ pub(crate) fn write_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
         durable_rename(&stage, path)?;
         sync_directory(parent)
     })();
-    if result.is_err() { let _ = std::fs::remove_file(&stage); }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
     result
 }
 
@@ -382,15 +568,61 @@ pub(crate) fn grant_world_read_for_test(path: &Path, directory: bool) {
     let mut world = [0_usize; 16];
     let mut world_bytes = size_of_val(&world) as u32;
     let mut acl = [0_usize; 64];
-    let inheritance = if directory { CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE } else { 0 };
+    let inheritance = if directory {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
     unsafe {
-        assert_ne!(CreateWellKnownSid(WinWorldSid, null_mut(), world.as_mut_ptr().cast(), &mut world_bytes), 0);
-        assert_ne!(InitializeAcl(acl.as_mut_ptr().cast(), size_of_val(&acl) as u32, ACL_REVISION), 0);
-        assert_ne!(AddAccessAllowedAceEx(acl.as_mut_ptr().cast(), ACL_REVISION, inheritance, FILE_ALL_ACCESS, user.user()), 0);
-        assert_ne!(AddAccessAllowedAceEx(acl.as_mut_ptr().cast(), ACL_REVISION, inheritance, FILE_GENERIC_READ, world.as_mut_ptr().cast()), 0);
-        assert_eq!(SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, null_mut(), null_mut(),
-            acl.as_ptr().cast(), null()), 0);
+        assert_ne!(
+            CreateWellKnownSid(
+                WinWorldSid,
+                null_mut(),
+                world.as_mut_ptr().cast(),
+                &mut world_bytes
+            ),
+            0
+        );
+        assert_ne!(
+            InitializeAcl(
+                acl.as_mut_ptr().cast(),
+                size_of_val(&acl) as u32,
+                ACL_REVISION
+            ),
+            0
+        );
+        assert_ne!(
+            AddAccessAllowedAceEx(
+                acl.as_mut_ptr().cast(),
+                ACL_REVISION,
+                inheritance,
+                FILE_ALL_ACCESS,
+                user.user()
+            ),
+            0
+        );
+        assert_ne!(
+            AddAccessAllowedAceEx(
+                acl.as_mut_ptr().cast(),
+                ACL_REVISION,
+                inheritance,
+                FILE_GENERIC_READ,
+                world.as_mut_ptr().cast()
+            ),
+            0
+        );
+        assert_eq!(
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl.as_ptr().cast(),
+                null()
+            ),
+            0
+        );
     }
 }
 
@@ -405,6 +637,53 @@ mod tests {
         directory
     }
 
+    struct NativeTestUser {
+        name: Vec<u16>,
+        sid: Vec<usize>,
+    }
+
+    impl NativeTestUser {
+        fn create() -> Self {
+            use windows_sys::Win32::NetworkManagement::NetManagement::{
+                NetApiBufferFree, NetUserAdd, NetUserGetInfo, USER_INFO_1, USER_INFO_23,
+                USER_PRIV_USER, UF_NORMAL_ACCOUNT, UF_SCRIPT,
+            };
+            let mut name: Vec<u16> = format!("aofs_{}\0", &uuid::Uuid::new_v4().simple().to_string()[..8])
+                .encode_utf16().collect();
+            let mut password: Vec<u16> = format!("Aa7!{}\0", uuid::Uuid::new_v4().simple())
+                .encode_utf16().collect();
+            let info = USER_INFO_1 {
+                usri1_name: name.as_mut_ptr(), usri1_password: password.as_mut_ptr(),
+                usri1_priv: USER_PRIV_USER, usri1_flags: UF_NORMAL_ACCOUNT | UF_SCRIPT,
+                ..Default::default()
+            };
+            let mut parameter = 0;
+            let result = unsafe { NetUserAdd(null(), 1, (&info as *const USER_INFO_1).cast(), &mut parameter) };
+            password.fill(0);
+            assert_eq!(result, 0, "disposable Windows user fixture creation failed at parameter {parameter}");
+            let mut user = Self { name, sid: Vec::new() };
+            let mut buffer = null_mut();
+            unsafe {
+                assert_eq!(NetUserGetInfo(null(), user.name.as_ptr(), 23, &mut buffer), 0);
+                let sid = (*(buffer.cast::<USER_INFO_23>())).usri23_user_sid;
+                assert_ne!(IsValidSid(sid), 0);
+                let bytes = GetLengthSid(sid) as usize;
+                user.sid = vec![0_usize; bytes.div_ceil(size_of::<usize>())];
+                std::ptr::copy_nonoverlapping(sid.cast::<u8>(), user.sid.as_mut_ptr().cast::<u8>(), bytes);
+                assert_eq!(NetApiBufferFree(buffer.cast()), 0);
+            }
+            user
+        }
+        fn sid(&self) -> PSID { self.sid.as_ptr().cast_mut().cast() }
+    }
+
+    impl Drop for NativeTestUser {
+        fn drop(&mut self) {
+            // The account exists only in a disposable hosted CI test process.
+            unsafe { windows_sys::Win32::NetworkManagement::NetManagement::NetUserDel(null(), self.name.as_ptr()); }
+        }
+    }
+
     #[test]
     fn windows_private_file_is_protected_at_birth_and_never_overwrites() {
         let root = private_root();
@@ -414,6 +693,15 @@ mod tests {
         // Read the security descriptor of the handle immediately after CREATE_NEW,
         // before any content write or later permission adjustment.
         verify_file(&file, false).unwrap();
+        let mut owner = null_mut();
+        let mut descriptor = null_mut();
+        unsafe {
+            assert_eq!(GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                &mut owner, null_mut(), null_mut(), null_mut(), &mut descriptor), 0);
+            assert_ne!(EqualSid(owner, UserSid::current().unwrap().user()), 0,
+                "new private objects must explicitly use TokenUser, not a default owner group");
+            LocalFree(descriptor);
+        }
         file.write_all(b"private fixture bytes").unwrap();
         file.sync_all().unwrap();
         assert!(create_new_file(&path).is_err());
@@ -436,7 +724,11 @@ mod tests {
     fn windows_private_key_load_rejects_another_trustee() {
         let root = private_root();
         let key = root.path().join("key.json");
-        crate::storage_encryption::generate_storage_encryption_key_file("windows-private-fixture", &key).unwrap();
+        crate::storage_encryption::generate_storage_encryption_key_file(
+            "windows-private-fixture",
+            &key,
+        )
+        .unwrap();
         crate::storage_encryption::load_storage_encryption_key(&key).unwrap();
         grant_world_read_for_test(&key, false);
         assert!(crate::storage_encryption::load_storage_encryption_key(&key).is_err());
@@ -480,8 +772,11 @@ mod tests {
         let manager = crate::context::SqliteContextManager::new(&database).unwrap();
         verify_path(&database, false).unwrap();
         let backups = root.path().join("backups");
-        let (signer, _) = crate::storage::BackupSigningKey::generate("windows-native-fixture").unwrap();
-        manager.create_signed_backup(&backups, "native-private-fixture", &signer).unwrap();
+        let (signer, _) =
+            crate::storage::BackupSigningKey::generate("windows-native-fixture").unwrap();
+        manager
+            .create_signed_backup(&backups, "native-private-fixture", &signer)
+            .unwrap();
         verify_path(&backups, true).unwrap();
         verify_path(&backups.join("native-private-fixture"), true).unwrap();
         let manifest = backups.join("native-private-fixture/manifest.json");
@@ -504,7 +799,10 @@ mod tests {
         sync_directory(root.path()).unwrap();
         verify_path(&destination, false).unwrap();
         let mut bytes = String::new();
-        open_read(&destination, true).unwrap().read_to_string(&mut bytes).unwrap();
+        open_read(&destination, true)
+            .unwrap()
+            .read_to_string(&mut bytes)
+            .unwrap();
         assert_eq!(bytes, "durable-content");
         assert!(!source.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
@@ -523,6 +821,7 @@ mod tests {
 
     #[test]
     fn windows_private_foreign_owner_is_rejected_before_acl_repair() {
+        use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
         const CHILD: &str = "AIAGENTOS_WINDOWS_FOREIGN_OWNER_TEST";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -535,34 +834,84 @@ mod tests {
         // Production never requests it or changes the owner of a foreign object.
         use windows_sys::Win32::Foundation::{GetLastError, LUID};
         use windows_sys::Win32::Security::{
-            AdjustTokenPrivileges, CreateWellKnownSid, LookupPrivilegeValueW,
-            LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
-            TOKEN_PRIVILEGES, WinLocalSystemSid,
+            AdjustTokenPrivileges, CreateWellKnownSid, LookupPrivilegeValueW, WinLocalSystemSid,
+            LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
         };
         let mut token = null_mut();
         let mut luid = unsafe { zeroed::<LUID>() };
         let privilege: Vec<u16> = "SeRestorePrivilege\0".encode_utf16().collect();
         unsafe {
-            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &mut token), 0);
-            assert_ne!(LookupPrivilegeValueW(null(), privilege.as_ptr(), &mut luid), 0);
+            assert_ne!(
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    &mut token
+                ),
+                0
+            );
+            assert_ne!(
+                LookupPrivilegeValueW(null(), privilege.as_ptr(), &mut luid),
+                0
+            );
         }
         let token = unsafe { OwnedHandle::from_raw_handle(token) };
-        let privileges = TOKEN_PRIVILEGES { PrivilegeCount: 1,
-            Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }] };
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
         unsafe {
-            assert_ne!(AdjustTokenPrivileges(token.as_raw_handle(), 0, &privileges, 0, null_mut(), null_mut()), 0);
-            assert_ne!(GetLastError(), 1300, "hosted Windows ownership fixture requires SeRestorePrivilege");
+            assert_ne!(
+                AdjustTokenPrivileges(
+                    token.as_raw_handle(),
+                    0,
+                    &privileges,
+                    0,
+                    null_mut(),
+                    null_mut()
+                ),
+                0
+            );
+            assert_ne!(
+                GetLastError(),
+                1300,
+                "hosted Windows ownership fixture requires SeRestorePrivilege"
+            );
         }
         let root = private_root();
         let path = root.path().join("foreign-key.json");
-        crate::storage_encryption::generate_storage_encryption_key_file("foreign-owner-fixture", &path).unwrap();
+        crate::storage_encryption::generate_storage_encryption_key_file(
+            "foreign-owner-fixture",
+            &path,
+        )
+        .unwrap();
         let mut system = [0_usize; 16];
         let mut bytes = std::mem::size_of_val(&system) as u32;
         let file = open(&path, false, READ_CONTROL | WRITE_OWNER).unwrap();
         unsafe {
-            assert_ne!(CreateWellKnownSid(WinLocalSystemSid, null_mut(), system.as_mut_ptr().cast(), &mut bytes), 0);
-            assert_eq!(SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                system.as_mut_ptr().cast(), null_mut(), null(), null()), 0);
+            assert_ne!(
+                CreateWellKnownSid(
+                    WinLocalSystemSid,
+                    null_mut(),
+                    system.as_mut_ptr().cast(),
+                    &mut bytes
+                ),
+                0
+            );
+            assert_eq!(
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    system.as_mut_ptr().cast(),
+                    null_mut(),
+                    null(),
+                    null()
+                ),
+                0
+            );
         }
         assert!(crate::storage_encryption::load_storage_encryption_key(&path).is_err());
         assert!(protect_path(&path, false).is_err());
@@ -570,10 +919,49 @@ mod tests {
         let mut owner = null_mut();
         let mut descriptor = null_mut();
         unsafe {
-            assert_eq!(GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                &mut owner, null_mut(), null_mut(), null_mut(), &mut descriptor), 0);
+            assert_eq!(
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut descriptor
+                ),
+                0
+            );
             assert_ne!(EqualSid(owner, system.as_mut_ptr().cast()), 0);
             LocalFree(descriptor);
+            assert_eq!(
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    UserSid::current().unwrap().user(),
+                    null_mut(),
+                    null(),
+                    null()
+                ),
+                0
+            );
+        }
+        let other_user = NativeTestUser::create();
+        unsafe {
+            assert_eq!(SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                other_user.sid(), null_mut(), null(), null()), 0);
+        }
+        assert!(crate::storage_encryption::load_storage_encryption_key(&path).is_err());
+        assert!(protect_path(&path, false).is_err());
+        let mut actual_owner = null_mut();
+        let mut actual_descriptor = null_mut();
+        unsafe {
+            assert_eq!(GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                &mut actual_owner, null_mut(), null_mut(), null_mut(), &mut actual_descriptor), 0);
+            assert_ne!(EqualSid(actual_owner, other_user.sid()), 0,
+                "rejected protection must preserve the foreign user's ownership");
+            LocalFree(actual_descriptor);
             assert_eq!(SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
                 UserSid::current().unwrap().user(), null_mut(), null(), null()), 0);
         }
@@ -597,13 +985,22 @@ mod tests {
         }
         let root = private_root();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "windows_private_fs::tests::windows_private_publication_survives_process_exit", "--nocapture"])
-            .env(ROOT, root.path()).status().unwrap();
+            .args([
+                "--exact",
+                "windows_private_fs::tests::windows_private_publication_survives_process_exit",
+                "--nocapture",
+            ])
+            .env(ROOT, root.path())
+            .status()
+            .unwrap();
         assert_eq!(status.code(), Some(86));
         let published = root.path().join("published");
         verify_path(&published, true).unwrap();
         verify_path(&published.join("state"), false).unwrap();
-        assert_eq!(std::fs::read(published.join("state")).unwrap(), b"committed-state");
+        assert_eq!(
+            std::fs::read(published.join("state")).unwrap(),
+            b"committed-state"
+        );
         assert!(!root.path().join("stage").exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }

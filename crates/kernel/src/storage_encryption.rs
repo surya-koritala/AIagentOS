@@ -1153,7 +1153,9 @@ fn set_owner_only_database(path: &Path) -> Result<(), ContextError> {
 
 #[cfg(not(any(unix, windows)))]
 fn set_owner_only_database(_path: &Path) -> Result<(), ContextError> {
-    Err(storage_error("owner-only database protection is unsupported on this platform"))
+    Err(storage_error(
+        "owner-only database protection is unsupported on this platform",
+    ))
 }
 
 fn validate_key_id(key_id: &str) -> Result<(), ContextError> {
@@ -1222,18 +1224,19 @@ fn create_owner_only_new_file_for(path: &Path, label: &str) -> Result<File, Cont
 
 #[cfg(windows)]
 fn create_owner_only_new_file_for(path: &Path, label: &str) -> Result<File, ContextError> {
-    crate::windows_private_fs::create_new_file(path)
-        .map_err(|error| {
-            storage_error(format!(
-                "failed to create {label} {} without overwrite: {error}",
-                path.display()
-            ))
-        })
+    crate::windows_private_fs::create_new_file(path).map_err(|error| {
+        storage_error(format!(
+            "failed to create {label} {} without overwrite: {error}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
 fn create_owner_only_new_file_for(_path: &Path, _label: &str) -> Result<File, ContextError> {
-    Err(storage_error("private file creation is unsupported on this platform"))
+    Err(storage_error(
+        "private file creation is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1256,13 +1259,18 @@ fn verify_owner_only(path: &Path, metadata: &fs::Metadata) -> Result<(), Context
 
 #[cfg(windows)]
 fn verify_owner_only(path: &Path, _metadata: &fs::Metadata) -> Result<(), ContextError> {
-    crate::windows_private_fs::verify_path(path, false)
-        .map_err(|error| storage_error(format!("storage key must have current-owner-only permissions: {error}")))
+    crate::windows_private_fs::verify_path(path, false).map_err(|error| {
+        storage_error(format!(
+            "storage key must have current-owner-only permissions: {error}"
+        ))
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
 fn verify_owner_only(_path: &Path, _metadata: &fs::Metadata) -> Result<(), ContextError> {
-    Err(storage_error("private file verification is unsupported on this platform"))
+    Err(storage_error(
+        "private file verification is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1282,29 +1290,42 @@ fn sync_parent(path: &Path) -> Result<(), ContextError> {
 
 #[cfg(windows)]
 fn sync_parent(path: &Path) -> Result<(), ContextError> {
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     crate::windows_private_fs::sync_directory(parent)
         .map_err(|error| storage_error(format!("failed to sync storage key parent: {error}")))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn sync_parent(_path: &Path) -> Result<(), ContextError> {
-    Err(storage_error("directory durability is unsupported on this platform"))
+    Err(storage_error(
+        "directory durability is unsupported on this platform",
+    ))
 }
 
 #[cfg(test)]
 fn create_private_directory_all(path: impl AsRef<Path>) -> std::io::Result<()> {
     #[cfg(windows)]
-    { crate::windows_private_fs::ensure_directory(path.as_ref()) }
+    {
+        crate::windows_private_fs::ensure_directory(path.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::create_dir_all(path) }
+    {
+        fs::create_dir_all(path)
+    }
 }
 
 fn rename_durable(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
     #[cfg(windows)]
-    { crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref()) }
+    {
+        crate::windows_private_fs::durable_rename(source.as_ref(), destination.as_ref())
+    }
     #[cfg(not(windows))]
-    { fs::rename(source, destination) }
+    {
+        fs::rename(source, destination)
+    }
 }
 
 fn storage_error(message: impl Into<String>) -> ContextError {

@@ -1549,7 +1549,7 @@ impl SyscallGate {
             let observed = authorized
                 .snapshot
                 .as_ref()
-                .map(|snapshot| snapshot.registration_revision)
+                .map(|snapshot| snapshot.agent.registration_revision)
                 .or_else(|| self.peripheral_registration(kid));
             if observed != Some(expected) {
                 return Err(GateDenial::AuthorizationStateChanged);

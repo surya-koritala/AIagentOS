@@ -8386,7 +8386,7 @@ mod tests {
             .all(|request| request.active_uses == 0 && !request.grant_pending));
         waiters[0].abort();
         let aborted = waiters.remove(0);
-        assert!(aborted.await.unwrap_err().is_cancelled());
+        assert!(matches!(aborted.await, Err(error) if error.is_cancelled()));
         assert!(operator
             .requests()
             .iter()

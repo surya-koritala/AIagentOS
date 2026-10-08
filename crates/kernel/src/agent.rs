@@ -205,6 +205,14 @@ impl AgentManager {
         self.agents.get(&agent_id).map(|a| a.config.task.clone())
     }
 
+    /// Bounded native-operator label without cloning prompts or enumerating the
+    /// entire agent table on each peripheral-state refresh.
+    pub(crate) fn get_agent_display_name(&self, agent_id: AgentId) -> Option<String> {
+        self.agents.get(&agent_id).map(|agent| {
+            agent.name.chars().filter(|character| !character.is_control()).take(128).collect()
+        })
+    }
+
     pub fn get_agent_config(&self, agent_id: AgentId) -> Option<AgentConfig> {
         self.agents.get(&agent_id).map(|agent| agent.config.clone())
     }

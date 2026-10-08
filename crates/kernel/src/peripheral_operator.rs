@@ -7,7 +7,6 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::agent::AgentKernel;
 use crate::syscall_gate::{LocalPeripheralAction, LocalPeripheralContract, SyscallGate};
 use crate::tools::{ApprovalPolicy, PreparedToolExecution};
 use crate::{AgentId, AgentKernelImpl, KernelError, PeripheralRevocation};
@@ -225,7 +224,6 @@ impl LocalPeripheralOperator {
     }
 
     pub fn requests(&self) -> Vec<PeripheralOperatorRequest> {
-        let agents = self.kernel.agent_manager.list_agents(None);
         self.requests
             .records
             .lock()
@@ -247,19 +245,10 @@ impl LocalPeripheralOperator {
                 {
                     status = PeripheralRequestStatus::Finished;
                 }
-                let agent_name = agents
-                    .iter()
-                    .find(|agent| agent.id == record.agent)
-                    .map(|agent| agent.name.as_str())
-                    .unwrap_or("Stopped agent");
                 PeripheralOperatorRequest {
                     request_id: record.id,
                     agent_id: record.agent,
-                    agent_name: agent_name
-                        .chars()
-                        .filter(|character| !character.is_control())
-                        .take(128)
-                        .collect(),
+                    agent_name: self.kernel.agent_manager.get_agent_display_name(record.agent).unwrap_or_else(|| "Stopped agent".into()),
                     tool_name: record.tool.clone(),
                     resource_identity: crate::resources::opaque_identity(
                         record.resource.as_bytes(),

@@ -18,6 +18,18 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   GitHub CI checks shipped binary restart, rule isolation, tool denial,
   planning bounds, quota admission, and cancellation. Relates #338.
 
+- Added public-wire VFS acceptance proof pairing stale descriptor rejection with
+  fresh real reads by the same restored owner, and verifying that authorized COW
+  cloning inherits no live tool/workspace/memory/KV/IPC handles or attenuated
+  duplicates. Generated actual-wire transitions check ownership, rights,
+  revocation, capacity, independent close and reclamation. Abrupt OS-process
+  fixtures cover pending-open, pending-write before staging, acknowledged
+  committed data and fresh authorized recovery; they do not claim power-loss
+  or after-staging qualification. Public-wire provider deadlines reclaim pending
+  workspace opens and bound admitted writes after a client disconnect, preserving
+  original bytes and draining workers before native cleanup. Relates #392;
+  independent production qualification remains open.
+
 - Added explicitly configured Hugging Face chat-router requests with shared
   native function, usage and SSE decoding. Legacy completions reject direct
   native tools, retain the audited governed shim and mark usage estimated.

@@ -137,6 +137,7 @@ impl LlmSession for ProposalSession {
                 / 4
                 + 1) as u32;
             LlmResponse {
+                provider_metadata: None,
                 content: content.into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: input + output,

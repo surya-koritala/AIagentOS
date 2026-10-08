@@ -408,7 +408,7 @@ impl SplitMix64 {
 /// One LSH table: a fixed set of random hyperplanes plus the buckets they induce.
 struct LshTable {
     /// `bits` hyperplanes, each a `dim`-length Gaussian vector.
-    planes: Vec<Vec<f32>>,
+    planes: std::sync::Arc<Vec<Vec<f32>>>,
     /// Signature → ids that hash to it in this table.
     buckets: std::collections::HashMap<u64, Vec<u64>>,
 }
@@ -466,12 +466,11 @@ impl LshIndex {
     pub fn new(dim: usize, num_tables: usize, bits_per_table: usize) -> Self {
         let num_tables = num_tables.max(1);
         let bits = bits_per_table.clamp(1, 64);
-        let mut rng = SplitMix64(Self::SEED);
-        let tables = (0..num_tables)
-            .map(|_| LshTable {
-                planes: (0..bits)
-                    .map(|_| (0..dim).map(|_| rng.next_gaussian()).collect())
-                    .collect(),
+        let planes = shared_lsh_planes(dim, num_tables, bits);
+        let tables = planes
+            .iter()
+            .map(|planes| LshTable {
+                planes: planes.clone(),
                 buckets: std::collections::HashMap::new(),
             })
             .collect();
@@ -500,6 +499,35 @@ impl LshIndex {
             }
         }
     }
+}
+
+type PlaneBank = Vec<std::sync::Arc<Vec<Vec<f32>>>>;
+type PlaneKey = (usize, usize, usize);
+type PlaneCache = std::collections::HashMap<PlaneKey, std::sync::Arc<PlaneBank>>;
+fn shared_lsh_planes(dim: usize, tables: usize, bits: usize) -> std::sync::Arc<PlaneBank> {
+    static BANKS: std::sync::OnceLock<std::sync::Mutex<PlaneCache>> = std::sync::OnceLock::new();
+    let mut banks = BANKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    banks
+        .entry((dim, tables, bits))
+        .or_insert_with(|| {
+            // Preserve the exact previous PRNG traversal: table, plane, component.
+            let mut rng = SplitMix64(LshIndex::SEED);
+            std::sync::Arc::new(
+                (0..tables)
+                    .map(|_| {
+                        std::sync::Arc::new(
+                            (0..bits)
+                                .map(|_| (0..dim).map(|_| rng.next_gaussian()).collect())
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .clone()
 }
 
 impl VectorIndex for LshIndex {
@@ -645,6 +673,24 @@ impl MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsh_planes_are_shared_but_agent_vector_buckets_remain_independent() {
+        let mut first = LshIndex::new(32, 4, 8);
+        let second = LshIndex::new(32, 4, 8);
+        for (left, right) in first.tables.iter().zip(&second.tables) {
+            assert!(std::sync::Arc::ptr_eq(&left.planes, &right.planes));
+        }
+        first.add(7, vec![1.0; 32]);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 0);
+        assert!(second.search(&vec![1.0; 32], 1).is_empty());
+        let different = LshIndex::new(32, 5, 8);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.tables[0].planes,
+            &different.tables[0].planes
+        ));
+    }
 
     #[test]
     fn embed_is_deterministic() {

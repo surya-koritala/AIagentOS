@@ -9,12 +9,12 @@ use std::ops::{Deref, DerefMut};
 use agent_sdk::{ConnectionProfile, KernelClient, SdkError};
 
 pub mod policy;
-pub mod slash;
 /// Provider registration shared by every first-party host surface.
 ///
 /// Keeping this in the library prevents the server, interactive CLI, and
 /// desktop shell from drifting on credential-source or endpoint behavior.
 pub mod providers;
+pub mod slash;
 
 /// An authenticated (or deliberately unauthenticated) `agentctl` session.
 ///

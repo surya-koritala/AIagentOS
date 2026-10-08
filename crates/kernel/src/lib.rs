@@ -5368,30 +5368,57 @@ impl AgentKernelImpl {
         let _guard = lifecycle.lock().await;
         if store.scope() != &crate::learning::RuleScope::local_cli()
             || !store.is_durable()
-            || store.operator() != crate::config::local_operator_identity().map_err(|error| KernelError::Policy(error.to_string()))?
-            || self.context_manager.agent_tenant(agent_id)?.as_deref() != Some(crate::context::DEFAULT_TENANT)
+            || store.operator()
+                != crate::config::local_operator_identity()
+                    .map_err(|error| KernelError::Policy(error.to_string()))?
+            || self.context_manager.agent_tenant(agent_id)?.as_deref()
+                != Some(crate::context::DEFAULT_TENANT)
         {
-            return Err(KernelError::Policy("local CLI corrections require the local operator scope and tenant".into()));
+            return Err(KernelError::Policy(
+                "local CLI corrections require the local operator scope and tenant".into(),
+            ));
         }
-        if self.get_agent_status(agent_id)? != AgentState::Running || self.syscall_gate.pid_of(agent_id).is_none() {
-            return Err(KernelError::Policy("local CLI conversation owner is not an eligible running agent".into()));
+        if self.get_agent_status(agent_id)? != AgentState::Running
+            || self.syscall_gate.pid_of(agent_id).is_none()
+        {
+            return Err(KernelError::Policy(
+                "local CLI conversation owner is not an eligible running agent".into(),
+            ));
         }
-        self.syscall_gate.cgroup_quota_constraints(agent_id).map_err(|error| KernelError::Policy(error.message()))?;
+        self.syscall_gate
+            .cgroup_quota_constraints(agent_id)
+            .map_err(|error| KernelError::Policy(error.message()))?;
         if let Some(conversation) = conversation {
-            let binding = store.cli_conversation(conversation).map_err(|error| KernelError::Policy(error.to_string()))?
-                .ok_or_else(|| KernelError::Policy("conversation is not registered to this local operator".into()))?;
+            let binding = store
+                .cli_conversation(conversation)
+                .map_err(|error| KernelError::Policy(error.to_string()))?
+                .ok_or_else(|| {
+                    KernelError::Policy(
+                        "conversation is not registered to this local operator".into(),
+                    )
+                })?;
             if binding.agent_id != agent_id || binding.tenant_id != crate::context::DEFAULT_TENANT {
-                return Err(KernelError::Policy("conversation registry owner does not match this agent and tenant".into()));
+                return Err(KernelError::Policy(
+                    "conversation registry owner does not match this agent and tenant".into(),
+                ));
             }
             if self.context_manager.conversation_owner(conversation)? != agent_id {
-                return Err(KernelError::Policy("conversation belongs to another agent".into()));
+                return Err(KernelError::Policy(
+                    "conversation belongs to another agent".into(),
+                ));
             }
-            if !self.context_manager.list_generation_checkpoints(&binding.tenant_id, Some(agent_id))?.is_empty() {
+            if !self
+                .context_manager
+                .list_generation_checkpoints(&binding.tenant_id, Some(agent_id))?
+                .is_empty()
+            {
                 return Err(KernelError::Policy("conversation has an unfinished checkpoint; use the governed checkpoint-resume flow".into()));
             }
         }
         let executor = self.ensure_executor(agent_id).await?;
-        let mut executor = executor.try_lock().map_err(|_| KernelError::Policy("cannot configure CLI corrections during an active turn".into()))?;
+        let mut executor = executor.try_lock().map_err(|_| {
+            KernelError::Policy("cannot configure CLI corrections during an active turn".into())
+        })?;
         executor.configure_terminal_prompt(system_prompt, conversation)?;
         executor.set_rule_store(store)?;
         Ok(executor.conversation_id.clone())
@@ -5399,11 +5426,19 @@ impl AgentKernelImpl {
 
     /// Generate text-only steps under ordinary turn admission, provider
     /// quotas, cancellation, retries, output limits, and usage accounting.
-    pub async fn generate_plan(&self, agent_id: AgentId, task: &str) -> Result<crate::planning::Plan, KernelError> {
+    pub async fn generate_plan(
+        &self,
+        agent_id: AgentId,
+        task: &str,
+    ) -> Result<crate::planning::Plan, KernelError> {
         crate::planning::validate_plan_task(task)?;
-        let output = self.send_message_inner(agent_id, task, None, None, None, true).await?;
+        let output = self
+            .send_message_inner(agent_id, task, None, None, None, true)
+            .await?;
         let result: Result<crate::planning::Plan, String> = serde_json::from_str(&output.content)
-            .map_err(|error| KernelError::Policy(format!("invalid governed plan result: {error}")))?;
+            .map_err(|error| {
+            KernelError::Policy(format!("invalid governed plan result: {error}"))
+        })?;
         result.map_err(KernelError::Policy)
     }
 
@@ -5413,7 +5448,9 @@ impl AgentKernelImpl {
         if let Some(cancellation) = self.active_cancellations.get(&agent_id) {
             cancellation.cancel();
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     /// Send a message while publishing bounded execution events and registering
@@ -5602,7 +5639,11 @@ impl AgentKernelImpl {
         // Set/clear around `run` (not via `?`) so the slot is freed even when
         // the turn errors.
         self.scheduler.set_running(agent_id);
-        let run_result = if planning { executor.run_plan(message).await } else { executor.run_resumable(message).await };
+        let run_result = if planning {
+            executor.run_plan(message).await
+        } else {
+            executor.run_resumable(message).await
+        };
         executor.clear_event_channel();
         drop(registration);
         let output = match run_result? {

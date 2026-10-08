@@ -373,7 +373,9 @@ fn database_nonexistent_file() {
 #[test]
 fn learning_empty_trigger() {
     let store = RuleStore::new();
-    assert!(store.add_rule("".into(), "correction".into(), RuleScope::Global).is_err());
+    assert!(store
+        .add_rule("".into(), "correction".into(), RuleScope::Global)
+        .is_err());
     // An empty trigger must not poison every subsequent prompt.
     let found = store.find_applicable("anything");
     assert!(found.is_empty());
@@ -382,7 +384,9 @@ fn learning_empty_trigger() {
 #[test]
 fn learning_case_insensitive_matching() {
     let store = RuleStore::new();
-    store.add_rule("Python".into(), "use type hints".into(), RuleScope::Global).unwrap();
+    store
+        .add_rule("Python".into(), "use type hints".into(), RuleScope::Global)
+        .unwrap();
     let found = store.find_applicable("write python code");
     assert_eq!(found.len(), 1); // Should match case-insensitively
 }

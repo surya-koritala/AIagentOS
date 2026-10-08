@@ -55,6 +55,12 @@ model as quoted user-level preference data with a warning that they grant
 no tool, permission, approval, or authority. Every resulting tool call still
 passes through the existing syscall gate. Removing a rule removes its
 previous prompt injection before the next turn.
+An explicit authorized conversation-history clone shares already-saved
+user-level conversation data, including quoted prior corrections. Its exact
+COW prefix remains intact. The child receives no live rule store, local CLI
+binding, resume registry, approval, or credential; current or subsequently
+added local rules are not automatically injected into it. Unrelated and
+foreign-tenant agents cannot acquire the store or clone a foreign source.
 
 Triggers contain 1–256 UTF-8 bytes and corrections 1–2048 bytes, without
 control characters. A store holds at most 32 rules and its serialized file

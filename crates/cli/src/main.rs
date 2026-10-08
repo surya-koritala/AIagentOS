@@ -14,8 +14,8 @@ use agent_cli::providers::register_providers;
 use agent_cli::slash::{handle_slash, SlashOutcome};
 use kernel::config::Config;
 use kernel::execution::StreamEvent;
-use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use kernel::learning::{RuleScope, RuleStore};
+use kernel::{AgentConfig, AgentKernelImpl, Priority};
 
 mod logging;
 mod policy_cmd;
@@ -158,46 +158,81 @@ async fn main() {
 
     let operator = kernel::config::local_operator_identity()
         .unwrap_or_else(|error| fail(format!("failed to determine local operator: {error}")));
-    let rules = Arc::new(RuleStore::from_file(
-        &config.data_dir.join("rules.json"), RuleScope::local_cli(), &operator,
-    ).unwrap_or_else(|error| fail(format!("failed to load local correction rules: {error}"))));
+    let rules = Arc::new(
+        RuleStore::from_file(
+            &config.data_dir.join("rules.json"),
+            RuleScope::local_cli(),
+            &operator,
+        )
+        .unwrap_or_else(|error| fail(format!("failed to load local correction rules: {error}"))),
+    );
     // Restore the original registered owner through the existing kernel
     // lifecycle, rather than copying another agent's history into a new one.
-    kernel.rehydrate_agents().await
+    kernel
+        .rehydrate_agents()
+        .await
         .unwrap_or_else(|error| fail(format!("failed to restore kernel agents: {error}")));
     let agent_id = if let Some(id) = conversation_id.as_deref() {
-        let binding = rules.cli_conversation(id)
-            .unwrap_or_else(|error| fail(format!("failed to read local conversation binding: {error}")))
+        let binding = rules
+            .cli_conversation(id)
+            .unwrap_or_else(|error| {
+                fail(format!(
+                    "failed to read local conversation binding: {error}"
+                ))
+            })
             .unwrap_or_else(|| fail("conversation is not registered to this local operator"));
-        let restored = kernel.agent_manager.get_agent_config(binding.agent_id)
+        let restored = kernel
+            .agent_manager
+            .get_agent_config(binding.agent_id)
             .unwrap_or_else(|| fail("registered conversation owner is missing or was erased"));
-        if restored.llm_provider != config.llm_provider || restored.permission_profile != config.permission_profile {
+        if restored.llm_provider != config.llm_provider
+            || restored.permission_profile != config.permission_profile
+        {
             fail("registered conversation provider or permission profile differs from the current CLI configuration");
         }
         binding.agent_id
     } else {
-        kernel.create_agent_full(AgentConfig {
-            name: "cli-agent".into(),
-            task: "interactive assistant".into(),
-            llm_provider: config.llm_provider.clone(),
-            permission_profile: config.permission_profile.clone(),
-            priority: Priority::default(),
-            sandbox_config: None,
-        }).await.unwrap_or_else(|error| fail(format!("failed to create agent: {error}"))).id
+        kernel
+            .create_agent_full(AgentConfig {
+                name: "cli-agent".into(),
+                task: "interactive assistant".into(),
+                llm_provider: config.llm_provider.clone(),
+                permission_profile: config.permission_profile.clone(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap_or_else(|error| fail(format!("failed to create agent: {error}")))
+            .id
     };
     let project_ctx = project_context();
     let system_prompt = format!("You are a helpful AI assistant running in a terminal. Be concise and use tools when needed.\n\n{}", project_ctx);
 
-    let conversation = kernel.configure_local_cli_agent(
-        agent_id, rules.clone(), system_prompt, conversation_id.as_deref(),
-    ).await.unwrap_or_else(|error| fail(format!("failed to configure CLI agent: {error}")));
+    let conversation = kernel
+        .configure_local_cli_agent(
+            agent_id,
+            rules.clone(),
+            system_prompt,
+            conversation_id.as_deref(),
+        )
+        .await
+        .unwrap_or_else(|error| fail(format!("failed to configure CLI agent: {error}")));
 
     // One-shot mode
     if let Some(cmd) = one_shot {
-        match cancellable_cli_operation(&kernel, agent_id, handle_slash(&cmd, &kernel, agent_id, &conversation, &rules)).await {
-            Ok(SlashOutcome::Output(output)) => { println!("{output}"); return; }
+        match cancellable_cli_operation(
+            &kernel,
+            agent_id,
+            handle_slash(&cmd, &kernel, agent_id, &conversation, &rules),
+        )
+        .await
+        {
+            Ok(SlashOutcome::Output(output)) => {
+                println!("{output}");
+                return;
+            }
             Ok(SlashOutcome::Quit) => return,
-            Ok(SlashOutcome::NotSlash) => {},
+            Ok(SlashOutcome::NotSlash) => {}
             Err(error) => fail(error),
         }
         let msg = if let Some(ref piped) = piped_input {
@@ -252,11 +287,23 @@ async fn main() {
             continue;
         }
 
-        match cancellable_cli_operation(&kernel, agent_id, handle_slash(input, &kernel, agent_id, &conversation, &rules)).await {
-            Ok(SlashOutcome::Output(output)) => { println!("{output}"); continue; }
+        match cancellable_cli_operation(
+            &kernel,
+            agent_id,
+            handle_slash(input, &kernel, agent_id, &conversation, &rules),
+        )
+        .await
+        {
+            Ok(SlashOutcome::Output(output)) => {
+                println!("{output}");
+                continue;
+            }
             Ok(SlashOutcome::Quit) => break,
-            Ok(SlashOutcome::NotSlash) => {},
-            Err(error) => { eprintln!("Error: {error}"); continue; },
+            Ok(SlashOutcome::NotSlash) => {}
+            Err(error) => {
+                eprintln!("Error: {error}");
+                continue;
+            }
         }
         let output = run_cli_turn(&kernel, agent_id, input).await;
 
@@ -266,9 +313,7 @@ async fn main() {
                 if out.tool_calls_made > 0 {
                     eprintln!(
                         "\x1b[90m  [{} tools, {} tokens, ${:.4}]\x1b[0m\n",
-                        out.tool_calls_made,
-                        out.tokens_used,
-                        out.estimated_cost_usd
+                        out.tool_calls_made, out.tokens_used, out.estimated_cost_usd
                     );
                 } else {
                     eprintln!("\x1b[90m  [{} tokens]\x1b[0m\n", out.tokens_used);
@@ -277,10 +322,18 @@ async fn main() {
             Err(e) => eprintln!("\x1b[31m  Error: {}\x1b[0m\n", e),
         }
     }
-    if kernel.context_manager.conversation_owner(&conversation).ok() == Some(agent_id) {
+    if kernel
+        .context_manager
+        .conversation_owner(&conversation)
+        .ok()
+        == Some(agent_id)
+    {
         eprintln!("\n\x1b[90mSaved: {}\x1b[0m", conversation);
     } else {
-        eprintln!("\n\x1b[90mNo messages saved. Conversation: {}\x1b[0m", conversation);
+        eprintln!(
+            "\n\x1b[90mNo messages saved. Conversation: {}\x1b[0m",
+            conversation
+        );
     }
 }
 
@@ -316,15 +369,21 @@ async fn run_cli_turn(
             match event {
                 StreamEvent::ToolCallStarted { name, .. } => eprint!("\x1b[33m  🔧 {name}\x1b[0m"),
                 StreamEvent::ToolCallResult { .. } => eprintln!(" ✓"),
-                _ => {},
+                _ => {}
             }
         }
     });
     let request = kernel::AgentId::new_v4().to_string();
     let output = cancellable_cli_operation(kernel, agent, async {
-        kernel.send_message_stream(agent, message, &request, events).await.map_err(|error| error.to_string())
-    }).await;
-    display.await.map_err(|error| format!("terminal event display failed: {error}"))?;
+        kernel
+            .send_message_stream(agent, message, &request, events)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    display
+        .await
+        .map_err(|error| format!("terminal event display failed: {error}"))?;
     output
 }
 

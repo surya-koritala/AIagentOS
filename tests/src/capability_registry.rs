@@ -1595,7 +1595,7 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "signed-updater foundation",
         "TAURI_SIGNING_PRIVATE_KEY",
         "automatic downgrade is not enabled",
-        "public `v*` tag is deliberately rejected",
+        "that requests desktop assets is deliberately rejected",
         "failed-update, and operator-led rollback evidence",
     ] {
         assert!(

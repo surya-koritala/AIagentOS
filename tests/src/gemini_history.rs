@@ -99,9 +99,12 @@ async fn signed_parallel_tool_turn_and_final_text_replay_after_kernel_restart() 
     assert_eq!(results["parts"].as_array().unwrap().len(), 2);
     for part in results["parts"].as_array().unwrap() {
         assert_eq!(part["functionResponse"]["name"], "read_file");
-        assert!(part["functionResponse"]["response"]
-            .to_string()
-            .contains("owned fixture contents"));
+        assert!(
+            part["functionResponse"]["response"]
+                .to_string()
+                .contains("owned fixture contents"),
+            "unexpected governed read result: {part}"
+        );
     }
     server.reset().await;
     Mock::given(method("POST"))

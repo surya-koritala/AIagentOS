@@ -38,7 +38,7 @@ rather than implied parity.
 
 `agentctl` exposes the public runtime path without bypasses: `create`, `clone`,
 `message`, `stream`, `cancel`, `checkpoints`, `checkpoint-resume`,
-`checkpoint-delete`, `capabilities`, `providers`, `metrics`, and `protocol`
+`checkpoint-delete`, `capabilities`, `providers`, `models`, `metrics`, and `protocol`
 map directly to `KernelClient`. A tenant API key therefore scopes creation,
 listing, messages, checkpoints, and enforcement details to that tenant.
 `stream` writes newline-delimited JSON event and completion records and flushes
@@ -161,9 +161,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 128 current syscalls and rejects either a missing schema operation or an
+all 129 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 97 v1
-operations and all 128 v2 operations. Domain payload examples and
+operations and all 129 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -362,7 +362,7 @@ Protocol v2 errors have:
 
 Stable codes cover authentication, authorization, invalid requests/arguments,
 not found, permission, quota, sandbox, conflict, unavailable, timeout,
-cancelled, incompatible version, provider, lifecycle, and internal failures.
+cancelled, incompatible version, provider, unsupported, lifecycle, and internal failures.
 `agent_sdk::SdkError::Wire` preserves the code and retry hint. The legacy
 `SdkError::Kernel` form remains for v1 replies and local SDK validation.
 
@@ -731,11 +731,13 @@ distributed kernel.
 Versioned fixtures:
 
 - `protocol/v1/error.json`
-- `protocol/v1/requests.json` (all 84 v1 operations)
+- `protocol/v1/requests.json` (all 97 v1 operations)
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
+- `protocol/v2/provider-models.json` (system-only identifier catalog)
+- `protocol/v2/unsupported-model-discovery.json` (unsupported catalog error)
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 115 v2 operations)
+- `protocol/v2/requests.json` (all 129 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

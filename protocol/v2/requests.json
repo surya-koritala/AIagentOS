@@ -291,6 +291,10 @@
     "op": "list_providers"
   },
   {
+    "op": "list_provider_models",
+    "provider_id": "fixture"
+  },
+  {
     "agent_id": "00000000-0000-0000-0000-000000000001",
     "category": null,
     "content": "fixture",

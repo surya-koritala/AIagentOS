@@ -35,6 +35,9 @@ pub mod mcp;
 pub mod mcp_server;
 pub mod memory_manager;
 pub mod metrics;
+pub mod model_discovery;
+#[cfg(test)]
+mod model_discovery_tests;
 pub mod models;
 #[cfg(feature = "wasm")]
 pub mod modules;
@@ -472,6 +475,9 @@ pub enum ConnectorError {
 
     #[error("Provider request cancelled: {0:?}")]
     Cancelled(ProviderErrorContext),
+
+    #[error("Provider feature unsupported: {0:?}")]
+    UnsupportedFeature(ProviderErrorContext),
 }
 
 impl ConnectorError {
@@ -555,6 +561,10 @@ impl ConnectorError {
         ))
     }
 
+    pub fn unsupported_feature(provider: ProviderId, message: impl Into<String>) -> Self {
+        Self::UnsupportedFeature(Self::provider_context(provider, message, None))
+    }
+
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Authentication(context)
@@ -564,7 +574,8 @@ impl ConnectorError {
             | Self::ToolIncompatiblePrimary(context)
             | Self::ContentFiltered(context)
             | Self::Timeout(context)
-            | Self::Cancelled(context) => context.request_id.as_deref(),
+            | Self::Cancelled(context)
+            | Self::UnsupportedFeature(context) => context.request_id.as_deref(),
             Self::RateLimited(limit) => limit.context.request_id.as_deref(),
             Self::ProviderUnavailable(_)
             | Self::ConnectionFailed(_)

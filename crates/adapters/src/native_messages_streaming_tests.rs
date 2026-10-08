@@ -325,30 +325,150 @@ async fn incomplete_native_tools_are_errors() {
 #[tokio::test]
 async fn typed_streams_bound_wire_and_replay_data_and_reject_broken_frames() {
     for index in 0..2 {
-        for body in [" ".repeat(crate::streaming::MAX_OPENAI_STREAM_BYTES + 1), "data: {broken}\n\n".into(), "data: {\"unfinished\":true}".into()] {
+        for body in [
+            " ".repeat(crate::streaming::MAX_OPENAI_STREAM_BYTES + 1),
+            "data: {broken}\n\n".into(),
+            "data: {\"unfinished\":true}".into(),
+        ] {
             let server = MockServer::start().await;
-            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string(body)).expect(1).mount(&server).await;
-            let error = collect(adapters(&server.uri()).remove(index).as_ref(), &[]).await.unwrap_err();
-            assert!(matches!(error, ConnectorError::ProtocolError(_) | ConnectorError::StreamError(_)));
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = collect(adapters(&server.uri()).remove(index).as_ref(), &[])
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ConnectorError::ProtocolError(_) | ConnectorError::StreamError(_)
+            ));
         }
     }
     let server = MockServer::start().await;
-    let body = event(json!({"candidates": [{"content": {"parts": [{"text": "x".repeat(256 * 1024)}]}, "finishReason": "STOP"}]}));
-    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string(body)).expect(1).mount(&server).await;
-    assert!(matches!(collect(adapters(&server.uri()).remove(1).as_ref(), &[]).await.unwrap_err(), ConnectorError::ProtocolError(_)));
+    let body = event(
+        json!({"candidates": [{"content": {"parts": [{"text": "x".repeat(256 * 1024)}]}, "finishReason": "STOP"}]}),
+    );
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(matches!(
+        collect(adapters(&server.uri()).remove(1).as_ref(), &[])
+            .await
+            .unwrap_err(),
+        ConnectorError::ProtocolError(_)
+    ));
 }
 
 #[tokio::test]
 async fn typed_stream_deadline_remains_active_during_sink_backpressure() {
     for index in 0..2 {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string(if index == 0 { anthropic_text_fixture() } else { gemini_text_fixture() })).expect(1).mount(&server).await;
-        let session = adapters(&server.uri()).remove(index).create_session().await.unwrap();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(if index == 0 {
+                anthropic_text_fixture()
+            } else {
+                gemini_text_fixture()
+            }))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = adapters(&server.uri())
+            .remove(index)
+            .create_session()
+            .await
+            .unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let task = tokio::spawn(async move { session.send_streaming_events_controlled(vec![StandardMessage::user("fixture")], &[], LlmRequestOptions { timeout: Some(Duration::from_millis(150)), ..Default::default() }, &CancellationToken::new(), ProviderEventSink::new(sender)).await });
-        tokio::time::timeout(Duration::from_secs(2), async { while receiver.is_empty() { tokio::task::yield_now().await; } }).await.unwrap();
-        assert!(matches!(task.await.unwrap().unwrap_err(), ConnectorError::Timeout(_)));
-        assert_eq!(receiver.recv().await, Some(ProviderStreamEvent::TextDelta("Hello ".into())));
+        let task = tokio::spawn(async move {
+            session
+                .send_streaming_events_controlled(
+                    vec![StandardMessage::user("fixture")],
+                    &[],
+                    LlmRequestOptions {
+                        timeout: Some(Duration::from_millis(150)),
+                        ..Default::default()
+                    },
+                    &CancellationToken::new(),
+                    ProviderEventSink::new(sender),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap_err(),
+            ConnectorError::Timeout(_)
+        ));
+        assert_eq!(
+            receiver.recv().await,
+            Some(ProviderStreamEvent::TextDelta("Hello ".into()))
+        );
         assert_eq!(receiver.recv().await, None);
     }
+}
+
+#[tokio::test]
+async fn visible_gemini_filter_remains_typed_and_never_starts_a_backup() {
+    let server = MockServer::start().await;
+    let body = [
+        event(json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]})),
+        event(json!({"candidates": [{"finishReason": "SAFETY"}]})),
+    ]
+    .concat();
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/fixture:streamGenerateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backup/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let connector = std::sync::Arc::new(AgentConnectorImpl::new());
+    connector
+        .register_provider(std::sync::Arc::new(
+            GeminiAdapter::new("fixture-key".into())
+                .with_base_url(server.uri())
+                .with_model("fixture".into()),
+        ))
+        .unwrap();
+    connector
+        .register_provider(std::sync::Arc::new(
+            crate::groq::GroqAdapter::new("fixture-key".into())
+                .with_base_url(format!("{}/backup", server.uri()))
+                .with_model("fixture".into()),
+        ))
+        .unwrap();
+    connector.set_backup(&"gemini".into(), &"groq".into());
+    let session = connector
+        .connect_resilient(kernel::AgentId::new_v4(), &"gemini".into())
+        .await
+        .unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+    let error = session
+        .send_streaming_events_controlled(
+            vec![StandardMessage::user("fixture")],
+            &[],
+            LlmRequestOptions::default(),
+            &CancellationToken::new(),
+            ProviderEventSink::new(sender),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConnectorError::ContentFiltered(_)));
+    assert_eq!(
+        receiver.recv().await,
+        Some(ProviderStreamEvent::TextDelta("partial".into()))
+    );
+    assert_eq!(session.last_attempts(), Some(1));
 }

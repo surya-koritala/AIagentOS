@@ -296,7 +296,9 @@ fn assistant_parts(
     if parsed.content != message.content || parsed.calls != calls {
         return Err(invalid("saved assistant content or function calls changed"));
     }
-    if parsed.calls.len() > 64 { return Err(invalid("saved history has too many function calls")); }
+    if parsed.calls.len() > 64 {
+        return Err(invalid("saved history has too many function calls"));
+    }
     Ok((parts, parsed))
 }
 
@@ -307,11 +309,17 @@ pub(super) fn single_message(
 ) -> Result<Value, ConnectorError> {
     match message.role.as_str() {
         "assistant" | "model" => {
-            if message.provider_metadata.as_ref()
+            if message
+                .provider_metadata
+                .as_ref()
                 .map(|metadata| stream_chunk_counts(metadata.payload()))
-                .transpose()?.flatten().is_some_and(|counts| counts.len() > 1)
+                .transpose()?
+                .flatten()
+                .is_some_and(|counts| counts.len() > 1)
             {
-                return Err(invalid("streamed Content boundaries need complete history translation"));
+                return Err(invalid(
+                    "streamed Content boundaries need complete history translation",
+                ));
             }
             let (parts, _) = assistant_parts(message, provider, model)?;
             Ok(json!({"role": "model", "parts": parts}))

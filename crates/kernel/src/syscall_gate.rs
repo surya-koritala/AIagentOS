@@ -608,6 +608,7 @@ impl SyscallGate {
             .map(|record| (record.cgroup, record.pid, record.accepting_tool_calls))
             .ok_or(GateDenial::UnknownAgent)?;
         self.acquire_tool_call_for_record(cgroup, pid, accepting_tool_calls)
+            .inspect_err(|error| self.record_agent_denial(kid, error))
     }
     /// Create a gate with the production baseline: enforcing MAC, profile-based
     /// allow rules, and a default-deny fallthrough. Tests that intentionally

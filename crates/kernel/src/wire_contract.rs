@@ -1638,20 +1638,39 @@ mod tests {
     fn agent_gate_statistics_is_an_additive_discoverable_reply_field() {
         let description = protocol_description();
         assert_eq!(description.protocol_version, 2);
-        assert!(description.features.contains(&"agent_gate_statistics".to_string()));
-        let agent_info = description.reply_schema["oneOf"].as_array().unwrap().iter()
-            .find(|variant| variant["properties"]["status"]["const"] == "agent_info").unwrap();
+        assert!(description
+            .features
+            .contains(&"agent_gate_statistics".to_string()));
+        let agent_info = description.reply_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["status"]["const"] == "agent_info")
+            .unwrap();
         assert_eq!(agent_info["properties"]["gate_decisions"]["type"], "object");
-        assert!(!agent_info["required"].as_array().unwrap().contains(&json!("gate_decisions")));
+        assert!(!agent_info["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("gate_decisions")));
         let reply = crate::syscall_server::SyscallReply::AgentInfo {
-            pid: 1, capabilities: vec![], namespaces: vec![],
+            pid: 1,
+            capabilities: vec![],
+            namespaces: vec![],
             gate_decisions: crate::syscall_gate::GateStats::default(),
         };
         let encoded = serde_json::to_value(reply).unwrap();
         let counters = encoded["gate_decisions"].as_object().unwrap();
         assert_eq!(counters.len(), 8);
-        for field in ["allowed", "denied_capability", "denied_mac", "denied_approval",
-            "denied_cgroup", "denied_namespace", "denied_unknown", "audited"] {
+        for field in [
+            "allowed",
+            "denied_capability",
+            "denied_mac",
+            "denied_approval",
+            "denied_cgroup",
+            "denied_namespace",
+            "denied_unknown",
+            "audited",
+        ] {
             assert_eq!(counters[field], 0);
         }
     }
@@ -1721,9 +1740,18 @@ mod tests {
     fn versioned_golden_fixtures_parse_with_the_public_types() {
         let agent: crate::syscall_server::SyscallReply =
             serde_json::from_str(include_str!("../../../protocol/v2/agent-info.json")).unwrap();
-        assert!(matches!(agent, crate::syscall_server::SyscallReply::AgentInfo {
-            gate_decisions: crate::syscall_gate::GateStats { allowed: 1, denied_unknown: 6, denied_namespace: 7, .. }, ..
-        }));
+        assert!(matches!(
+            agent,
+            crate::syscall_server::SyscallReply::AgentInfo {
+                gate_decisions: crate::syscall_gate::GateStats {
+                    allowed: 1,
+                    denied_unknown: 6,
+                    denied_namespace: 7,
+                    ..
+                },
+                ..
+            }
+        ));
 
         let v1: crate::syscall_server::SyscallReply =
             serde_json::from_str(include_str!("../../../protocol/v1/error.json")).unwrap();

@@ -10,6 +10,11 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Indexed exact fact payload byte counts for storage quota aggregation, retaining
+  agent, tenant and global limits. Raw-write, rollback, reopen and rejected-update
+  regressions verify accounting; a same-run hosted 100k comparison preserves
+  the existing quality, isolation, integrity, traffic and latency thresholds.
+
 - Added bounded typed inline PNG/JPEG input through governed v2 requests,
   SDK and CLI commands, four native provider adapters, and schema-fenced
   conversation/checkpoint persistence. Image admission uses explicit

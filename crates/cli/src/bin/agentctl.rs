@@ -9,7 +9,7 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenant TENANT_ID] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] tenant-create NAME\n\
@@ -395,11 +395,42 @@ async fn run() {
         usage();
     }
 
-    // Policy authoring, verification, and restore operate directly on local
-    // files and must not depend on a live connection profile. Restore remains
-    // offline: the storage lease rejects replacement while a kernel owns the
-    // destination database.
-    match command.as_str() {
+    if command == "user-create" {
+        let role = args.clone().nth(2).unwrap_or_else(|| usage());
+        if agent_sdk::Role::parse(&role).is_none() {
+            usage();
+        }
+    }
+
+    // Keep recovery's kernel construction outside the wire-command frame.
+    if Box::pin(run_offline(&command, &mut args)).await {
+        return;
+    }
+
+    let mut profile = ConnectionProfile::from_env().unwrap_or_else(|error| {
+        eprintln!("agentctl: {error}");
+        std::process::exit(2);
+    });
+    if let Some(address) = address_override {
+        profile.address = address;
+    }
+    let client = OperatorClient::connect_profile(&profile, token.as_deref())
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "agentctl: could not connect to {}: {error}",
+                profile.address
+            );
+            std::process::exit(1);
+        });
+
+    Box::pin(run_online(&command, args, client, tenant_override)).await;
+}
+
+type CommandArgs = std::iter::Peekable<std::iter::Skip<std::vec::IntoIter<String>>>;
+
+async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
+    match command {
         "policy-validate" => {
             let path = args.next().unwrap_or_else(|| usage());
             if args.next().is_some() {
@@ -407,7 +438,7 @@ async fn run() {
             }
             let report = policy::validate_file(path).unwrap_or_else(|error| fail_operator(error));
             print_json(&report, "policy validation report");
-            return;
+            true
         }
         "policy-explain" => {
             let path = args.next().unwrap_or_else(|| usage());
@@ -420,7 +451,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_operator(error));
             print_json(&report, "policy explanation report");
-            return;
+            true
         }
         "backup-key-generate" => {
             let key_id = args.next().unwrap_or_else(|| usage());
@@ -436,7 +467,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&trust, "backup trust root");
-            return;
+            true
         }
         "backup-anchor-create" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
@@ -458,7 +489,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&anchor, "backup recovery anchor");
-            return;
+            true
         }
         "backup-verify" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
@@ -490,7 +521,7 @@ async fn run() {
                 )
                 .unwrap_or_else(|error| fail_storage(error));
                 print_json(&manifest, "backup manifest");
-                return;
+                return true;
             }
             let manifest = match (storage_key.as_ref(), trust.as_ref()) {
                 (None, None) => kernel::storage::verify_backup(std::path::Path::new(&backup_dir)),
@@ -512,7 +543,7 @@ async fn run() {
             }
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&manifest, "backup manifest");
-            return;
+            true
         }
         "backup-restore" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
@@ -546,7 +577,7 @@ async fn run() {
                 )
                 .unwrap_or_else(|error| fail_storage(error));
                 print_json(&report, "restore report");
-                return;
+                return true;
             }
             let report = match (storage_key.as_ref(), trust.as_ref()) {
                 (None, None) => kernel::storage::restore_backup(
@@ -574,7 +605,7 @@ async fn run() {
             }
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "restore report");
-            return;
+            true
         }
         "backup-disaster-recover" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
@@ -615,7 +646,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "disaster recovery report");
-            return;
+            true
         }
         "backup-corruption-recover" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
@@ -658,7 +689,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "corrupt storage recovery report");
-            return;
+            true
         }
         "backup-remote-publish" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
@@ -710,7 +741,7 @@ async fn run() {
             .await
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "remote backup publication report");
-            return;
+            true
         }
         "backup-remote-fetch" => {
             let endpoint = args.next().unwrap_or_else(|| usage());
@@ -757,7 +788,7 @@ async fn run() {
             .await
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "remote backup recovery report");
-            return;
+            true
         }
         "storage-portable-export" => {
             let database = args.next().unwrap_or_else(|| usage());
@@ -774,7 +805,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "portable storage export report");
-            return;
+            true
         }
         "storage-portable-verify" => {
             let bundle_dir = args.next().unwrap_or_else(|| usage());
@@ -785,7 +816,7 @@ async fn run() {
                 kernel::storage::verify_portable_storage(std::path::Path::new(&bundle_dir))
                     .unwrap_or_else(|error| fail_storage(error));
             print_json(&manifest, "portable storage manifest");
-            return;
+            true
         }
         "storage-portable-import" => {
             let bundle_dir = args.next().unwrap_or_else(|| usage());
@@ -802,7 +833,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "portable storage import report");
-            return;
+            true
         }
         "storage-key-generate" => {
             let key_id = args.next().unwrap_or_else(|| usage());
@@ -819,7 +850,7 @@ async fn run() {
                 &serde_json::json!({"key_id": key_id, "key_file": key_file}),
                 "storage key",
             );
-            return;
+            true
         }
         "storage-encrypt" => {
             let database = args.next().unwrap_or_else(|| usage());
@@ -837,7 +868,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "storage encryption migration report");
-            return;
+            true
         }
         "storage-encrypt-recover" => {
             let database = args.next().unwrap_or_else(|| usage());
@@ -855,7 +886,7 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "storage encryption recovery report");
-            return;
+            true
         }
         "storage-key-rotate" => {
             let database = args.next().unwrap_or_else(|| usage());
@@ -879,29 +910,19 @@ async fn run() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "storage key rotation report");
-            return;
+            true
         }
-        _ => {}
+        _ => false,
     }
+}
 
-    let mut profile = ConnectionProfile::from_env().unwrap_or_else(|error| {
-        eprintln!("agentctl: {error}");
-        std::process::exit(2);
-    });
-    if let Some(address) = address_override {
-        profile.address = address;
-    }
-    let mut client = OperatorClient::connect_profile(&profile, token.as_deref())
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!(
-                "agentctl: could not connect to {}: {error}",
-                profile.address
-            );
-            std::process::exit(1);
-        });
-
-    let result = match command.as_str() {
+async fn run_online(
+    command: &str,
+    mut args: CommandArgs,
+    mut client: OperatorClient,
+    tenant_override: Option<String>,
+) {
+    let result = match command {
         "tenant-create" => {
             let name = args.next().unwrap_or_else(|| usage());
             if args.next().is_some() {

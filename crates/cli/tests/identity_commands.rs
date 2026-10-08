@@ -377,6 +377,12 @@ async fn first_operator_bootstrap_two_tenants_multiple_agents_and_crash_restart_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_cli_help_roles_and_exact_confirmation_are_unambiguous() {
+    let invalid_without_server = agentctl(
+        "127.0.0.1:1",
+        BOOTSTRAP_TOKEN,
+        &["user-create", "bad", "bad@example.test", "superuser"],
+    );
+    assert_eq!(invalid_without_server.status.code(), Some(2));
     let kernel = std::sync::Arc::new(kernel::AgentKernelImpl::new().unwrap());
     let server = kernel::syscall_server::SyscallServer::bind(kernel, "127.0.0.1:0")
         .await

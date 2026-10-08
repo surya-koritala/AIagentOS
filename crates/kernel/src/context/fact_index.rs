@@ -996,7 +996,7 @@ mod tests {
                 .unwrap()],
             )
             .unwrap();
-            conn.execute_batch("DROP TABLE fact_index_generations; ALTER TABLE facts DROP COLUMN embedding_blob; DELETE FROM schema_migrations WHERE version=10; UPDATE storage_meta SET schema_version=9,min_reader_schema_version=9; PRAGMA user_version=9;").unwrap();
+            conn.execute_batch("DROP INDEX idx_facts_storage_bytes; DROP TABLE fact_index_generations; ALTER TABLE facts DROP COLUMN embedding_blob; DELETE FROM schema_migrations WHERE version=10; UPDATE storage_meta SET schema_version=9,min_reader_schema_version=9; PRAGMA user_version=9;").unwrap();
         }
         drop(manager);
         let reopened = SqliteContextManager::new(&path).unwrap();

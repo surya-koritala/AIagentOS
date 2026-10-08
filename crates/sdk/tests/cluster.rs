@@ -18,17 +18,16 @@ use kernel::syscall_server::SyscallServer;
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use tokio::task::JoinHandle;
 
-struct TempDb(PathBuf);
+struct TempDb(PathBuf, tempfile::TempDir);
 
 impl TempDb {
     fn new(label: &str) -> Self {
-        Self(std::env::temp_dir().join(format!(
-            "agentos-cluster-{label}-{}.sqlite",
-            uuid::Uuid::new_v4()
-        )))
+        let directory = tempfile::tempdir().unwrap();
+        Self(directory.path().join(format!("{label}.sqlite")), directory)
     }
 
     fn path(&self) -> &Path {
+        assert_eq!(self.0.parent(), Some(self.1.path()));
         &self.0
     }
 }

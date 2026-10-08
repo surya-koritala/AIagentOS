@@ -797,8 +797,10 @@ mod tests {
     use crate::quota_clock::ManualQuotaClock;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
-    fn temporary_database_path(test_name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("aiagentos-{test_name}-{}.sqlite", Uuid::new_v4()))
+    fn temporary_database_path(test_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("{test_name}.sqlite"));
+        (directory, path)
     }
 
     fn deterministic_limiter(config: RateLimitConfig, clock: Arc<ManualQuotaClock>) -> RateLimiter {
@@ -1303,7 +1305,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_epoch_reconciliation_does_not_charge_completion_epoch() {
-        let path = temporary_database_path("cross-epoch-reconcile");
+        let (_directory, path) = temporary_database_path("cross-epoch-reconcile");
         let clock = Arc::new(ManualQuotaClock::new(59_999));
         let store = Arc::new(SqliteContextManager::new(&path).unwrap());
         let limiter = RateLimiter::with_store(
@@ -1355,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_restart_in_same_epoch_preserves_usage() {
-        let path = temporary_database_path("rate-restart");
+        let (_directory, path) = temporary_database_path("rate-restart");
         let clock = Arc::new(ManualQuotaClock::new(20_000));
         let config = RateLimitConfig {
             rpm: 1,
@@ -1394,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn storage_failure_poisons_future_admission() {
-        let path = temporary_database_path("rate-poison");
+        let (_directory, path) = temporary_database_path("rate-poison");
         let store = Arc::new(SqliteContextManager::new(&path).unwrap());
         let clock = Arc::new(ManualQuotaClock::new(0));
         let limiter = RateLimiter::with_store(RateLimitConfig::default(), store, clock).unwrap();
@@ -1423,6 +1425,7 @@ mod tests {
             "unexpected second error: {second}"
         );
         assert!(!limiter.stats().healthy);
+        drop(limiter);
         let _ = std::fs::remove_file(path);
     }
 }

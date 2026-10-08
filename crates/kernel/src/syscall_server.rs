@@ -11503,10 +11503,8 @@ memory = ["remember this"]
 
     #[tokio::test]
     async fn operator_tunables_are_durable_audited_atomic_and_enforced() {
-        let db_path = std::env::temp_dir().join(format!(
-            "agentos-operator-tunables-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("operator-tunables.sqlite");
         {
             let kernel = AgentKernelImpl::with_db_path(&db_path).unwrap();
             let initial = match dispatch(&kernel, Syscall::ListOperatorTunables).await {

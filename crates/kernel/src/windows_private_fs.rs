@@ -446,6 +446,15 @@ pub(crate) fn check_directory(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn protect_path(path: &Path, directory: bool) -> io::Result<()> {
+    #[cfg(test)]
+    if directory {
+        let target = std::fs::canonicalize(path)?;
+        let shared_temporary = std::fs::canonicalize(std::env::temp_dir())?;
+        assert_ne!(
+            target, shared_temporary,
+            "private storage test fixtures must own their directory before ACL mutation"
+        );
+    }
     let file = open(path, directory, READ_CONTROL | WRITE_DAC)?;
     let descriptor = PrivateDescriptor::new(directory)?;
     // A permissive object owned by the exact current TokenUser/TokenOwner may

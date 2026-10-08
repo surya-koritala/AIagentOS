@@ -4767,9 +4767,8 @@ mod tests {
 
     #[tokio::test]
     async fn vote_log_state_machine_and_snapshot_survive_restart() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let path = database.path().to_path_buf();
-        drop(database);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-restart.sqlite");
         let operation_id = Uuid::new_v4();
         let snapshot_meta;
         {

@@ -1098,7 +1098,13 @@ mod tests {
         assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 2);
         for handle in [fresh.id, existing.id] {
             assert!(matches!(
-                client.call(Syscall::VfsClose { agent_id: agent.to_string(), handle }).await.unwrap(),
+                client
+                    .call(Syscall::VfsClose {
+                        agent_id: agent.to_string(),
+                        handle
+                    })
+                    .await
+                    .unwrap(),
                 SyscallReply::VfsClosed
             ));
         }
@@ -1141,7 +1147,10 @@ mod tests {
         })
         .await
         .expect("abandoned native write escaped its provider deadline");
-        assert_eq!(std::fs::read(root.path().join("file.bin")).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(root.path().join("file.bin")).unwrap(),
+            b"original"
+        );
         release.store(true, Ordering::Release);
         let mut reader = SyscallClient::connect(address).await.unwrap();
         match reader
@@ -1155,14 +1164,22 @@ mod tests {
             .unwrap()
         {
             SyscallReply::WorkspaceRead { chunk } => assert_eq!(
-                base64::engine::general_purpose::STANDARD.decode(chunk.data_base64).unwrap(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk.data_base64)
+                    .unwrap(),
                 b"original"
             ),
             other => panic!("fresh public read after abandoned worker drain failed: {other:?}"),
         }
         assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 1);
         assert!(matches!(
-            reader.call(Syscall::VfsClose { agent_id: agent.to_string(), handle: handle.id }).await.unwrap(),
+            reader
+                .call(Syscall::VfsClose {
+                    agent_id: agent.to_string(),
+                    handle: handle.id
+                })
+                .await
+                .unwrap(),
             SyscallReply::VfsClosed
         ));
         reader.close().await.unwrap();

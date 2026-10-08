@@ -445,6 +445,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn conflicting_wire_child_does_not_wait_behind_a_queued_fence_writer() {
+        use crate::syscall_server::{dispatch, Syscall, SyscallReply};
+        let kernel = AgentKernelImpl::new().unwrap();
+        let parent = kernel.create_agent_full(config()).await.unwrap().id;
+        let unrelated = kernel.create_agent_full(config()).await.unwrap().id;
+        let barrier = kernel.agent_mutation_fence_barrier(unrelated);
+        let reader = barrier.clone().read_owned().await;
+        let mut writer = Box::pin(barrier.write_owned());
+        tokio::select! {
+            biased;
+            _ = &mut writer => panic!("writer cannot acquire while the reader is held"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatch(
+                &kernel,
+                Syscall::CloneAgent {
+                    agent_id: parent.to_string(),
+                    child_agent_id: unrelated.to_string(),
+                    child_ownership_proof: None,
+                    name: "conflicting child".into(),
+                    drop_capabilities: vec![],
+                },
+            ),
+        )
+        .await
+        .expect("an invalid child must not queue for another agent's fence");
+        assert!(matches!(reply, SyscallReply::Error { message } if message.contains("conflicts")));
+        drop(writer);
+        drop(reader);
+        assert_eq!(
+            kernel.get_agent_status(parent).unwrap(),
+            AgentState::Running
+        );
+        assert_eq!(
+            kernel.get_agent_status(unrelated).unwrap(),
+            AgentState::Running
+        );
+        kernel.stop_agent(parent).await.unwrap();
+        kernel.stop_agent(unrelated).await.unwrap();
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(16))]
         #[test]
@@ -497,6 +541,22 @@ pub struct CloneResult {
 
 fn policy(message: impl Into<String>) -> KernelError {
     KernelError::Policy(message.into())
+}
+
+pub(crate) fn clone_attenuation(
+    names: &[String],
+) -> Result<std::collections::BTreeSet<u64>, KernelError> {
+    let mut dropped = std::collections::BTreeSet::new();
+    for capability in names {
+        let bit = crate::syscall_gate::capability_bit(capability)
+            .ok_or_else(|| policy("invalid clone capability attenuation: unknown name"))?;
+        if !dropped.insert(bit) {
+            return Err(policy(
+                "invalid clone capability attenuation: duplicate name",
+            ));
+        }
+    }
+    Ok(dropped)
 }
 
 // A dropped RPC must release every unpublished runtime resource. The durable
@@ -567,16 +627,7 @@ impl AgentKernelImpl {
         if parent == child || child.is_nil() || name.is_empty() || name.len() > 256 {
             return Err(policy("invalid clone identity or name"));
         }
-        let mut dropped = std::collections::BTreeSet::new();
-        for capability in drop_capabilities {
-            let bit = crate::syscall_gate::capability_bit(&capability)
-                .ok_or_else(|| policy("invalid clone capability attenuation: unknown name"))?;
-            if !dropped.insert(bit) {
-                return Err(policy(
-                    "invalid clone capability attenuation: duplicate name",
-                ));
-            }
-        }
+        let dropped = clone_attenuation(&drop_capabilities)?;
         let request_digest = crate::context::clone_request_digest(parent, &name, &dropped)?;
         let _operator = self.operator_control.mutation_guard().await;
         let parent_lock = self.lifecycle_lock(parent);

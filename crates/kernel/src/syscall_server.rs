@@ -2901,6 +2901,48 @@ async fn dispatch_scoped_inner_with_fence(
                 Ok(value) => value,
                 Err(message) => return SyscallReply::Error { message },
             };
+            match (
+                kernel.context_manager.agent_tenant(parent),
+                kernel.context_manager.agent_tenant(child),
+            ) {
+                (Ok(Some(parent_tenant)), Ok(Some(child_tenant)))
+                    if parent_tenant != child_tenant =>
+                {
+                    return SyscallReply::Error {
+                        message: "authorization denied for clone child identity".into(),
+                    };
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+                _ => {}
+            }
+            // Reject unrelated existing identities before waiting for a second
+            // writer-preferring fence. Reciprocal invalid clone requests must
+            // not hold each other's parent readers behind queued writers.
+            let digest =
+                crate::cloning::clone_attenuation(&drop_capabilities).and_then(|dropped| {
+                    crate::context::clone_request_digest(parent, &name, &dropped)
+                        .map_err(crate::KernelError::Context)
+                });
+            let digest = match digest {
+                Ok(digest) => digest,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            if let Err(error) = kernel
+                .context_manager
+                .completed_clone(parent, child, &digest)
+            {
+                return SyscallReply::Error {
+                    message: error.to_string(),
+                };
+            }
             let _child_fence = barrier.read_owned().await;
             let proof_valid = match child_ownership_proof {
                 Some(proof) => kernel
@@ -2919,24 +2961,6 @@ async fn dispatch_scoped_inner_with_fence(
             };
             if let Err(message) = proof_valid {
                 return SyscallReply::Error { message };
-            }
-            match (
-                kernel.context_manager.agent_tenant(parent),
-                kernel.context_manager.agent_tenant(child),
-            ) {
-                (Ok(Some(parent_tenant)), Ok(Some(child_tenant)))
-                    if parent_tenant != child_tenant =>
-                {
-                    return SyscallReply::Error {
-                        message: "authorization denied for clone child identity".into(),
-                    };
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    return SyscallReply::Error {
-                        message: error.to_string(),
-                    }
-                }
-                _ => {}
             }
             match kernel
                 .clone_agent(parent, child, name, drop_capabilities)

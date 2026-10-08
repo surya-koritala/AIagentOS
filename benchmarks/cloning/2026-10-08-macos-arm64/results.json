@@ -12,49 +12,49 @@
       "samples": [
         {
           "branch": 1,
-          "latency_us": 6569,
-          "resident_growth_bytes": 2555904,
+          "latency_us": 6749,
+          "resident_growth_bytes": 2572288,
           "retained_database_growth_bytes": 475136
         },
         {
           "branch": 2,
-          "latency_us": 1746,
+          "latency_us": 1794,
           "resident_growth_bytes": 2588672,
           "retained_database_growth_bytes": 475136
         },
         {
           "branch": 3,
-          "latency_us": 1638,
+          "latency_us": 1673,
           "resident_growth_bytes": 2588672,
           "retained_database_growth_bytes": 475136
         },
         {
           "branch": 4,
-          "latency_us": 1647,
-          "resident_growth_bytes": 2605056,
+          "latency_us": 1658,
+          "resident_growth_bytes": 2637824,
           "retained_database_growth_bytes": 475136
         },
         {
           "branch": 5,
-          "latency_us": 1677,
-          "resident_growth_bytes": 2605056,
+          "latency_us": 1650,
+          "resident_growth_bytes": 2637824,
           "retained_database_growth_bytes": 475136
         },
         {
           "branch": 6,
-          "latency_us": 1800,
-          "resident_growth_bytes": 2621440,
-          "retained_database_growth_bytes": 475136
-        },
-        {
-          "branch": 7,
-          "latency_us": 1635,
+          "latency_us": 1682,
           "resident_growth_bytes": 2670592,
           "retained_database_growth_bytes": 475136
         },
         {
+          "branch": 7,
+          "latency_us": 1661,
+          "resident_growth_bytes": 2703360,
+          "retained_database_growth_bytes": 475136
+        },
+        {
           "branch": 8,
-          "latency_us": 1646,
+          "latency_us": 1629,
           "resident_growth_bytes": 2703360,
           "retained_database_growth_bytes": 475136
         }
@@ -68,50 +68,50 @@
       "samples": [
         {
           "branch": 1,
-          "latency_us": 3813,
-          "resident_growth_bytes": 1638400,
+          "latency_us": 3893,
+          "resident_growth_bytes": 1851392,
           "retained_database_growth_bytes": 512000
         },
         {
           "branch": 2,
-          "latency_us": 3694,
-          "resident_growth_bytes": 1998848,
+          "latency_us": 3701,
+          "resident_growth_bytes": 2260992,
           "retained_database_growth_bytes": 1024000
         },
         {
           "branch": 3,
-          "latency_us": 3631,
-          "resident_growth_bytes": 2048000,
+          "latency_us": 3692,
+          "resident_growth_bytes": 2277376,
           "retained_database_growth_bytes": 1536000
         },
         {
           "branch": 4,
-          "latency_us": 3674,
-          "resident_growth_bytes": 2097152,
+          "latency_us": 3739,
+          "resident_growth_bytes": 2342912,
           "retained_database_growth_bytes": 2048000
         },
         {
           "branch": 5,
-          "latency_us": 4061,
-          "resident_growth_bytes": 2097152,
+          "latency_us": 3919,
+          "resident_growth_bytes": 2359296,
           "retained_database_growth_bytes": 2568192
         },
         {
           "branch": 6,
-          "latency_us": 4212,
-          "resident_growth_bytes": 2129920,
+          "latency_us": 4031,
+          "resident_growth_bytes": 2392064,
           "retained_database_growth_bytes": 3088384
         },
         {
           "branch": 7,
-          "latency_us": 5292,
-          "resident_growth_bytes": 2244608,
+          "latency_us": 5176,
+          "resident_growth_bytes": 2506752,
           "retained_database_growth_bytes": 3870720
         },
         {
           "branch": 8,
-          "latency_us": 4763,
-          "resident_growth_bytes": 2293760,
+          "latency_us": 4333,
+          "resident_growth_bytes": 2523136,
           "retained_database_growth_bytes": 4112384
         }
       ],
@@ -124,50 +124,50 @@
       "samples": [
         {
           "branch": 1,
-          "latency_us": 86618,
-          "resident_growth_bytes": 12353536,
+          "latency_us": 79927,
+          "resident_growth_bytes": 14270464,
           "retained_database_growth_bytes": 7614464
         },
         {
           "branch": 2,
-          "latency_us": 5445,
-          "resident_growth_bytes": 12353536,
+          "latency_us": 5362,
+          "resident_growth_bytes": 14286848,
           "retained_database_growth_bytes": 7614464
         },
         {
           "branch": 3,
-          "latency_us": 5325,
-          "resident_growth_bytes": 12369920,
+          "latency_us": 5203,
+          "resident_growth_bytes": 14336000,
           "retained_database_growth_bytes": 7614464
         },
         {
           "branch": 4,
-          "latency_us": 5591,
-          "resident_growth_bytes": 12419072,
+          "latency_us": 5209,
+          "resident_growth_bytes": 14385152,
           "retained_database_growth_bytes": 7614464
         },
         {
           "branch": 5,
-          "latency_us": 5523,
-          "resident_growth_bytes": 12419072,
+          "latency_us": 5322,
+          "resident_growth_bytes": 14385152,
           "retained_database_growth_bytes": 7614464
         },
         {
           "branch": 6,
-          "latency_us": 5365,
-          "resident_growth_bytes": 12468224,
+          "latency_us": 5093,
+          "resident_growth_bytes": 14417920,
           "retained_database_growth_bytes": 7614464
         },
         {
           "branch": 7,
-          "latency_us": 5401,
-          "resident_growth_bytes": 12484608,
+          "latency_us": 5114,
+          "resident_growth_bytes": 14450688,
           "retained_database_growth_bytes": 7614464
         },
         {
           "branch": 8,
-          "latency_us": 5414,
-          "resident_growth_bytes": 12517376,
+          "latency_us": 5437,
+          "resident_growth_bytes": 14467072,
           "retained_database_growth_bytes": 7614464
         }
       ],
@@ -180,50 +180,50 @@
       "samples": [
         {
           "branch": 1,
-          "latency_us": 59311,
-          "resident_growth_bytes": 4980736,
+          "latency_us": 54120,
+          "resident_growth_bytes": 9535488,
           "retained_database_growth_bytes": 8200192
         },
         {
           "branch": 2,
-          "latency_us": 58560,
-          "resident_growth_bytes": 8945664,
+          "latency_us": 54723,
+          "resident_growth_bytes": 13434880,
           "retained_database_growth_bytes": 16412672
         },
         {
           "branch": 3,
-          "latency_us": 61551,
-          "resident_growth_bytes": 12910592,
+          "latency_us": 59398,
+          "resident_growth_bytes": 17383424,
           "retained_database_growth_bytes": 25145344
         },
         {
           "branch": 4,
-          "latency_us": 67834,
-          "resident_growth_bytes": 16842752,
+          "latency_us": 67396,
+          "resident_growth_bytes": 21315584,
           "retained_database_growth_bytes": 34369536
         },
         {
           "branch": 5,
-          "latency_us": 61589,
-          "resident_growth_bytes": 20758528,
+          "latency_us": 59413,
+          "resident_growth_bytes": 25247744,
           "retained_database_growth_bytes": 41103360
         },
         {
           "branch": 6,
-          "latency_us": 66912,
-          "resident_growth_bytes": 24690688,
+          "latency_us": 60147,
+          "resident_growth_bytes": 29196288,
           "retained_database_growth_bytes": 49160192
         },
         {
           "branch": 7,
-          "latency_us": 72448,
-          "resident_growth_bytes": 28672000,
+          "latency_us": 67718,
+          "resident_growth_bytes": 33128448,
           "retained_database_growth_bytes": 58499072
         },
         {
           "branch": 8,
-          "latency_us": 73981,
-          "resident_growth_bytes": 32587776,
+          "latency_us": 67072,
+          "resident_growth_bytes": 37027840,
           "retained_database_growth_bytes": 66654208
         }
       ],
@@ -236,50 +236,50 @@
       "samples": [
         {
           "branch": 1,
-          "latency_us": 326548,
-          "resident_growth_bytes": 108429312,
+          "latency_us": 313507,
+          "resident_growth_bytes": 112590848,
           "retained_database_growth_bytes": 30474240
         },
         {
           "branch": 2,
-          "latency_us": 16583,
-          "resident_growth_bytes": 108462080,
+          "latency_us": 16459,
+          "resident_growth_bytes": 112623616,
           "retained_database_growth_bytes": 30474240
         },
         {
           "branch": 3,
-          "latency_us": 16505,
-          "resident_growth_bytes": 108462080,
+          "latency_us": 16125,
+          "resident_growth_bytes": 112640000,
           "retained_database_growth_bytes": 30474240
         },
         {
           "branch": 4,
-          "latency_us": 16862,
-          "resident_growth_bytes": 108478464,
+          "latency_us": 16084,
+          "resident_growth_bytes": 112705536,
           "retained_database_growth_bytes": 30474240
         },
         {
           "branch": 5,
-          "latency_us": 16681,
-          "resident_growth_bytes": 108494848,
+          "latency_us": 16065,
+          "resident_growth_bytes": 112705536,
           "retained_database_growth_bytes": 30474240
         },
         {
           "branch": 6,
-          "latency_us": 16705,
-          "resident_growth_bytes": 108511232,
+          "latency_us": 16308,
+          "resident_growth_bytes": 112721920,
           "retained_database_growth_bytes": 30474240
         },
         {
           "branch": 7,
-          "latency_us": 16698,
-          "resident_growth_bytes": 108544000,
+          "latency_us": 16121,
+          "resident_growth_bytes": 112738304,
           "retained_database_growth_bytes": 30474240
         },
         {
           "branch": 8,
-          "latency_us": 16701,
-          "resident_growth_bytes": 108560384,
+          "latency_us": 16284,
+          "resident_growth_bytes": 112787456,
           "retained_database_growth_bytes": 30474240
         }
       ],
@@ -292,50 +292,50 @@
       "samples": [
         {
           "branch": 1,
-          "latency_us": 230914,
-          "resident_growth_bytes": -12943360,
+          "latency_us": 220545,
+          "resident_growth_bytes": 19447808,
           "retained_database_growth_bytes": 32808960
         },
         {
           "branch": 2,
-          "latency_us": 236035,
-          "resident_growth_bytes": 48594944,
+          "latency_us": 214559,
+          "resident_growth_bytes": 80412672,
           "retained_database_growth_bytes": 65609728
         },
         {
           "branch": 3,
-          "latency_us": 265631,
-          "resident_growth_bytes": 64208896,
+          "latency_us": 238077,
+          "resident_growth_bytes": 96026624,
           "retained_database_growth_bytes": 100954112
         },
         {
           "branch": 4,
-          "latency_us": 212263,
-          "resident_growth_bytes": 79724544,
+          "latency_us": 219320,
+          "resident_growth_bytes": 111607808,
           "retained_database_growth_bytes": 135827456
         },
         {
           "branch": 5,
-          "latency_us": 209119,
-          "resident_growth_bytes": 95256576,
+          "latency_us": 205953,
+          "resident_growth_bytes": 127107072,
           "retained_database_growth_bytes": 165552128
         },
         {
           "branch": 6,
-          "latency_us": 203912,
-          "resident_growth_bytes": 110788608,
+          "latency_us": 200098,
+          "resident_growth_bytes": 142655488,
           "retained_database_growth_bytes": 196612096
         },
         {
           "branch": 7,
-          "latency_us": 238689,
-          "resident_growth_bytes": 126304256,
+          "latency_us": 232173,
+          "resident_growth_bytes": 158171136,
           "retained_database_growth_bytes": 234348544
         },
         {
           "branch": 8,
-          "latency_us": 236399,
-          "resident_growth_bytes": 141819904,
+          "latency_us": 228793,
+          "resident_growth_bytes": 173703168,
           "retained_database_growth_bytes": 266162176
         }
       ],

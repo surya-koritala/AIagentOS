@@ -56,13 +56,20 @@ The Rust SDK provides `KernelClient::vfs_mounts`, `vfs_open`, `vfs_invoke`, and
 Ownership-fenced deployments wrap handle mutations in the existing
 `FencedAgentMutation` request through `KernelClient::call`.
 
-## Remaining VFS work
+## Other mounts and delivery status
 
-Issue [#392](https://github.com/surya-koritala/AIagentOS/issues/392) stays open.
-[Workspace entry handles](WORKSPACE_VFS.md) now provide attenuated rights and
-governed read/write/list/stat with native directory capabilities. Administrable
-per-namespace mounts and unmount generations, memory/KV/IPC mounts, and
-dup/inheritance semantics remain separate delivery slices. This tool mount
-does not establish a complete VFS or production qualification. Durable
-copy-on-write cloning in #393 and the coding agent in #394 follow those
-contracts.
+[Workspace entry handles](WORKSPACE_VFS.md) provide attenuated rights and
+governed read/write/list/stat with native directory capabilities.
+[Namespace mount controls](NAMESPACE_MOUNTS.md) provide governed aliases and
+generation-fenced unmount. [Data handles](DATA_VFS.md) provide persistent
+memory/KV and local IPC under the same gate and shared handle bounds.
+
+Workspace and data descriptors support independent, attenuating duplicates.
+Tool descriptors identify registrations; callers can explicitly reopen a
+visible registration to obtain an independent descriptor. Every descriptor is
+agent-owned, ephemeral, and closed on restart or clone. There is no implicit
+inheritance of descriptors, approvals, credentials or live operations.
+
+Issue [#392](https://github.com/surya-koritala/AIagentOS/issues/392) retains its
+broader acceptance and qualification requirements. Durable copy-on-write
+cloning in #393 and the coding agent in #394 build on these contracts.

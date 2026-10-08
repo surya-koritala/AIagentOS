@@ -3376,6 +3376,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
             .messages
             .push(StandardMessage::assistant("earlier result"));
         executor.messages.push(StandardMessage::user("latest text"));
+        let original = executor.messages.clone();
         executor.set_context_budget(900);
         executor.compact_to_token_budget(&[]).await.unwrap();
         assert!(!executor.messages.contains(&image));
@@ -3383,10 +3384,31 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
         let raw = context.kv_get(id, &key).unwrap().unwrap();
         let restored: Vec<StandardMessage> = serde_json::from_str(&raw).unwrap();
         assert!(restored.contains(&image));
+        let digest = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let expected_reference = format!(
+            "[Context spill: key={key}; sha256-prefix={}; n={}]",
+            &digest[..16],
+            restored.len()
+        );
         assert!(executor
             .messages
             .iter()
-            .any(|message| message.content.starts_with("[Durable context spill:")));
+            .any(|message| message.role == "system"
+                && message.content.legacy_text() == Some(expected_reference.as_str())));
+        assert!(executor.estimate_prompt_tokens(&executor.messages) <= 900);
+        let active_original = executor
+            .messages
+            .iter()
+            .filter(|message| message.content.legacy_text() != Some(expected_reference.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(active_original.len() + restored.len(), original.len());
+        assert!(original
+            .iter()
+            .all(|message| active_original.contains(&message) || restored.contains(message)));
     }
 
     struct CountingContentSession {

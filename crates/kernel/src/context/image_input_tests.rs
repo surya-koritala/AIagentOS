@@ -67,7 +67,7 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
         std::env::temp_dir().join(format!("aiagentos-image-history-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("kernel.sqlite");
-    let (parent, child, foreign, checkpoint_id, expected, spill) = {
+    let (parent, child, foreign, checkpoint_id, expected, child_expected, spill) = {
         let manager = SqliteContextManager::new(&path).unwrap();
         let parent = agent(&manager, "tenant-image");
         let child = agent(&manager, "tenant-image");
@@ -97,6 +97,11 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
             .fork_conversation(parent, "image-parent", child, "image-child")
             .unwrap();
         assert_eq!(manager.load_conversation("image-child").unwrap(), expected);
+        let mut child_expected = expected.clone();
+        child_expected.push(StandardMessage::user("private-tail-search-marker"));
+        manager
+            .save_conversation("image-child", child, &child_expected)
+            .unwrap();
         let conn = manager.locked_conn();
         let metadata = crate::schema::read_storage_metadata(&conn).unwrap();
         assert_eq!(metadata.schema_version, 13);
@@ -119,9 +124,17 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
             assert!(projections
                 .iter()
                 .all(|projection| !projection.contains(PNG)));
-            assert!(projections
-                .iter()
-                .any(|projection| projection.contains("image before λ")));
+            let expected_text = if table == "execution_snapshot_fts" {
+                "image before λ"
+            } else {
+                "private-tail-search-marker"
+            };
+            assert!(
+                projections
+                    .iter()
+                    .any(|projection| projection.contains(expected_text)),
+                "{table} must index its own prefix or tail"
+            );
         }
         assert!(!format!(
             "{:?}",
@@ -131,12 +144,51 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
         )
         .contains(PNG));
         drop(conn);
-        (parent, child, foreign, checkpoint_id, expected, spill)
+        let prefix_hits = manager.search_conversations("\"image before λ\"");
+        assert_eq!(
+            prefix_hits
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["image-parent", "image-child"])
+        );
+        assert!(prefix_hits
+            .iter()
+            .all(|(_, excerpt)| !excerpt.contains(PNG)));
+        let tail_hits = manager.search_conversations("\"private-tail-search-marker\"");
+        assert_eq!(
+            tail_hits
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["image-child"]
+        );
+        (
+            parent,
+            child,
+            foreign,
+            checkpoint_id,
+            expected,
+            child_expected,
+            spill,
+        )
     };
     {
         let manager = SqliteContextManager::new(&path).unwrap();
         assert_eq!(manager.load_conversation("image-parent").unwrap(), expected);
-        assert_eq!(manager.load_conversation("image-child").unwrap(), expected);
+        assert_eq!(
+            manager.load_conversation("image-child").unwrap(),
+            child_expected
+        );
+        assert_eq!(manager.search_conversations("\"image before λ\"").len(), 2);
+        assert_eq!(
+            manager
+                .search_conversations("\"private-tail-search-marker\"")
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["image-child"]
+        );
         let restored = manager
             .claim_generation_checkpoint(checkpoint_id, parent, "tenant-image")
             .unwrap();
@@ -158,7 +210,10 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
             None
         );
         manager.delete_agent(parent).unwrap();
-        assert_eq!(manager.load_conversation("image-child").unwrap(), expected);
+        assert_eq!(
+            manager.load_conversation("image-child").unwrap(),
+            child_expected
+        );
         assert_eq!(
             manager
                 .kv_get(child, "context_spill:image:fixture")

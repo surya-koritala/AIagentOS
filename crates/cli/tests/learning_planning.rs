@@ -450,9 +450,12 @@ async fn authorized_history_clone_preserves_prefix_without_inheriting_live_local
     assert_eq!(kernel.context_manager.latest_execution_history(child).unwrap().unwrap().1, prefix);
     store.add_rule("rust".into(), "Subsequently added private preference".into(), RuleScope::local_cli()).unwrap();
     kernel.send_message(child, "write rust code in child").await.unwrap();
-    let child_request = &requests.lock().unwrap()[1];
-    assert!(child_request.messages.iter().any(|message| message.content.contains("Historical authorized preference")));
-    assert!(!child_request.messages.iter().any(|message| message.content.contains("Current unsent private preference") || message.content.contains("Subsequently added private preference")));
+    {
+        let captured = requests.lock().unwrap();
+        let child_request = &captured[1];
+        assert!(child_request.messages.iter().any(|message| message.content.contains("Historical authorized preference")));
+        assert!(!child_request.messages.iter().any(|message| message.content.contains("Current unsent private preference") || message.content.contains("Subsequently added private preference")));
+    }
     let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.0.join("rules.json")).unwrap()).unwrap();
     assert_eq!(disk["conversations"].as_array().unwrap().len(), 1);
     assert_ne!(disk["conversations"][0]["agent_id"], child.to_string());

@@ -4712,7 +4712,7 @@ impl SqliteContextManager {
                 &format!("WITH shared_spill_bytes AS ({}), context_bytes(agent_id, byte_count) AS (
                     SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM contexts
                     UNION ALL
-                    SELECT agent_id, SUM(LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0)) FROM facts GROUP BY agent_id
+                    SELECT agent_id, SUM({fact_bytes}) FROM facts INDEXED BY idx_facts_storage_bytes GROUP BY agent_id
                     UNION ALL
                     SELECT c.agent_id, LENGTH(CAST(c.messages_json AS BLOB)) + COALESCE(s.logical_bytes - 2, 0)
                         + CASE WHEN s.message_count > 0 AND json_array_length(c.messages_json) > 0 THEN 1 ELSE 0 END
@@ -4736,7 +4736,7 @@ impl SqliteContextManager {
                         'default'
                     ) = ?2 THEN byte_count ELSE 0 END), 0),
                     COALESCE(SUM(byte_count), 0)
-                FROM context_bytes",shared_spills::LOGICAL_SPILL_BYTES),
+                FROM context_bytes",shared_spills::LOGICAL_SPILL_BYTES, fact_bytes = fact_index::STORAGE_BYTE_EXPRESSION),
                 params![agent_id.to_string(), tenant_id],
                 |row| {
                     Ok((
@@ -7651,6 +7651,10 @@ impl SqliteContextManager {
         self.list_snapshots(agent_id)
     }
 }
+
+#[cfg(test)]
+#[path = "context/storage_index_tests.rs"]
+mod storage_index_tests;
 
 #[cfg(test)]
 mod tests {

@@ -499,3 +499,35 @@ impl AgentKernelImpl {
         Ok(result.data)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn kv_components_roundtrip_opaque_utf8_keys(
+            characters in prop::collection::vec(any::<char>(), 1..128)
+        ) {
+            let key = characters.into_iter().collect::<String>();
+            prop_assume!(validated_key(&key).is_ok());
+            let component = kv_component(&key).unwrap();
+            prop_assert_eq!(component.len(), key.len() * 2);
+            prop_assert_eq!(decode_key(&component).unwrap(), key);
+            let traversal = format!("{component}/..");
+            prop_assert!(decode_key(&traversal).is_err());
+            if component.to_uppercase() != component {
+                prop_assert!(decode_key(&component.to_uppercase()).is_err());
+            }
+        }
+
+        #[test]
+        fn accepted_components_have_one_canonical_encoding(component in any::<String>()) {
+            if let Ok(key) = decode_key(&component) {
+                prop_assert_eq!(kv_component(&key).unwrap(), component);
+                prop_assert!(validated_key(&key).is_ok());
+            }
+        }
+    }
+}

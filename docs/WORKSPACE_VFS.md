@@ -54,6 +54,13 @@ records any retained stage without treating it as a committed entry or promising
 automatic cleanup. These process-exit checks do not establish physical
 power-loss durability, including directory-sync behavior on Windows.
 
+The same hosted acceptance matrix also pauses a deterministic embedding worker
+behind a real `/memory` write. Both a connected caller and a disconnected caller
+must reclaim all memory-provider permits at the existing provider deadline.
+Releasing the worker afterward must not publish the cancelled fact; fresh
+authorized reads and writes must succeed, and reopening the durable store must
+retain only acknowledged facts. The fixture uses no remote service or model.
+
 Directory listing retains the sandbox's deterministic, typed 4,096-entry bound.
 `stat` returns file/directory kind, size, and the host readonly bit. The readonly
 bit is metadata, not a promise that policy permits writing.

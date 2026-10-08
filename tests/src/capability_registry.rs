@@ -673,7 +673,8 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    let opaque_projection = "resource_identity:crate::resources::opaque_identity(record.resource.as_bytes()";
+    let opaque_projection =
+        "resource_identity:crate::resources::opaque_identity(record.resource.as_bytes()";
     assert!(
         compact_native.contains(&format!("{opaque_projection})"))
             || compact_native.contains(&format!("{opaque_projection},)")),

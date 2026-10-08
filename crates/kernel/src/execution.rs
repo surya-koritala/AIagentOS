@@ -3038,6 +3038,9 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
 
     #[async_trait::async_trait]
     impl LlmSession for ImageBoundSession {
+        async fn send_with_tools(&self,messages: Vec<StandardMessage>,_tools: &[ToolDefinition]) -> Result<LlmResponse,ConnectorError> {
+            self.send(messages).await
+        }
         async fn send(
             &self,
             _messages: Vec<StandardMessage>,

@@ -12,10 +12,10 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 10;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
-// Older readers cannot preserve a clone's attenuated security on restart.
-const MIN_READER_SCHEMA_VERSION: i64 = 9;
+// Older readers cannot preserve binary fact embeddings or clone security.
+const MIN_READER_SCHEMA_VERSION: i64 = 10;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
@@ -27,6 +27,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, "bind-destination-fences-to-authority-terms-and-expiry"),
     (8, "share-immutable-execution-history-prefixes"),
     (9, "add-atomic-agent-clone-lifecycle"),
+    (10, "retain-fact-indexes-with-binary-embeddings"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub(crate) struct StorageMetadata {
 const REQUIRED_TABLES: &[&str] = &[
     "contexts",
     "facts",
+    "fact_index_generations",
     "conversations",
     "conversations_fts",
     "execution_context_snapshots",
@@ -100,6 +102,7 @@ const REQUIRED_TABLES: &[&str] = &[
 const LEGACY_MARKER_TABLES: &[&str] = &[
     "contexts",
     "facts",
+    "fact_index_generations",
     "conversations",
     "usage_log",
     "agent_kv",

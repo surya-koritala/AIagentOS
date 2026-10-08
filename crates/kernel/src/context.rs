@@ -20,6 +20,8 @@ use crate::{AgentId, ContextError};
 mod branching;
 #[path = "context/clone_store.rs"]
 mod clone_store;
+#[path = "context/fact_index.rs"]
+pub(crate) mod fact_index;
 #[path = "context/shared_spills.rs"]
 mod shared_spills;
 pub use branching::{
@@ -166,6 +168,11 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         table: "facts",
         owner: "agent",
         deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "fact_index_generations",
+        owner: "agent",
+        deletion: "erase-after-facts",
     },
     DurableDataClassification {
         table: "conversations",
@@ -1000,6 +1007,7 @@ pub struct SqliteContextManager {
     /// via [`SqliteContextManager::with_embedder`] to change embedding strategy
     /// without touching persistence.
     embedder: Arc<dyn Embedder>,
+    fact_cache: Mutex<fact_index::FactCache>,
     #[cfg(test)]
     fail_next_agent_save: AtomicBool,
     #[cfg(test)]
@@ -1212,6 +1220,7 @@ impl SqliteContextManager {
             retired_encryption_keys,
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
+            fact_cache: Mutex::new(fact_index::FactCache::default()),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
             #[cfg(test)]
@@ -1250,6 +1259,7 @@ impl SqliteContextManager {
             retired_encryption_keys: Vec::new(),
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
+            fact_cache: Mutex::new(fact_index::FactCache::default()),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
             #[cfg(test)]
@@ -1289,6 +1299,10 @@ impl SqliteContextManager {
     /// `self` for builder-style chaining. The seam where a different
     /// [`Embedder`] can drop in without changing persistence.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.fact_cache
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         self.embedder = embedder;
         self
     }
@@ -2370,6 +2384,7 @@ impl SqliteContextManager {
             crate::schema::add_column_if_missing(conn, "agents", name, definition)?;
         }
         branching::init_schema(conn)?;
+        fact_index::init_schema(conn)?;
         crate::schema::complete_migration(conn, schema_version)?;
         transaction.commit().map_err(|error| {
             quota_error(format!(
@@ -4150,7 +4165,7 @@ impl ContextManager for SqliteContextManager {
         // Persistence owns the embedding: caller-supplied vectors are not
         // trusted because they may have the wrong model, dimension, or tenant.
         let embedding = self.embedder.embed(&fact.content);
-        let embedding_json = Some(serde_json::to_string(&embedding).unwrap_or_default());
+        let embedding_blob = fact_index::encode(&embedding)?;
         let embedding_model = self.embedder.model_id();
         let embedding_version = self.embedder.version();
         let embedding_dim = self.embedder.dim();
@@ -4169,7 +4184,7 @@ impl ContextManager for SqliteContextManager {
         let existing = transaction
             .query_row(
                 "SELECT agent_id,
-                        LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0)
+                        LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0)
                         + LENGTH(embedding_model) + LENGTH(content_hash)
                  FROM facts WHERE id = ?1",
                 params![fact.id.to_string()],
@@ -4189,7 +4204,7 @@ impl ContextManager for SqliteContextManager {
         let incoming_bytes = fact
             .content
             .len()
-            .saturating_add(embedding_json.as_deref().map_or(0, str::len))
+            .saturating_add(embedding_blob.len())
             .saturating_add(embedding_model.len())
             .saturating_add(content_hash.len()) as u64;
         self.enforce_context_storage_locked(
@@ -4204,9 +4219,9 @@ impl ContextManager for SqliteContextManager {
             .execute(
                 "INSERT OR REPLACE INTO facts
                 (id, agent_id, content, category, created_at, last_accessed_at,
-                 embedding_json, embedding_model, embedding_version,
+                 embedding_json, embedding_blob, embedding_model, embedding_version,
                  embedding_dim, content_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     fact.id.to_string(),
                     agent_id.to_string(),
@@ -4214,7 +4229,7 @@ impl ContextManager for SqliteContextManager {
                     category_str,
                     fact.created_at.to_rfc3339(),
                     fact.last_accessed_at.to_rfc3339(),
-                    embedding_json,
+                    embedding_blob,
                     embedding_model,
                     i64::from(embedding_version),
                     i64::try_from(embedding_dim).unwrap_or(i64::MAX),
@@ -4233,172 +4248,7 @@ impl ContextManager for SqliteContextManager {
         agent_id: AgentId,
         query: &str,
     ) -> Result<Vec<Fact>, ContextError> {
-        let conn = self.locked_conn();
-        let id_str = agent_id.to_string();
-
-        // Fetch the agent's candidate facts. We pull all of the agent's facts
-        // (rather than a substring `LIKE` prefilter) so that semantic ranking
-        // can surface relevant facts that don't share literal tokens with the
-        // query — that's the whole point of vector retrieval.
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, content, category, created_at, last_accessed_at,
-                        embedding_json, embedding_model, embedding_version,
-                        embedding_dim, content_hash
-             FROM facts WHERE agent_id = ?1
-             ORDER BY last_accessed_at DESC",
-            )
-            .map_err(|e| ContextError::StorageError(e.to_string()))?;
-
-        let facts = stmt
-            .query_map(params![id_str], |row| {
-                let id_str: String = row.get(0)?;
-                let content: String = row.get(1)?;
-                let category_str: String = row.get(2)?;
-                let created_str: String = row.get(3)?;
-                let accessed_str: String = row.get(4)?;
-                let embedding_str: Option<String> = row.get(5)?;
-                let embedding_model: String = row.get(6)?;
-                let embedding_version: i64 = row.get(7)?;
-                let embedding_dim: i64 = row.get(8)?;
-                let content_hash: String = row.get(9)?;
-                Ok((
-                    id_str,
-                    content,
-                    category_str,
-                    created_str,
-                    accessed_str,
-                    embedding_str,
-                    embedding_model,
-                    embedding_version,
-                    embedding_dim,
-                    content_hash,
-                ))
-            })
-            .map_err(|e| ContextError::StorageError(e.to_string()))?;
-
-        let mut result = Vec::new();
-        let mut repairs = Vec::new();
-        for row in facts {
-            let (
-                id_str,
-                content,
-                category_str,
-                created_str,
-                accessed_str,
-                embedding_str,
-                embedding_model,
-                embedding_version,
-                embedding_dim,
-                content_hash,
-            ) = row.map_err(|e| ContextError::StorageError(e.to_string()))?;
-
-            let id = uuid::Uuid::parse_str(&id_str)
-                .map_err(|e| ContextError::StorageError(e.to_string()))?;
-            let category: FactCategory = serde_json::from_str(&category_str)
-                .map_err(|e| ContextError::StorageError(e.to_string()))?;
-            let created_at = DateTime::parse_from_rfc3339(&created_str)
-                .map_err(|e| ContextError::StorageError(e.to_string()))?
-                .with_timezone(&Utc);
-            let last_accessed_at = DateTime::parse_from_rfc3339(&accessed_str)
-                .map_err(|e| ContextError::StorageError(e.to_string()))?
-                .with_timezone(&Utc);
-            let stored_embedding: Option<Vec<f32>> = embedding_str
-                .as_deref()
-                .and_then(|value| serde_json::from_str(value).ok());
-            let expected_hash = memory_content_hash(&content);
-            let valid_embedding = embedding_model == self.embedder.model_id()
-                && embedding_version == i64::from(self.embedder.version())
-                && embedding_dim == i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX)
-                && content_hash == expected_hash
-                && stored_embedding.as_ref().is_some_and(|embedding| {
-                    embedding.len() == self.embedder.dim()
-                        && embedding.iter().all(|value| value.is_finite())
-                });
-            let embedding = if valid_embedding {
-                stored_embedding.expect("validated embedding is present")
-            } else {
-                let rebuilt = self.embedder.embed(&content);
-                let rebuilt_json = serde_json::to_string(&rebuilt)
-                    .map_err(|error| ContextError::StorageError(error.to_string()))?;
-                repairs.push((id_str.clone(), rebuilt_json, expected_hash));
-                rebuilt
-            };
-
-            result.push(Fact {
-                id,
-                content,
-                category,
-                created_at,
-                last_accessed_at,
-                embedding: Some(embedding),
-            });
-        }
-        drop(stmt);
-
-        for (fact_id, embedding_json, content_hash) in repairs {
-            conn.execute(
-                "UPDATE facts
-                 SET embedding_json = ?1, embedding_model = ?2,
-                     embedding_version = ?3, embedding_dim = ?4,
-                     content_hash = ?5
-                 WHERE id = ?6 AND agent_id = ?7",
-                params![
-                    embedding_json,
-                    self.embedder.model_id(),
-                    i64::from(self.embedder.version()),
-                    i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
-                    content_hash,
-                    fact_id,
-                    id_str,
-                ],
-            )
-            .map_err(|error| ContextError::StorageError(error.to_string()))?;
-        }
-
-        // Semantic ranking: embed the query and return the top-K facts by cosine
-        // similarity (best-first). Invalid or stale rows were rebuilt and
-        // persisted above before they are admitted to the index.
-        //
-        // Ranking goes through the `VectorIndex` seam (`rank_topk`): an exact scan
-        // at small candidate counts, and the approximate `LshIndex` above
-        // `ANN_EXACT_THRESHOLD` so an agent with a large fact store bounds the work
-        // instead of scoring every vector. The top-K cap also keeps the caller
-        // (which injects these facts into the LLM context) from dumping the whole
-        // store into the prompt.
-        const MEMORY_QUERY_TOP_K: usize = 16;
-        const ANN_EXACT_THRESHOLD: usize = 64;
-        let query_vec = self.embedder.embed(query);
-        let scored: Vec<(Fact, Vec<f32>)> = result
-            .into_iter()
-            .map(|fact| {
-                let emb = match &fact.embedding {
-                    Some(e) if !e.is_empty() => e.clone(),
-                    _ => self.embedder.embed(&fact.content),
-                };
-                (fact, emb)
-            })
-            .collect();
-        let result: Vec<Fact> = crate::memory_manager::rank_topk(
-            &query_vec,
-            scored,
-            MEMORY_QUERY_TOP_K,
-            ANN_EXACT_THRESHOLD,
-        )
-        .into_iter()
-        .map(|(fact, _score)| fact)
-        .collect();
-
-        // Update last_accessed_at for returned facts
-        let now = Utc::now().to_rfc3339();
-        for fact in &result {
-            let _ = conn.execute(
-                "UPDATE facts SET last_accessed_at = ?1 WHERE id = ?2",
-                params![now, fact.id.to_string()],
-            );
-        }
-
-        Ok(result)
+        self.cached_query_memory(agent_id, query)
     }
 }
 
@@ -4815,7 +4665,7 @@ impl SqliteContextManager {
                 &format!("WITH shared_spill_bytes AS ({}), context_bytes(agent_id, byte_count) AS (
                     SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM contexts
                     UNION ALL
-                    SELECT agent_id, LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) FROM facts
+                    SELECT agent_id, LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0) FROM facts
                     UNION ALL
                     SELECT c.agent_id, LENGTH(CAST(c.messages_json AS BLOB)) + COALESCE(s.logical_bytes - 2, 0)
                         + CASE WHEN s.message_count > 0 AND json_array_length(c.messages_json) > 0 THEN 1 ELSE 0 END
@@ -6090,6 +5940,7 @@ impl SqliteContextManager {
         for table in [
             "contexts",
             "facts",
+            "fact_index_generations",
             "conversations",
             "usage_log",
             "agent_kv",
@@ -6109,6 +5960,7 @@ impl SqliteContextManager {
             crash_erasure_after_step_for_test(match table {
                 "contexts" => "agent.contexts",
                 "facts" => "agent.facts",
+                "fact_index_generations" => "agent.fact_index_generations",
                 "conversations" => "agent.conversations",
                 "usage_log" => "agent.usage_log",
                 "agent_kv" => "agent.agent_kv",
@@ -6220,6 +6072,10 @@ impl SqliteContextManager {
         crash_erasure_after_step_for_test("agent.deletion_receipt");
         tx.commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        self.fact_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(agent_id);
         Ok(receipt)
     }
 
@@ -7295,17 +7151,16 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         for (id, content) in &facts {
             let embedding = self.embedder.embed(content);
-            let embedding_json = serde_json::to_string(&embedding)
-                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let embedding_blob = fact_index::encode(&embedding)?;
             transaction
                 .execute(
                     "UPDATE facts
-                     SET embedding_json = ?1, embedding_model = ?2,
+                     SET embedding_json = NULL, embedding_blob = ?1, embedding_model = ?2,
                          embedding_version = ?3, embedding_dim = ?4,
                          content_hash = ?5
                      WHERE id = ?6 AND agent_id = ?7",
                     params![
-                        embedding_json,
+                        embedding_blob,
                         self.embedder.model_id(),
                         i64::from(self.embedder.version()),
                         i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
@@ -7330,8 +7185,7 @@ impl SqliteContextManager {
         content: &str,
     ) -> Result<bool, ContextError> {
         let embedding = self.embedder.embed(content);
-        let embedding_json = serde_json::to_string(&embedding)
-            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let embedding_blob = fact_index::encode(&embedding)?;
         let conn = self
             .conn
             .lock()
@@ -7339,14 +7193,14 @@ impl SqliteContextManager {
         let updated = conn
             .execute(
                 "UPDATE facts
-                 SET content = ?1, last_accessed_at = ?2, embedding_json = ?3,
+                 SET content = ?1, last_accessed_at = ?2, embedding_json = NULL, embedding_blob = ?3,
                      embedding_model = ?4, embedding_version = ?5,
                      embedding_dim = ?6, content_hash = ?7
                  WHERE id = ?8 AND agent_id = ?9",
                 params![
                     content,
                     Utc::now().to_rfc3339(),
-                    embedding_json,
+                    embedding_blob,
                     self.embedder.model_id(),
                     i64::from(self.embedder.version()),
                     i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
@@ -7375,6 +7229,12 @@ impl SqliteContextManager {
                 params![fact_id.to_string(), agent_id.to_string()],
             )
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        if deleted == 1 {
+            self.fact_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(agent_id);
+        }
         Ok(deleted == 1)
     }
 
@@ -7461,6 +7321,7 @@ impl SqliteContextManager {
         for table in [
             "contexts",
             "facts",
+            "fact_index_generations",
             "conversations",
             "usage_log",
             "agent_kv",
@@ -7477,6 +7338,7 @@ impl SqliteContextManager {
             crash_erasure_after_step_for_test(match table {
                 "contexts" => "tenant.contexts",
                 "facts" => "tenant.facts",
+                "fact_index_generations" => "tenant.fact_index_generations",
                 "conversations" => "tenant.conversations",
                 "usage_log" => "tenant.usage_log",
                 "agent_kv" => "tenant.agent_kv",
@@ -7616,6 +7478,10 @@ impl SqliteContextManager {
         transaction
             .commit()
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        self.fact_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         Ok(Some(receipt))
     }
 
@@ -8941,6 +8807,7 @@ mod tests {
         for table in [
             "contexts",
             "facts",
+            "fact_index_generations",
             "conversations",
             "usage_log",
             "agent_kv",
@@ -9575,6 +9442,7 @@ mod tests {
         for table in [
             "contexts",
             "facts",
+            "fact_index_generations",
             "conversations",
             "usage_log",
             "agent_kv",
@@ -9915,6 +9783,7 @@ mod tests {
             retired_encryption_keys: Vec::new(),
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
+            fact_cache: Mutex::new(fact_index::FactCache::default()),
             fail_next_agent_save: AtomicBool::new(false),
             fail_agent_status_update_after: AtomicUsize::new(0),
         };
@@ -11298,6 +11167,11 @@ mod tests {
                 .execute("UPDATE storage_meta SET schema_version = 1", [])
                 .unwrap();
             connection.pragma_update(None, "user_version", 1).unwrap();
+            for (name, _) in fact_index::TRIGGERS {
+                connection
+                    .execute(&format!("DROP TRIGGER {name}"), [])
+                    .unwrap();
+            }
         }
 
         let manager = SqliteContextManager::new(&database.path).unwrap();
@@ -11456,6 +11330,11 @@ mod tests {
                 .execute("UPDATE storage_meta SET schema_version = 6", [])
                 .unwrap();
             connection.pragma_update(None, "user_version", 6).unwrap();
+            for (name, _) in fact_index::TRIGGERS {
+                connection
+                    .execute(&format!("DROP TRIGGER {name}"), [])
+                    .unwrap();
+            }
         }
 
         let manager = SqliteContextManager::new(&database.path).unwrap();

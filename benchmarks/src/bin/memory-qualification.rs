@@ -113,13 +113,15 @@ fn main() {
     let top1_agreement = top1_matches as f64 / evaluated_queries as f64;
     let exact_p95_us = percentile_95(&mut exact_durations);
     let approximate_p95_us = percentile_95(&mut approximate_durations);
+    let require_faster_ann = items >= DEFAULT_ITEMS;
+    let performance_passed = !require_faster_ann || approximate_p95_us < exact_p95_us;
     let vector_bytes_estimate = items
         .saturating_mul(EMBED_DIM)
         .saturating_mul(std::mem::size_of::<f32>())
         .saturating_mul(2);
 
     let report = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "embedding": {
             "model": embedder.model_id(),
             "version": embedder.version(),
@@ -132,28 +134,30 @@ fn main() {
         "top1_agreement": top1_agreement,
         "thresholds": {
             "minimum_recall_at_10": MIN_RECALL,
-            "minimum_top1_agreement": MIN_TOP1_AGREEMENT
+            "minimum_top1_agreement": MIN_TOP1_AGREEMENT,
+            "ann_must_be_faster_than_exact": require_faster_ann
         },
         "timing": {
             "build_ms": build_ms,
             "exact_query_p95_us": exact_p95_us,
-            "ann_query_p95_us": approximate_p95_us
+            "ann_query_p95_us": approximate_p95_us,
+            "performance_passed": performance_passed
         },
         "memory": {
             "index_vector_bytes_estimate": vector_bytes_estimate,
             "resident_kib_linux": resident_memory_kib()
         },
-        "passed": recall_at_10 >= MIN_RECALL && top1_agreement >= MIN_TOP1_AGREEMENT
+        "passed": recall_at_10 >= MIN_RECALL && top1_agreement >= MIN_TOP1_AGREEMENT && performance_passed
     });
     println!(
         "{}",
         serde_json::to_string_pretty(&report).expect("serialize benchmark report")
     );
 
-    if recall_at_10 < MIN_RECALL || top1_agreement < MIN_TOP1_AGREEMENT {
+    if recall_at_10 < MIN_RECALL || top1_agreement < MIN_TOP1_AGREEMENT || !performance_passed {
         eprintln!(
             "memory qualification failed: recall@10={recall_at_10:.3}, \
-             top1={top1_agreement:.3}"
+             top1={top1_agreement:.3}, ann_p95_us={approximate_p95_us}, exact_p95_us={exact_p95_us}"
         );
         std::process::exit(1);
     }

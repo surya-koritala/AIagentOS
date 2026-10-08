@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Retained per-agent semantic-memory indexes and shared deterministic LSH planes.
+  Facts use versioned binary embeddings with atomic JSON migration, repair checks,
+  durable mutation revisions, bounded cache eviction and erasure cleanup. LSH
+  candidate compression and partial selection preserve search results; the 10k
+  qualification also requires ANN p95 below exact search. Relates #357.
+
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,
   and SDK/agentctl surfaces. Durable KV admission now counts UTF-8 key/value

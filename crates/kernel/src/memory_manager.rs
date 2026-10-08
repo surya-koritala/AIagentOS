@@ -321,6 +321,18 @@ pub trait VectorIndex: Send + Sync {
     fn add(&mut self, id: u64, vec: Vec<f32>);
     /// Return up to `k` ids most similar to `query`, best (highest score) first.
     fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)>;
+    /// Apply the caller's durable ordering to equal-scoring candidates.
+    fn search_with_tiebreak(
+        &self,
+        query: &[f32],
+        k: usize,
+        compare: &dyn Fn(u64, u64) -> std::cmp::Ordering,
+    ) -> Vec<(u64, f32)> {
+        let mut hits = self.search(query, self.len());
+        hits.sort_by(|a, b| score_order(a, b).then_with(|| compare(a.0, b.0)));
+        hits.truncate(k);
+        hits
+    }
     /// Number of vectors currently stored.
     fn len(&self) -> usize;
     /// Whether the index holds no vectors.
@@ -336,7 +348,7 @@ pub trait VectorIndex: Send + Sync {
 /// in an ANN index behind [`VectorIndex`] when corpora grow.
 #[derive(Debug, Default, Clone)]
 pub struct BruteForceIndex {
-    entries: Vec<(u64, Vec<f32>)>,
+    entries: Vec<(u64, Vec<f32>, f32)>,
 }
 
 impl BruteForceIndex {
@@ -350,20 +362,32 @@ impl BruteForceIndex {
 
 impl VectorIndex for BruteForceIndex {
     fn add(&mut self, id: u64, vec: Vec<f32>) {
-        if let Some(slot) = self.entries.iter_mut().find(|(eid, _)| *eid == id) {
+        let norm = vector_norm(&vec);
+        if let Some(slot) = self.entries.iter_mut().find(|(eid, _, _)| *eid == id) {
             slot.1 = vec;
+            slot.2 = norm;
         } else {
-            self.entries.push((id, vec));
+            self.entries.push((id, vec, norm));
         }
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.search_with_tiebreak(query, k, &|_, _| std::cmp::Ordering::Equal)
+    }
+
+    fn search_with_tiebreak(
+        &self,
+        query: &[f32],
+        k: usize,
+        compare: &dyn Fn(u64, u64) -> std::cmp::Ordering,
+    ) -> Vec<(u64, f32)> {
+        let query_norm = vector_norm(query);
         let mut scored: Vec<(u64, f32)> = self
             .entries
             .iter()
-            .map(|(id, v)| (*id, cosine_similarity(query, v)))
+            .map(|(id, v, norm)| (*id, cached_cosine(query, query_norm, v, *norm)))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| score_order(a, b).then_with(|| compare(a.0, b.0)));
         scored.truncate(k);
         scored
     }
@@ -409,8 +433,39 @@ impl SplitMix64 {
 struct LshTable {
     /// `bits` hyperplanes, each a `dim`-length Gaussian vector.
     planes: std::sync::Arc<Vec<Vec<f32>>>,
-    /// Signature → ids that hash to it in this table.
-    buckets: std::collections::HashMap<u64, Vec<u64>>,
+    /// Signature → sparse bitset of dense vector slots.
+    buckets: std::collections::HashMap<u64, CandidateBucket>,
+}
+
+#[derive(Default)]
+struct CandidateBucket {
+    // Sorted nonempty blocks compress repeated members without allocating a
+    // corpus-sized bitset for every sparse signature bucket.
+    blocks: Vec<(usize, u64)>,
+}
+impl CandidateBucket {
+    fn add(&mut self, slot: usize) {
+        let block = slot / 64;
+        let mask = 1_u64 << (slot % 64);
+        match self
+            .blocks
+            .binary_search_by_key(&block, |(block, _)| *block)
+        {
+            Ok(index) => self.blocks[index].1 |= mask,
+            Err(index) => self.blocks.insert(index, (block, mask)),
+        }
+    }
+    fn remove(&mut self, slot: usize) {
+        if let Ok(index) = self
+            .blocks
+            .binary_search_by_key(&(slot / 64), |(block, _)| *block)
+        {
+            self.blocks[index].1 &= !(1_u64 << (slot % 64));
+            if self.blocks[index].1 == 0 {
+                self.blocks.remove(index);
+            }
+        }
+    }
 }
 
 impl LshTable {
@@ -451,8 +506,9 @@ impl LshTable {
 /// degrades gracefully rather than dropping results.
 pub struct LshIndex {
     tables: Vec<LshTable>,
-    /// Source of truth: id → vector. Survives bucket churn on overwrite.
-    vectors: std::collections::HashMap<u64, Vec<f32>>,
+    /// Dense insertion-ordered vectors; buckets contain slot ordinals.
+    vectors: Vec<(u64, Vec<f32>, f32)>,
+    slots: std::collections::HashMap<u64, usize>,
 }
 
 impl LshIndex {
@@ -476,7 +532,8 @@ impl LshIndex {
             .collect();
         Self {
             tables,
-            vectors: std::collections::HashMap::new(),
+            vectors: Vec::new(),
+            slots: std::collections::HashMap::new(),
         }
     }
 
@@ -492,8 +549,8 @@ impl LshIndex {
         for table in &mut self.tables {
             let sig = table.signature(vec);
             if let Some(ids) = table.buckets.get_mut(&sig) {
-                ids.retain(|&x| x != id);
-                if ids.is_empty() {
+                ids.remove(id as usize);
+                if ids.blocks.is_empty() {
                     table.buckets.remove(&sig);
                 }
             }
@@ -532,19 +589,36 @@ fn shared_lsh_planes(dim: usize, tables: usize, bits: usize) -> std::sync::Arc<P
 
 impl VectorIndex for LshIndex {
     fn add(&mut self, id: u64, vec: Vec<f32>) {
-        // Overwrite: drop the id from every table's old bucket first so no table
-        // holds a stale signature for it.
-        if let Some(old) = self.vectors.get(&id).cloned() {
-            self.remove_id(&old, id);
+        let slot = self.slots.get(&id).copied().unwrap_or(self.vectors.len());
+        // Overwrites retain their original insertion ordinal and remove all
+        // prior bucket memberships before the replacement is published.
+        if let Some((_, old, _)) = self.vectors.get(slot) {
+            self.remove_id(&old.clone(), slot as u64);
         }
         for table in &mut self.tables {
             let sig = table.signature(&vec);
-            table.buckets.entry(sig).or_default().push(id);
+            table.buckets.entry(sig).or_default().add(slot);
         }
-        self.vectors.insert(id, vec);
+        let norm = vector_norm(&vec);
+        if slot == self.vectors.len() {
+            self.vectors.push((id, vec, norm));
+            self.slots.insert(id, slot);
+        } else {
+            self.vectors[slot].1 = vec;
+            self.vectors[slot].2 = norm;
+        }
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.search_with_tiebreak(query, k, &|a, b| self.slots[&a].cmp(&self.slots[&b]))
+    }
+
+    fn search_with_tiebreak(
+        &self,
+        query: &[f32],
+        k: usize,
+        compare: &dyn Fn(u64, u64) -> std::cmp::Ordering,
+    ) -> Vec<(u64, f32)> {
         if k == 0 || self.vectors.is_empty() {
             return Vec::new();
         }
@@ -554,41 +628,86 @@ impl VectorIndex for LshIndex {
         // radius 1 (cheap: `bits` extra lookups per table) is what lifts recall
         // for the moderate-cosine pairs that text embeddings produce — a near
         // pair that misses on one bit per table still collides.
-        let mut candidates: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // A dense bitset avoids hashing every repeated bucket member and
+        // looking up each vector again. The candidate union is unchanged.
+        let mut candidates = vec![0_u64; self.vectors.len().div_ceil(64)];
         for table in &self.tables {
             let sig = table.signature(query);
-            if let Some(ids) = table.buckets.get(&sig) {
-                candidates.extend(ids.iter().copied());
-            }
-            for bit in 0..table.planes.len() {
-                if let Some(ids) = table.buckets.get(&(sig ^ (1 << bit))) {
-                    candidates.extend(ids.iter().copied());
+            for signature in
+                std::iter::once(sig).chain((0..table.planes.len()).map(|bit| sig ^ (1 << bit)))
+            {
+                if let Some(slots) = table.buckets.get(&signature) {
+                    for &(block, mask) in &slots.blocks {
+                        candidates[block] |= mask;
+                    }
                 }
             }
         }
-
-        // Safety net: still too few (sparse/unlucky) — score everything. Exact
-        // and bounded by the corpus size, so results are never silently dropped.
-        if candidates.len() < k {
-            candidates = self.vectors.keys().copied().collect();
+        let mut candidate_count = candidates
+            .iter()
+            .map(|block| block.count_ones() as usize)
+            .sum::<usize>();
+        // Preserve the exact safety-net rule and the previous candidate set.
+        if candidate_count < k {
+            candidates.fill(u64::MAX);
+            candidate_count = self.vectors.len();
         }
-
-        let mut scored: Vec<(u64, f32)> = candidates
-            .into_iter()
-            .filter_map(|id| {
-                self.vectors
-                    .get(&id)
-                    .map(|v| (id, cosine_similarity(query, v)))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let query_norm = vector_norm(query);
+        let mut scored = Vec::with_capacity(candidate_count);
+        for (block, mut bits) in candidates.into_iter().enumerate() {
+            while bits != 0 {
+                let slot = block * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some((id, vector, norm)) = self.vectors.get(slot) {
+                    scored.push((*id, cached_cosine(query, query_norm, vector, *norm)));
+                }
+            }
+        }
+        let compare_hits = |a: &(u64, f32), b: &(u64, f32)| {
+            score_order(a, b)
+                .then_with(|| compare(a.0, b.0))
+                .then_with(|| self.slots[&a.0].cmp(&self.slots[&b.0]))
+        };
+        // Only the returned prefix needs sorting. A total tie order makes the
+        // partition deterministic even for identical or zero vectors.
+        if k < scored.len() {
+            scored.select_nth_unstable_by(k, compare_hits);
+        }
         scored.truncate(k);
+        scored.sort_by(compare_hits);
         scored
     }
 
     fn len(&self) -> usize {
         self.vectors.len()
     }
+}
+
+fn vector_norm(vector: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for value in vector {
+        sum += value * value;
+    }
+    sum.sqrt()
+}
+fn cached_cosine(query: &[f32], query_norm: f32, vector: &[f32], norm: f32) -> f32 {
+    if query.is_empty() || query.len() != vector.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    for (left, right) in query.iter().zip(vector) {
+        dot += left * right;
+    }
+    let denominator = query_norm * norm;
+    if denominator > 0.0 {
+        dot / denominator
+    } else {
+        0.0
+    }
+}
+
+fn score_order(a: &(u64, f32), b: &(u64, f32)) -> std::cmp::Ordering {
+    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// Rank `(item, embedding)` pairs against a `query` embedding and return the top
@@ -675,6 +794,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compressed_candidate_union_preserves_original_probe_and_overwrite_results() {
+        let mut rng = SplitMix64(17);
+        let mut index = LshIndex::new(32, 4, 4);
+        for id in (1..=171).rev() {
+            index.add(id, (0..32).map(|_| rng.next_gaussian()).collect());
+        }
+        index.add(13, vec![1.0; 32]);
+        for query in [
+            vec![0.0; 32],
+            vec![1.0; 32],
+            (0..32).map(|_| rng.next_gaussian()).collect(),
+        ] {
+            for k in [0, 1, 16, 170, 200] {
+                let mut candidates = index
+                    .vectors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, vector, _))| {
+                        index.tables.iter().any(|table| {
+                            (table.signature(&query) ^ table.signature(vector)).count_ones() <= 1
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.len() < k {
+                    candidates = index.vectors.iter().enumerate().collect();
+                }
+                let mut oracle = candidates
+                    .into_iter()
+                    .map(|(slot, (id, vector, _))| (slot, *id, cosine_similarity(&query, vector)))
+                    .collect::<Vec<_>>();
+                oracle.sort_by(|a, b| {
+                    b.2.partial_cmp(&a.2)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                oracle.truncate(k);
+                assert_eq!(
+                    index.search(&query, k),
+                    oracle
+                        .into_iter()
+                        .map(|(_, id, score)| (id, score))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let mut tied = LshIndex::new(8, 2, 2);
+        for id in [7, 2, 99, 1] {
+            tied.add(id, vec![1.0; 8]);
+        }
+        tied.add(2, vec![1.0; 8]);
+        assert_eq!(
+            tied.search(&[1.0; 8], 3)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![7, 2, 99]
+        );
+        assert_eq!(
+            tied.search_with_tiebreak(&[1.0; 8], 3, &|a, b| b.cmp(&a))
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![99, 7, 2]
+        );
+    }
+
+    #[test]
     fn lsh_planes_are_shared_but_agent_vector_buckets_remain_independent() {
         let mut first = LshIndex::new(32, 4, 8);
         let second = LshIndex::new(32, 4, 8);
@@ -684,7 +870,7 @@ mod tests {
         first.add(7, vec![1.0; 32]);
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 0);
-        assert!(second.search(&vec![1.0; 32], 1).is_empty());
+        assert!(second.search(&[1.0; 32], 1).is_empty());
         let different = LshIndex::new(32, 5, 8);
         assert!(!std::sync::Arc::ptr_eq(
             &first.tables[0].planes,

@@ -50,9 +50,9 @@ Parent erasure preserves that lineage; child or tenant erasure removes it.
 
 All payloads, references and search indexes remain in the kernel's single
 SQLite store. Configured SQLCipher encryption, verified database backups and
-transaction recovery cover them together. Database schema 9 requires a reader
-that understands branch tails and durable clone security; older binaries must
-not open it.
+transaction recovery cover them together. Database schema 10 requires a reader
+that understands branch tails, durable clone security and binary fact embeddings;
+older binaries must not open it. Cloning was introduced in schema 9.
 
 ## Public agent cloning
 

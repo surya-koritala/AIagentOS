@@ -114,6 +114,15 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "erase with fact, agent, or tenant and rebuild index"
     ),
     sqlite_entry!(
+        "fact_index_generations",
+        "agent",
+        "agents.tenant_id via agent_id",
+        "retrieval cache revision; no fact content",
+        "until agent or tenant erasure",
+        "same whole-database protection as facts",
+        "erase after facts with agent or tenant"
+    ),
+    sqlite_entry!(
         "conversations",
         "agent",
         "agents.tenant_id via agent_id",
@@ -809,6 +818,17 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "process memory only; no application memory encryption",
         "not backed up directly; committed state is in SQLite",
         "coordinated lifecycle cleanup or process exit"
+    ),
+    boundary_entry!(
+        "ephemeral/fact-index-cache",
+        "ephemeral-memory",
+        "agent and tenant",
+        "durable agent fact revision",
+        "confidential fact content, embeddings and last-access metadata",
+        "bounded 16-agent/512 MiB cache; eviction, fact deletion, subject erasure or exit",
+        "process memory only; no application memory encryption",
+        "not backed up; authoritative rows remain in SQLite",
+        "drop on fact deletion and successful subject erasure; warm after revision change"
     ),
     boundary_entry!(
         "ephemeral/scheduler-and-admission",

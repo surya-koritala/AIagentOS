@@ -141,7 +141,10 @@ legacy, malformed, wrong-dimension, or content-mismatched vector is
 deterministically rebuilt and persisted before ranking.
 
 The public wire protocol and Rust SDK support store, semantic query, update,
-delete, and full-agent reindex. Mutations are agent-owned; tests cover
+delete, and full-agent reindex. The context manager retains per-agent fact rows
+and search indexes instead of rebuilding them for every query. Deterministic
+planes are shared; vectors and buckets remain private. Mutations are agent-owned;
+tests cover
 cross-agent denial, 160 concurrent writes without loss, large top-k queries,
 corrupt/stale rebuilds, and tenant purge that removes runtime/memory artifacts
 without damaging another tenant or deleting durable agent identity history.
@@ -156,7 +159,8 @@ embedding model and should not be described as equivalent to one.
 LSH indexes, runs planted queries, emits JSON evidence, and fails when:
 
 - mean recall@10 is below `0.80`; or
-- exact/ANN top-1 agreement is below `0.99`.
+- exact/ANN top-1 agreement is below `0.99`; or
+- ANN query p95 is not below exact p95 at 10,000 or more items.
 
 Run it with:
 
@@ -168,8 +172,10 @@ The default corpus is 10,000 items and 100 queries. A local development-profile
 run on 2026-07-25 produced recall@10 `1.0` and top-1 agreement `1.0`. Its ANN
 p95 (`44.260 ms`) was slower than exact search (`25.052 ms`) on that host, so
 this is quality evidence—not a performance SLO. The CI artifact records each
-runner's build/query timing and Linux resident memory. Cached/persistent ANN
-construction and sustained 100k+ latency/soak goals remain part of
+runner's build/query timing and Linux resident memory. The retained cache,
+binary-embedding migration, deterministic ordering and revised performance gate
+are described in [memory retrieval](MEMORY_RETRIEVAL.md). Sustained 100k+ latency
+and soak goals remain part of
 [issue #125](https://github.com/surya-koritala/AIagentOS/issues/125).
 
 ## Protected evidence workflows

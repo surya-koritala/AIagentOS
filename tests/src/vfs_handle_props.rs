@@ -188,7 +188,7 @@ async fn verify_sequence(sequence: Vec<(u8, usize, u8)>) {
                     );
                 }
             }
-            3 | 4 | 5 => {
+            3..=5 => {
                 let required = if operation == 3 {
                     1
                 } else if operation == 4 {

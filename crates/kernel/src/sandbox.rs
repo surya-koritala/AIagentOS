@@ -2298,10 +2298,10 @@ mod tests {
     fn matching_native_file_handles(path: &Path) -> std::io::Result<Vec<(usize, u32, u32)>> {
         use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
         use windows_sys::Wdk::System::Threading::{
             NtQueryInformationProcess, ProcessHandleInformation,
         };
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
         use windows_sys::Win32::Storage::FileSystem::{
             GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_TYPE_DISK,
@@ -2393,12 +2393,24 @@ mod tests {
             // the current object with a non-inheritable duplicate before both
             // queries; close only this duplicate through OwnedHandle.
             let mut duplicate = std::ptr::null_mut();
-            if unsafe { DuplicateHandle(
-                GetCurrentProcess(), entry.value, GetCurrentProcess(),
-                &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS,
-            ) } == 0 { continue; }
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    entry.value,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                continue;
+            }
             let owned = unsafe { OwnedHandle::from_raw_handle(duplicate) };
-            if unsafe { GetFileType(owned.as_raw_handle()) } != FILE_TYPE_DISK { continue; }
+            if unsafe { GetFileType(owned.as_raw_handle()) } != FILE_TYPE_DISK {
+                continue;
+            }
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
             if unsafe { GetFileInformationByHandle(owned.as_raw_handle(), &mut info) } == 0 {
                 continue;
@@ -3493,6 +3505,32 @@ mod tests {
 
         #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+            };
+
+            // An unrelated metadata/protection handle has the observed access
+            // mask, but must never match the crowded directory's file identity.
+            let unrelated = root.join("unrelated-identity-control");
+            std::fs::create_dir(&unrelated).unwrap();
+            let metadata = std::fs::OpenOptions::new()
+                .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&unrelated)
+                .unwrap();
+            let raw = metadata.as_raw_handle() as usize;
+            assert!(matching_native_file_handles(&unrelated)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == raw));
+            assert!(!matching_native_file_handles(&crowded)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == raw));
+            drop(metadata);
+
             // The workspace capability deliberately denies delete sharing
             // until teardown; the failed listing's child iterator must already
             // have released its own native directory reference.

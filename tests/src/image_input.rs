@@ -95,6 +95,9 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
         .await
         .unwrap()
         .id;
+    let stream_agent = kernel.create_agent_for_tenant(&tenant, config()).await.unwrap().id;
+    let desktop_agent = kernel.create_agent_for_tenant(&tenant, config()).await.unwrap().id;
+    let tui_agent = kernel.create_agent_for_tenant(&tenant, config()).await.unwrap().id;
     let foreign_agent = kernel
         .create_agent_for_tenant(&foreign, config())
         .await
@@ -133,7 +136,7 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
     assert_eq!(
         sdk.send_message_content_stream(
             "image-sdk-stream",
-            owner.to_string(),
+            stream_agent.to_string(),
             content(),
             |event| if let MessageStreamEvent::Token { delta } = event {
                 tokens.push_str(delta)
@@ -150,7 +153,7 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
         .unwrap();
     assert_eq!(
         desktop
-            .send_message_content(owner.to_string(), content())
+            .send_message_content(desktop_agent.to_string(), content())
             .await
             .unwrap()
             .content,
@@ -161,7 +164,7 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
         .unwrap();
     assert_eq!(
         tui.message_client()
-            .send_message_content_stream("image-tui-stream", owner.to_string(), content(), |_| {})
+            .send_message_content_stream("image-tui-stream", tui_agent.to_string(), content(), |_| {})
             .await
             .unwrap()
             .content,
@@ -196,6 +199,7 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
     task.abort();
     let _ = task.await;
     kernel.stop_agent(owner).await.unwrap();
+    for id in [stream_agent,desktop_agent,tui_agent] { kernel.stop_agent(id).await.unwrap(); }
     kernel.stop_agent(foreign_agent).await.unwrap();
 }
 

@@ -24,13 +24,13 @@ plaintext tool shim is separate.
 | Provider | Text fixture | Native stream | Tools / parallel | Usage parsed | Cancel / timeout | Vision / audio | Model/API selection | Live evidence for this commit |
 |---|---:|---:|---:|---:|---:|---:|---|---|
 | Azure OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Deployment + configured API version | **Not run** |
-| OpenAI | Yes | No; bounded non-streaming fallback | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Configured model; OpenAI v1 family | **Not run** |
+| OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Configured model; OpenAI v1 family | **Not run** |
 | Anthropic | Yes | No; bounded non-streaming fallback | Yes / yes | Input, output, cache-read | Yes / yes | Not in the standard message contract | Configured model; Messages API family | **Not run** |
-| Groq | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| DeepSeek | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
+| Groq | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
+| DeepSeek | Yes | Yes, SSE | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Gemini | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
-| vLLM | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
+| vLLM | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
 | Candle/GGUF | Failure/template fixtures; gated real-model test | No | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
 
@@ -42,6 +42,13 @@ A green nightly run with an empty provider set retains a dated `not_run` plan
 and skips live contracts. It verifies fixture contracts only; it is not live
 provider evidence and never permits a production claim. Invalid provider sets
 fail, and every explicitly selected live provider must still report `passed`.
+
+## Native streaming conformance
+
+Azure/OpenAI/Groq/DeepSeek/vLLM use one bounded byte-safe SSE reader with
+ordered native call assembly, usage, cancellation/backpressure and partial-output
+retry suppression. Keyless nine-adapter conformance remains distinct from live
+provider qualification. See issue #351 and the hosted streaming fixtures.
 
 ## Shared runtime contract
 

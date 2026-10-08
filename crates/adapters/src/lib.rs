@@ -291,3 +291,6 @@ mod local_tests;
 
 #[cfg(test)]
 mod output_bound_tests;
+
+#[cfg(test)]
+mod streaming_conformance_tests;

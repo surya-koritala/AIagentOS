@@ -321,3 +321,34 @@ async fn incomplete_native_tools_are_errors() {
         ));
     }
 }
+
+#[tokio::test]
+async fn typed_streams_bound_wire_and_replay_data_and_reject_broken_frames() {
+    for index in 0..2 {
+        for body in [" ".repeat(crate::streaming::MAX_OPENAI_STREAM_BYTES + 1), "data: {broken}\n\n".into(), "data: {\"unfinished\":true}".into()] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string(body)).expect(1).mount(&server).await;
+            let error = collect(adapters(&server.uri()).remove(index).as_ref(), &[]).await.unwrap_err();
+            assert!(matches!(error, ConnectorError::ProtocolError(_) | ConnectorError::StreamError(_)));
+        }
+    }
+    let server = MockServer::start().await;
+    let body = event(json!({"candidates": [{"content": {"parts": [{"text": "x".repeat(256 * 1024)}]}, "finishReason": "STOP"}]}));
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string(body)).expect(1).mount(&server).await;
+    assert!(matches!(collect(adapters(&server.uri()).remove(1).as_ref(), &[]).await.unwrap_err(), ConnectorError::ProtocolError(_)));
+}
+
+#[tokio::test]
+async fn typed_stream_deadline_remains_active_during_sink_backpressure() {
+    for index in 0..2 {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string(if index == 0 { anthropic_text_fixture() } else { gemini_text_fixture() })).expect(1).mount(&server).await;
+        let session = adapters(&server.uri()).remove(index).create_session().await.unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move { session.send_streaming_events_controlled(vec![StandardMessage::user("fixture")], &[], LlmRequestOptions { timeout: Some(Duration::from_millis(150)), ..Default::default() }, &CancellationToken::new(), ProviderEventSink::new(sender)).await });
+        tokio::time::timeout(Duration::from_secs(2), async { while receiver.is_empty() { tokio::task::yield_now().await; } }).await.unwrap();
+        assert!(matches!(task.await.unwrap().unwrap_err(), ConnectorError::Timeout(_)));
+        assert_eq!(receiver.recv().await, Some(ProviderStreamEvent::TextDelta("Hello ".into())));
+        assert_eq!(receiver.recv().await, None);
+    }
+}

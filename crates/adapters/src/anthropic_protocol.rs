@@ -79,6 +79,12 @@ pub(super) fn request(
     let mut seen = HashSet::<String>::new();
     let mut results = Vec::new();
     for message in messages {
+        if message.role != "assistant" && message.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+            return Err(invalid("non-assistant history cannot request tools"));
+        }
+        if message.role != "tool" && message.tool_call_id.is_some() {
+            return Err(invalid("only tool results may carry a call id"));
+        }
         if message.role != "tool" {
             if !pending.is_empty() {
                 return Err(invalid("native tools are missing results"));

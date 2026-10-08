@@ -174,7 +174,11 @@ p95 (`44.260 ms`) was slower than exact search (`25.052 ms`) on that host, so
 this is quality evidence—not a performance SLO. The CI artifact records each
 runner's build/query timing and Linux resident memory. The retained cache,
 binary-embedding migration, deterministic ordering and revised performance gate
-are described in [memory retrieval](MEMORY_RETRIEVAL.md). Sustained 100k+ latency
+are described in [memory retrieval](MEMORY_RETRIEVAL.md). The
+[2026-10-08 Linux fixture](../benchmarks/retrieval/2026-10-08-linux-10k/README.md)
+passed with recall/top-one agreement 1.0 and ANN p95 15.228 ms versus exact
+17.851 ms; it measures index searches and excludes database warming.
+Sustained 100k+ latency
 and soak goals remain part of
 [issue #125](https://github.com/surya-koritala/AIagentOS/issues/125).
 

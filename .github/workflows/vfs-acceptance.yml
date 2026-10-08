@@ -66,6 +66,7 @@ jobs:
         with:
           save-if: false
       - name: Bind proof to PR source and tested merge
+        id: source
         shell: bash
         env:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
@@ -82,21 +83,25 @@ jobs:
           cargo test -p agent-sdk --test workspace_vfs workspace_handles_are_not_resurrected_after_durable_agent_restart --locked -- --nocapture 2>&1 | tee vfs-acceptance-workspace-restart.log
           cargo test -p agent-sdk --test data_vfs persistent_data_survives_restart_and_old_descriptors_do_not --locked -- --nocapture 2>&1 | tee vfs-acceptance-data-restart.log
       - name: Authorized COW child cannot inherit any live descriptor family
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p agent-sdk --test durable_conversation clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles --locked -- --nocapture 2>&1 | tee vfs-acceptance-clone.log
       - name: Generated actual-wire lifecycle rights and capacity invariants
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p integration-tests vfs_handle_props --locked -- --nocapture 2>&1 | tee vfs-acceptance-properties.log
       - name: Abrupt actual-process VFS death and fresh authorized recovery
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p kernel --lib --locked vfs::process_crash::abrupt_process_crash_revokes_handles_and_reopens_committed_vfs_data -- --nocapture 2>&1 | tee vfs-acceptance-process-crash.log
       - name: Public-wire provider deadlines reclaim admitted workspace operations
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail

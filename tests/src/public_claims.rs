@@ -180,8 +180,7 @@ fn claim_errors(registry: &Registry, path: &str, text: &str) -> Vec<String> {
                                 matches!(character, ' ' | '.' | ';' | ':' | '(' | '—')
                             })
                     })
-                }) {
-                    if ![
+                }) && ![
                         "not ",
                         "pending",
                         "requires",
@@ -192,12 +191,11 @@ fn claim_errors(registry: &Registry, path: &str, text: &str) -> Vec<String> {
                     ]
                     .iter()
                     .any(|condition| lower.contains(condition))
-                    {
+                {
                         errors.push(format!(
                             "{path}:{}: unbound current evidence status {cell:?}",
                             index + 1
                         ));
-                    }
                 }
             }
         } else {

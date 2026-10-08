@@ -299,6 +299,17 @@ async fn unhealthy_correction_store_blocks_text_typed_content_and_planning_befor
     let directory = PrivateDirectory::new();
     let path = directory.0.join("rules.json");
     let store = rules(&path);
+    store
+        .add_rule(
+            "seed".into(),
+            "committed correction".into(),
+            RuleScope::local_cli(),
+        )
+        .unwrap();
+    assert!(
+        path.is_file(),
+        "fixture must persist a rule before replacing its file"
+    );
     let kernel = AgentKernelImpl::new().unwrap();
     let requests = fixture(&kernel, Vec::new(), false);
     let local = kernel

@@ -1062,12 +1062,11 @@ mod tests {
 
     #[test]
     fn byte_fallback_progress_waits_for_utf8_and_flushes_exact_batch_tail() {
-        use std::collections::HashMap;
-        let vocab = HashMap::from([
+        let vocab = [
             ("<0x20>".to_string(), 0),
             ("<0xC3>".to_string(), 1),
             ("<0xA9>".to_string(), 2),
-        ]);
+        ];
         let model = tokenizers::models::bpe::BPE::builder()
             .vocab_and_merges(vocab, vec![])
             .byte_fallback(true)

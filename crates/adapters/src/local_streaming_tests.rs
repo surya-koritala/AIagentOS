@@ -225,3 +225,63 @@ async fn controlled_candle_decoder_passes_the_shared_native_stream_contract() {
     assert_eq!(response.tokens_used, batch.tokens_used);
     assert_eq!(deltas, ["one", " two", " three"]);
 }
+
+#[tokio::test]
+async fn ollama_three_wire_chunks_preserve_split_utf8_and_early_delivery() {
+    let first = line(json!({"message": {"content": "Hel"}, "done": false}));
+    let middle = line(json!({"message": {"content": "lo "}, "done": false}));
+    let last = line(json!({"message": {"content": "🌐"}, "done": true, "prompt_eval_count": 11, "eval_count": 3}));
+    let split = last.as_bytes().iter().position(|byte| *byte == 0xf0).unwrap() + 2;
+    let mut second = middle.into_bytes();
+    second.extend_from_slice(&last.as_bytes()[..split]);
+    let (uri, resume, server) = paused_stream(vec![first.into_bytes(), second, last.as_bytes()[split..].to_vec()]).await;
+    let session = LocalLlmAdapter::new(uri, "fixture".into()).create_session().await.unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let task = tokio::spawn(async move {
+        session.send_streaming_events_controlled(vec![StandardMessage::user("fixture")], &[], LlmRequestOptions::default(), &CancellationToken::new(), ProviderEventSink::new(sender)).await
+    });
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await.unwrap(), Some(ProviderStreamEvent::TextDelta("Hel".into())));
+    assert!(!task.is_finished());
+    resume.send(()).unwrap();
+    assert_eq!(receiver.recv().await, Some(ProviderStreamEvent::TextDelta("lo ".into())));
+    assert_eq!(receiver.recv().await, Some(ProviderStreamEvent::TextDelta("🌐".into())));
+    let response = task.await.unwrap().unwrap();
+    assert_eq!(response.content, "Hello 🌐");
+    assert_eq!(response.usage, LlmUsage::reported(11, 3, 0));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn ollama_failed_and_cancelled_template_retries_still_count_both_requests() {
+    for cancel in [false, true] {
+        let server = MockServer::start().await;
+        template_rejection(&server).await;
+        let response = if cancel {
+            ResponseTemplate::new(200).set_body_string(ndjson_fixture()).set_delay(Duration::from_secs(10))
+        } else {
+            ResponseTemplate::new(503).set_body_json(json!({"error": "unavailable"}))
+        };
+        Mock::given(method("POST")).respond_with(response).expect(1).with_priority(6).mount(&server).await;
+        let connector = Arc::new(AgentConnectorImpl::new());
+        connector.register_provider(Arc::new(LocalLlmAdapter::new(server.uri(), "fixture".into()))).unwrap();
+        let session = connector.connect_resilient(kernel::AgentId::new_v4(), &"local".into()).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let tools = [tool()];
+        let send = session.send_streaming_events_controlled(vec![StandardMessage::user("fixture")], &tools, LlmRequestOptions::default(), &cancellation, ProviderEventSink::new(sender));
+        let cancel_after_retry = async {
+            if cancel {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while server.received_requests().await.unwrap().len() < 2 { tokio::task::yield_now().await; }
+                }).await.unwrap();
+                trigger.cancel();
+            }
+        };
+        let (result, ()) = tokio::join!(send, cancel_after_retry);
+        let error = result.unwrap_err();
+        if cancel { assert!(matches!(error, ConnectorError::Cancelled(_))); }
+        else { assert!(matches!(error, ConnectorError::ServiceUnavailable(_))); }
+        assert_eq!(session.last_attempts(), Some(2));
+    }
+}

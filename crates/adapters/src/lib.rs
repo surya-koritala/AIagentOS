@@ -299,3 +299,6 @@ mod streaming_conformance_tests;
 
 #[cfg(test)]
 mod native_messages_streaming_tests;
+
+#[cfg(test)]
+mod local_streaming_tests;

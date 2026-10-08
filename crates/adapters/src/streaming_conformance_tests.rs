@@ -100,6 +100,28 @@ pub(super) async fn collect(
     Ok((response?, deltas))
 }
 
+pub(super) fn assert_conformance(
+    adapter: &dyn LlmProviderAdapter,
+    response: &LlmResponse,
+    deltas: &[String],
+) {
+    assert_eq!(deltas.concat(), response.content, "{}", adapter.id());
+    if adapter.capabilities().native_streaming {
+        assert!(
+            deltas.len() >= 2,
+            "{} claimed native streaming",
+            adapter.id()
+        );
+    } else {
+        assert_eq!(
+            deltas.len(),
+            1,
+            "{} claimed fallback streaming",
+            adapter.id()
+        );
+    }
+}
+
 #[tokio::test]
 async fn network_adapters_and_huggingface_modes_conform_to_declared_streaming() {
     let server = MockServer::start().await;
@@ -141,13 +163,19 @@ async fn network_adapters_and_huggingface_modes_conform_to_declared_streaming() 
         .expect(1)
         .mount(&server)
         .await;
-    let fallback_fixtures = [
-        ("/models/fixture", json!([{"generated_text": "Hello 🌐"}])),
-        (
-            "/api/chat",
-            json!({"message": {"content": "Hello 🌐"}, "prompt_eval_count": 11, "eval_count": 3}),
-        ),
-    ];
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_partial_json(
+            json!({"stream": true, "options": {"num_predict": 41}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(crate::local_streaming_tests::ndjson_fixture()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fallback_fixtures = [("/models/fixture", json!([{"generated_text": "Hello 🌐"}]))];
     for (request_path, fixture) in fallback_fixtures {
         Mock::given(method("POST"))
             .and(path(request_path))
@@ -198,21 +226,7 @@ async fn network_adapters_and_huggingface_modes_conform_to_declared_streaming() 
     for adapter in adapters {
         let (response, deltas) = collect(adapter.as_ref(), &[]).await.unwrap();
         assert_eq!(response.content, "Hello 🌐", "{}", adapter.id());
-        assert_eq!(deltas.concat(), response.content, "{}", adapter.id());
-        if adapter.capabilities().native_streaming {
-            assert!(
-                deltas.len() >= 2,
-                "{} claimed native streaming",
-                adapter.id()
-            );
-        } else {
-            assert_eq!(
-                deltas.len(),
-                1,
-                "{} claimed fallback streaming",
-                adapter.id()
-            );
-        }
+        assert_conformance(adapter.as_ref(), &response, &deltas);
         if adapter.id() == "huggingface" && !adapter.capabilities().native_streaming {
             assert!(!response.usage.provider_reported);
             assert!(response.usage.input_tokens > 0 && response.usage.output_tokens > 0);

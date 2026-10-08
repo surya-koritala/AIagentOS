@@ -137,7 +137,7 @@ jobs:
         run: >-
           cargo run -p adapters --example on_device_qualification
           --features candle --locked -- --validate
-      - name: Qualify load, generation, cancellation drain, and resources
+      - name: Qualify real stream parity, cancellation drain, and resources
         env:
           RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           ENVIRONMENT_ID: ${{ inputs.environment_id }}

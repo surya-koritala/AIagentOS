@@ -8554,37 +8554,7 @@ mod tests {
             && request.active_uses == 0));
     }
 
-    struct PeripheralCallbackCounter(Arc<std::sync::atomic::AtomicUsize>);
-
-    #[async_trait::async_trait]
-    impl crate::resources::ResourceProvider for PeripheralCallbackCounter {
-        fn resource_type(&self) -> crate::resources::ResourceType {
-            crate::resources::ResourceType::Peripheral
-        }
-        fn supported_operations(&self) -> Vec<String> {
-            vec!["capture_image".into()]
-        }
-        async fn execute(
-            &self,
-            _: &str,
-            _: &serde_json::Value,
-        ) -> Result<serde_json::Value, ResourceError> {
-            panic!("controlled callback required");
-        }
-        async fn execute_controlled(
-            &self,
-            _: &str,
-            _: &serde_json::Value,
-            _: &tokio_util::sync::CancellationToken,
-        ) -> Result<serde_json::Value, ResourceError> {
-            // Deliberately counts entry before inspecting cancellation: the
-            // broker must refuse already-revoked admission before this callback.
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(ResourceError::OperationFailed(
-                "peripheral use revoked".into(),
-            ))
-        }
-    }
+    use crate::resources::PeripheralCallbackCounter;
 
     fn register_peripheral_race_binding(kernel: &AgentKernelImpl) {
         kernel.tool_registry.register(crate::tools::ToolBinding {

@@ -1209,6 +1209,25 @@ pub(crate) struct RevocablePeripheralProvider {
 }
 
 #[cfg(test)]
+pub(crate) struct PeripheralCallbackCounter(pub(crate) Arc<AtomicUsize>);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ResourceProvider for PeripheralCallbackCounter {
+    fn resource_type(&self) -> ResourceType { ResourceType::Peripheral }
+    fn supported_operations(&self) -> Vec<String> { vec!["capture_image".into()] }
+    async fn execute(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
+        panic!("controlled callback required");
+    }
+    async fn execute_controlled(&self, _: &str, _: &serde_json::Value, _: &CancellationToken) -> Result<serde_json::Value, ResourceError> {
+        // Count entry before cancellation inspection: the broker must refuse
+        // an already-revoked admission before this test callback is entered.
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(ResourceError::OperationFailed("peripheral use revoked".into()))
+    }
+}
+
+#[cfg(test)]
 #[async_trait::async_trait]
 impl ResourceProvider for RevocablePeripheralProvider {
     fn resource_type(&self) -> ResourceType {

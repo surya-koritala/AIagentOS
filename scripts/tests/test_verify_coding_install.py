@@ -1,4 +1,6 @@
 import copy
+import builtins
+import importlib.util
 import json
 import subprocess
 import sys
@@ -63,6 +65,21 @@ class CodingInstallTests(unittest.TestCase):
                 verify(self.archive, "0" * 64, "0.4.0-rc.1", "fixture", self.root / "install")
             execute.assert_not_called()
         self.assertFalse((self.root / "install").exists())
+
+    def test_archive_validation_does_not_require_the_toml_parser(self):
+        original_import = builtins.__import__
+        def without_toml(name, *args, **kwargs):
+            if name == "tomllib":
+                raise ImportError("Python 3.10 fixture")
+            return original_import(name, *args, **kwargs)
+        spec = importlib.util.spec_from_file_location(
+            "cli_qualification_without_toml", Path(__file__).resolve().parents[1] / "linux_cli_rc_qualification.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch("builtins.__import__", side_effect=without_toml):
+            spec.loader.exec_module(module)
+            self.assertEqual(set(module.validate_archive(self.archive)), set(BINARIES))
+            self.assertEqual(module.sha256_file(self.archive), self.digest)
 
     def test_scripted_tests_cannot_be_promoted_to_process_install_evidence(self):
         self.completed["branches"][1]["test"]["kind"] = "contract_fixture"

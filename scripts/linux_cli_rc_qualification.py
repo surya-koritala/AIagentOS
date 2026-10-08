@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -175,6 +174,10 @@ def extract_archive(path: Path, destination: Path) -> dict[str, Path]:
 
 
 def load_release_fixture(registry_path: Path, released_tag: str) -> tuple[Path, dict[str, Any]]:
+    try:
+        import tomllib
+    except ImportError as error:
+        raise QualificationError("released-schema qualification requires Python 3.11 or newer") from error
     _require_regular_file(
         registry_path, "released-schema registry", MAX_FIXTURE_REGISTRY_BYTES
     )

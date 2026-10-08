@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added native bounded SSE streaming for OpenAI, Groq, DeepSeek and vLLM,
+  using Azure's shared byte-safe reader. Keyless nine-provider conformance
+  fixtures cover capability declarations, parallel tool argument assembly,
+  usage, cancellation, deadlines, wire ceilings and partial-output replay
+  suppression. Real-service qualification remains pending. Closes #351.
+
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,
   and SDK/agentctl surfaces. Durable KV admission now counts UTF-8 key/value

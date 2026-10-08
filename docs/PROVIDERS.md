@@ -24,13 +24,13 @@ plaintext tool shim is separate.
 | Provider | Text fixture | Native stream | Tools / parallel | Usage parsed | Cancel / timeout | Vision / audio | Model/API selection | Live evidence for this commit |
 |---|---:|---:|---:|---:|---:|---:|---|---|
 | Azure OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Deployment + configured API version | **Not run** |
-| OpenAI | Yes | No; bounded non-streaming fallback | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Configured model; OpenAI v1 family | **Not run** |
+| OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Configured model; OpenAI v1 family | **Not run** |
 | Anthropic | Yes | No; bounded non-streaming fallback | Yes / yes | Input, output, cache-read | Yes / yes | Not in the standard message contract | Configured model; Messages API family | **Not run** |
-| Groq | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| DeepSeek | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
+| Groq | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
+| DeepSeek | Yes | Yes, SSE | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Gemini | Yes | No; bounded non-streaming fallback | No / no | Prompt, candidate, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
-| vLLM | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
+| vLLM | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
 | Candle/GGUF | Failure/template fixtures; gated real-model test | No | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
 
@@ -55,6 +55,26 @@ ceiling, structured credential/prompt fields are redacted recursively, and
 unstructured bodies fail closed to a generic message. Tests cover retry
 classification, content-filter handling, oversized usage counters, and secret
 redaction.
+
+### Native streaming conformance
+
+Azure OpenAI, OpenAI, Groq, DeepSeek and vLLM use one SSE reader. It retains
+UTF-8 across HTTP chunks, accepts SSE line endings and comments, reassembles
+parallel function arguments by index, and preserves final prompt, completion
+and cached usage (including DeepSeek cache-hit fields). The entire response,
+including comments and incomplete events, is capped at 8 MiB. Tool-call count
+and identities are bounded; malformed arguments, sparse indexes and duplicate
+identities fail before any tool execution. A truncated stream is an error.
+
+The reusable fixture checks all nine network adapters independently of their
+capability flags: native adapters publish multiple text deltas; compatibility
+adapters publish one completed delta. Concatenated text must equal the terminal
+response. A paused chunked HTTP fixture proves delivery before completion and
+split UTF-8 handling. Cancellation and deadlines cover channel backpressure;
+visible-output failures suppress connector retry and failover. These tests run
+in `provider-streaming.yml` and the platform/workspace CI suites without keys,
+model downloads or live requests. They qualify the protocol implementation;
+real provider evidence remains **Not run**.
 
 ### Retry, circuit breaking, and failover
 

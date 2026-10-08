@@ -357,6 +357,29 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Keep exact version and platform metadata mandatory for CLI-only releases
+        run: |
+          python3 scripts/verify_desktop_release.py
+          python3 scripts/verify_supported_platforms.py
+      - name: Require an exact GitHub-verified annotated release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          test "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          tag_object="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" > release-tag.json
+          jq -e --arg tag "$GITHUB_REF_NAME" --arg commit "$GITHUB_SHA" \
+            '.tag == $tag and .object.type == "commit" and .object.sha == $commit
+              and .verification.verified == true
+              and (.verification.verified_at | type == "string" and length > 0)' \
+            release-tag.json
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
@@ -399,6 +422,9 @@ jobs:
         run: |
           cp release-asset-inventory.json dist/release-asset-inventory.json
           cp DISTRIBUTION_NOTES.md dist/DISTRIBUTION_NOTES.md
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            cp release-tag.json dist/release-tag.json
+          fi
       - name: Generate SHA-256 manifest
         working-directory: dist
         run: >-

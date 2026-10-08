@@ -77,6 +77,19 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
             self.assertIn(name, self.scenario)
         self.assertIn("real_publication_exercised': False", self.scenario)
 
+    def test_cli_only_path_still_checks_exact_metadata_and_cryptographic_tag(self):
+        assembly = job(self.release, "assemble")
+        self.assertIn("Keep exact version and platform metadata mandatory", assembly)
+        self.assertIn("python3 scripts/verify_desktop_release.py", assembly)
+        self.assertIn("python3 scripts/verify_supported_platforms.py", assembly)
+        self.assertIn('git cat-file -t "$GITHUB_REF_NAME"', assembly)
+        self.assertIn('refs/tags/${GITHUB_REF_NAME}^{commit}', assembly)
+        self.assertIn('refs/tags/${GITHUB_REF_NAME}^{tag}', assembly)
+        self.assertIn('.object.sha == $commit', assembly)
+        self.assertIn('.verification.verified == true', assembly)
+        self.assertIn('cp release-tag.json dist/release-tag.json', assembly)
+        self.assertLess(assembly.index("Keep exact version"), assembly.index("download-artifact@"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -115,6 +115,10 @@ protected signing identity. A `v*` tag runs the same workflow and
 
 All five required gates must succeed. Skipped, cancelled, or failed optional
 desktop jobs do not waive any CLI gate and their partial output is excluded.
+CLI-only assembly still requires synchronized exact tag/platform versions;
+stable tags must be annotated, bound to the workflow's exact source commit,
+and carry a cryptographic signature verified by GitHub. The verified tag
+metadata is retained in the signed bundle.
 The release notes contain the matching `CHANGELOG.md` section followed by an
 asset inventory and explicit omitted classes and reasons. The inventory and
 distribution notes enter the checksum, Sigstore, and provenance bundle too.

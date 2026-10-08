@@ -1,0 +1,62 @@
+name: Coding agent fixture
+
+on:
+  pull_request:
+    paths:
+      - 'crates/coding-agent/**'
+      - 'crates/kernel/**'
+      - 'crates/sdk/**'
+      - 'fixtures/coding-agent/**'
+      - 'Cargo.lock'
+      - '.github/workflows/coding-agent.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coding-fixture:
+    name: Governed coding fixture and restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: 0
+      CODING_RUST_IMAGE: rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5
+        with:
+          version: v29.6.2
+          rootless: true
+          daemon-config: |
+            {"exec-opts": ["native.cgroupdriver=cgroupfs"]}
+      - name: Verify the supported backend and pull the pinned operator image
+        run: |
+          docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
+          docker pull "$CODING_RUST_IMAGE"
+      - name: Build the application and run the first failed branch
+        run: |
+          cargo build -p coding-agent --bin agent-code --locked
+          mkdir -p target/coding-evidence
+          target/debug/agent-code fixture --image "$CODING_RUST_IMAGE" \
+            --data-dir "$RUNNER_TEMP/coding-fixture" --pause-after-branch \
+            > target/coding-evidence/paused.json 2> target/coding-evidence/paused-events.jsonl
+          jq -e '.status == "paused" and .branches[0].phase == "discarded" and .branches[0].test.exit_code != 0 and .branches[0].test.kind == "isolated_process"' target/coding-evidence/paused.json
+      - name: Resume in a fresh process and select the correct fix
+        run: |
+          target/debug/agent-code resume --data-dir "$RUNNER_TEMP/coding-fixture" \
+            > target/coding-evidence/completed.json 2> target/coding-evidence/completed-events.jsonl
+          jq -e '.status == "completed" and .selected_agent == .branches[1].id and .branches[1].test.exit_code == 0 and .branches[1].test.kind == "isolated_process" and .original_repository_written == false' target/coding-evidence/completed.json
+          target/debug/agent-code resume --data-dir "$RUNNER_TEMP/coding-fixture" > target/coding-evidence/replayed-report.json
+          test "$(jq .provider_tokens target/coding-evidence/completed.json)" = "$(jq .provider_tokens target/coding-evidence/replayed-report.json)"
+          test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
+      - name: Retain actual fixture outcomes
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coding-fixture-${{ github.sha }}
+          path: target/coding-evidence/

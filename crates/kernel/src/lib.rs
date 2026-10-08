@@ -1732,6 +1732,28 @@ impl AgentKernelImpl {
             .await
     }
 
+    /// Trusted application bootstrap with a freshly allocated owned workspace.
+    /// The supplied workspace path is replaced; it cannot claim or overwrite an
+    /// operator directory. Lifecycle cleanup owns filesystem/container roots.
+    pub async fn create_agent_with_managed_sandbox(
+        &self,
+        mut config: AgentConfig,
+        mut sandbox: SandboxConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        if !matches!(
+            sandbox.isolation_level,
+            IsolationLevel::Filesystem | IsolationLevel::Container
+        ) {
+            return Err(KernelError::Policy(
+                "managed application bootstrap requires an isolated backend".into(),
+            ));
+        }
+        sandbox.workspace_dir = SandboxManagerImpl::default_config().workspace_dir;
+        config.sandbox_config = Some(sandbox);
+        self.create_agent_grouped_owned(config, None, crate::context::DEFAULT_TENANT, None, true)
+            .await
+    }
+
     /// Create an agent with an authority-reserved identifier.
     pub async fn create_agent_full_with_id(
         &self,
@@ -2266,10 +2288,22 @@ impl AgentKernelImpl {
 
     async fn create_agent_grouped(
         &self,
+        config: AgentConfig,
+        group: Option<&str>,
+        tenant_id: &str,
+        requested_agent_id: Option<AgentId>,
+    ) -> Result<AgentHandle, KernelError> {
+        self.create_agent_grouped_owned(config, group, tenant_id, requested_agent_id, false)
+            .await
+    }
+
+    async fn create_agent_grouped_owned(
+        &self,
         mut config: AgentConfig,
         group: Option<&str>,
         tenant_id: &str,
         requested_agent_id: Option<AgentId>,
+        owned_sandbox: bool,
     ) -> Result<AgentHandle, KernelError> {
         let _operator_mutation = self.operator_control.mutation_guard().await;
         let max_agents = self.operator_control.max_agents();
@@ -2284,8 +2318,8 @@ impl AgentKernelImpl {
         // Absence means the secure managed default, never host-unconfined. Only
         // in-process operator code can explicitly request IsolationLevel::Trusted;
         // the wire and package formats do not expose that bypass.
-        let managed_sandbox = config.sandbox_config.is_none();
-        if managed_sandbox {
+        let managed_sandbox = config.sandbox_config.is_none() || owned_sandbox;
+        if config.sandbox_config.is_none() {
             config.sandbox_config = Some(SandboxManagerImpl::default_config());
         }
         // 1. Create agent via agent manager

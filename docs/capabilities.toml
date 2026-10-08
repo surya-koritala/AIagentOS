@@ -50,6 +50,22 @@ platforms = ["linux", "macos", "windows"]
 limitations = ["Public fixture regressions cover actual execution, durable spills, isolation, cleanup and restart; independent security review and target soak evidence remain pending under #127. Retained performance measurements are macOS arm64 fixtures, including first-promotion cost, and do not qualify production performance. Clones require idle Running or Paused parents with no retained generation checkpoint, moved cgroup or transient namespace membership. Workspaces, VFS handles, approvals, credentials, private facts/KV and live effects are not inherited; provider execution still materializes resolved history."]
 
 [[capability]]
+id = "rust-coding-userland"
+title = "Bounded repository maintenance with speculative execution branches"
+owner = "userland"
+maturity = "integrated"
+release = "v1.0"
+tracking_issue = 394
+qualification_issue = 127
+kernel_modules = []
+source_paths = ["crates/coding-agent", "fixtures/coding-agent/utf8-budget", ".github/workflows/coding-agent.yml"]
+public_entry_points = ["crates/coding-agent/src/main.rs::agent-code", "crates/coding-agent/src/workflow.rs::run_job"]
+runtime_call_paths = ["crates/coding-agent/src/io.rs::JobIo", "crates/coding-agent/src/workflow.rs::ProcessRunner"]
+test_evidence = ["crates/coding-agent/tests/workflow.rs", "crates/coding-agent/tests/provider.rs", ".github/workflows/coding-agent.yml"]
+platforms = ["linux"]
+limitations = ["Real process execution requires the rootless/digest-pinned Linux backend and an explicitly permitted offline locked Rust test target. Public-wire contract tests use a labelled scripted runner; container fixture outcomes and reviewed real-provider tasks are separate evidence. Downloadable package installation, real-model task quality, configured-price/invoice reconciliation, same-agent comparisons and independent security/production qualification remain pending under #394/#127. Originals, protected tests, dependency manifests, credentials and remote effects cannot be changed by proposals. Started operations without receipts require explicit retry; no exact-once external-effect claim is made."]
+
+[[capability]]
 id = "claim-integrity"
 title = "Capability claim integrity"
 owner = "release-engineering"

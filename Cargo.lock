@@ -1160,6 +1160,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "coding-agent"
+version = "0.4.0-rc.1"
+dependencies = [
+ "adapters",
+ "agent-sdk",
+ "async-trait",
+ "chrono",
+ "kernel",
+ "proptest",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

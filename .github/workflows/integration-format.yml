@@ -44,3 +44,19 @@ jobs:
           retention-days: 30
       - name: Require formatted source
         run: test ! -s target/qualification/format/rustfmt.patch
+      - name: Verify the source-bound concurrency policy without broad CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 492eab5d4b97c88527119ec12f36e350486cf264 HEAD
+          git diff --exit-code 492eab5d4b97c88527119ec12f36e350486cf264 HEAD -- . ':!.github/workflows/integration-format.yml'
+          printf '%s\n' 492eab5d4b97c88527119ec12f36e350486cf264 > target/qualification/format/policy-source-commit.txt
+          printf '%s\n' '${{ github.event_name }}' > target/qualification/format/policy-event.txt
+          python3 -m unittest discover -s scripts/tests -p test_pr_concurrency_policy.py -v 2>&1 | tee target/qualification/format/policy.log
+          python3 scripts/verify_workflow_action_pins.py 2>&1 | tee target/qualification/format/action-pins.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: concurrency-policy-${{ github.sha }}
+          path: target/qualification/format
+          retention-days: 30

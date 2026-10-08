@@ -9,6 +9,7 @@ on:
       - 'crates/kernel/src/gate_statistics_tests.rs'
       - 'crates/kernel/src/syscall_gate.rs'
       - 'crates/kernel/src/tools.rs'
+      - 'crates/kernel/src/sandbox.rs'
       - 'crates/kernel/src/wire_contract.rs'
       - 'crates/sdk/**'
       - 'crates/cli/**'
@@ -82,6 +83,7 @@ jobs:
           cargo test -p kernel gate_statistics_tests --locked -- --nocapture 2>&1 | tee gate-statistics-wire.log
           cargo test -p kernel wire_contract --locked 2>&1 | tee gate-statistics-contract.log
           cargo test -p integration-tests os_enforcement --locked 2>&1 | tee gate-statistics-enforcement.log
+          cargo test -p kernel sandbox::tests::capability_directory_listing_is_deterministic_typed_and_bounded --locked -- --exact --nocapture 2>&1 | tee gate-statistics-lifetime.log
       - name: Actual SDK and shipped CLI preserve global bytes and scoped reads
         shell: bash
         run: |

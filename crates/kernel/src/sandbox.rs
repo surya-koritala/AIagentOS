@@ -3310,10 +3310,25 @@ mod tests {
 
     #[test]
     fn capability_directory_listing_is_deterministic_typed_and_bounded() {
+        #[cfg(windows)]
+        fn deletion_handle(path: &Path) -> std::io::Result<std::fs::File> {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS};
+
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+        }
+
         let mgr = SandboxManagerImpl::new();
         let config = test_config();
         let root = config.workspace_dir.clone();
         let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+        // Retaining state must not retain its native directory capability
+        // after teardown, including the bounded-listing early error path.
+        let retained = mgr.sandboxes.get(&sid).unwrap().clone();
         std::fs::write(root.join("z.txt"), "z").unwrap();
         std::fs::create_dir(root.join("a-dir")).unwrap();
         #[cfg(unix)]
@@ -3355,7 +3370,33 @@ mod tests {
             .execute_filesystem(sid, "list", &serde_json::json!({"path": "crowded"}))
             .is_err());
 
+        #[cfg(windows)]
+        {
+            // The workspace capability deliberately denies delete sharing
+            // until teardown; the failed listing's child iterator must already
+            // have released its own native directory reference.
+            assert_eq!(deletion_handle(&root).unwrap_err().raw_os_error(), Some(32));
+            drop(deletion_handle(&crowded).expect("bounded-list error retained its directory"));
+        }
         mgr.destroy_sandbox(sid).unwrap();
+        assert!(retained.workspace.lock().unwrap().is_none());
+        assert!(retained.workspace_directories.lock().unwrap().is_empty());
+        assert!(!mgr.sandboxes.contains_key(&sid));
+        assert!(mgr
+            .execute_filesystem(sid, "list", &serde_json::json!({"path": "."}))
+            .is_err());
+        #[cfg(windows)]
+        for directory in [&root, &crowded] {
+            // A directory capability opened without FILE_SHARE_DELETE would
+            // prevent this exclusive open. Exercise the actual Windows handle
+            // lifetime before recursive deletion, without retries or new flags
+            // on the production capabilities.
+            let exclusive = deletion_handle(directory)
+                .expect("destroyed listing sandbox retained a native directory handle");
+            drop(exclusive);
+        }
+        drop(retained);
+        drop(mgr);
         std::fs::remove_dir_all(root).unwrap();
     }
 

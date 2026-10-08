@@ -163,18 +163,29 @@ mod tests {
     /// field the adapter error path does not redact.
     #[tokio::test]
     async fn gemini_transport_failure_reveals_no_url_or_credential() {
-        let mock_server = MockServer::start().await;
-        let base_url = mock_server.uri();
-        // Stopping the server turns the next request into a connection failure.
-        drop(mock_server);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        // Keep the listener owned throughout the request. A dropped wiremock
+        // server can be returned to its pool and reused by a parallel fixture.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
         let adapter =
             GeminiAdapter::new("super-secret-key".to_string()).with_base_url(base_url.clone());
         let session = adapter.create_session().await.unwrap();
-        let error = session
-            .send(vec![StandardMessage::user("Hi")])
-            .await
-            .unwrap_err();
+        let malformed_server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"invalid HTTP response\r\n").await.unwrap();
+            stream.shutdown().await.unwrap();
+        };
+        let request = session.send(vec![StandardMessage::user("Hi")]);
+        let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(malformed_server, request)
+        })
+        .await
+        .expect("reserved malformed server must return a bounded transport failure");
+        let error = result.unwrap_err();
 
         let rendered = error.to_string();
         assert!(

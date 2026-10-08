@@ -1,8 +1,6 @@
 name: Operator onboarding evidence
 
 on:
-  push:
-    branches: [codex/operator-onboarding]
   pull_request:
     branches: [main]
     paths:

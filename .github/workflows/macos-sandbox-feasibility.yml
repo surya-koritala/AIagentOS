@@ -1,0 +1,57 @@
+name: macOS App Sandbox feasibility
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/macos_app_sandbox_probe.py'
+      - 'scripts/fixtures/macos_app_sandbox_probe.c'
+      - '.github/workflows/macos-sandbox-feasibility.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-sandbox-feasibility-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  app-sandbox-probe:
+    name: Supported App Sandbox probe (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, macos-26-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Observe maintained App Sandbox behavior on the actual host
+        run: >-
+          python3 scripts/macos_app_sandbox_probe.py
+          --output target/qualification/macos-app-sandbox-probe.json
+      - name: Preserve the unsupported runtime and production disposition
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(Path('target/qualification/macos-app-sandbox-probe.json').read_text())
+          assert report['schema_version'] == 1
+          assert report['source']['commit'] == os.environ['QUALIFICATION_SHA']
+          assert report['source']['dirty'] is False
+          assert report['backend_enabled'] is False
+          assert report['production_claim_allowed'] is False
+          assert report['native_process_contract_qualified'] is False
+          assert report['signing'] == 'disposable_ad_hoc_fixture_only'
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: macos-app-sandbox-${{ matrix.runner }}-${{ github.run_id }}
+          path: target/qualification/macos-app-sandbox-probe.json
+          if-no-files-found: error

@@ -67,6 +67,11 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   binaries through multi-tenant isolation, permission/quota denials, credential
   revocation, and process restart. Relates #329 and #330.
 
+- Added native ARM64/Intel macOS App Sandbox feasibility probes and exact-source
+  evidence. Documented actual temporary-directory, executable, process-group,
+  and resource-limit gaps; untrusted native process execution stays unavailable.
+  Issue #335 remains open pending a supported complete boundary.
+
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,
   and SDK/agentctl surfaces. Durable KV admission now counts UTF-8 key/value

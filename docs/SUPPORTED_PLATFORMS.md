@@ -149,7 +149,7 @@ install/upgrade/failure/rollback evidence exist for every promised platform.
 The native ARM workflow builds each CLI binary twice, compares every byte, checks
 the Mach-O/ELF architecture, and archives a deterministic ZIP and CycloneDX SBOM.
 A distinct fresh runner downloads those artifacts, checks their SHA-256 files,
-extracts the final archive without Cargo, executes all four version entry points,
+extracts the final archive without Cargo, executes all five version entry points,
 boots the installed server, rejects unauthenticated access, creates multiple
 agents, and proves private storage survives server restart without leaking between
 agents. Reports bind source SHA, archive digest, actual OS/CPU, and results.

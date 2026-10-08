@@ -136,6 +136,7 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
                 "{table} must index its own prefix or tail"
             );
         }
+        drop(conn);
         assert!(!format!(
             "{:?}",
             manager
@@ -143,7 +144,6 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
                 .unwrap()
         )
         .contains(PNG));
-        drop(conn);
         let prefix_hits = manager.search_conversations("\"image before λ\"");
         assert_eq!(
             prefix_hits

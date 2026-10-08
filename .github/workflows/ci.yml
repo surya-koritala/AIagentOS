@@ -122,6 +122,7 @@ jobs:
 
   rust-platforms:
     name: Rust tests (${{ matrix.os }})
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -140,6 +141,7 @@ jobs:
       - name: Gemini governed history and restart fixtures
         run: cargo test -p integration-tests gemini_history --locked -- --nocapture
       - name: Deterministic unit and integration tests
+        timeout-minutes: 20
         run: cargo test --workspace --exclude tauri-app --locked
 
   desktop-platforms:
@@ -231,6 +233,7 @@ jobs:
   coverage:
     name: Coverage floor
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -246,6 +249,7 @@ jobs:
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Enforce workspace line coverage floor
+        timeout-minutes: 30
         run: >-
           cargo llvm-cov --workspace --exclude tauri-app --all-targets --locked
           --lcov --output-path lcov.info --fail-under-lines 60 -- --test-threads=1

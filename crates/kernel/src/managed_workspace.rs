@@ -542,7 +542,9 @@ mod tests {
         let moved = namespace.root.join("preserved-control");
         #[cfg(windows)]
         assert_eq!(
-            std::fs::rename(&control, &moved).unwrap_err().raw_os_error(),
+            std::fs::rename(&control, &moved)
+                .unwrap_err()
+                .raw_os_error(),
             Some(5)
         );
         // Replace only after the real namespace lease is closed. Windows denies

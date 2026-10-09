@@ -1,5 +1,17 @@
 # Public wire and client contract
 
+Protocol v2 advertises `cluster_principal_auth` for independently signed
+quorum commands. `submit_signed_authority_command` carries one `Authorized`
+authority envelope; `get_authority_principal_registry` is trusted-system-only.
+Both operations are absent from v1. The caller owns the signing callback/key;
+API credentials and the node transport key cannot create a principal proof.
+Principal failures retain distinct redacted reasons and non-retryable
+`authorization_denied` classification through follower forwarding. The
+[distributed authority contract](DISTRIBUTED_CONTROL_PLANE.md) defines digest,
+generation, class, scope, expiration, replay and genesis rules. Old token-only
+quorum mutation methods fail closed; the separately disabled single-node
+authority retains its legacy behavior.
+
 AI Agent OS has one canonical remote ABI:
 `kernel::syscall_server::Syscall` / `SyscallReply` as UTF-8,
 newline-delimited JSON. The Rust SDK, CLI, TUI backend, and raw clients must use

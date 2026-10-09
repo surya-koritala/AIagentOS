@@ -750,6 +750,11 @@ pub enum Syscall {
         limit: usize,
     },
     /// Create a one-time authority challenge for admitting a durable node.
+    SubmitSignedAuthorityCommand {
+        command: Box<crate::cluster_consensus::AuthorityCommand>,
+    },
+    /// Public-key registry is global operator metadata, never tenant discovery.
+    GetAuthorityPrincipalRegistry,
     IssueClusterJoinChallenge {
         /// Stable UUID for safe replay after an ambiguous response. Omitted by
         /// legacy clients; the server then creates one for this attempt.
@@ -1599,6 +1604,12 @@ pub enum SyscallReply {
         entries: Vec<crate::cluster_control::NodeControlAudit>,
     },
     /// One-time authority challenge for a node join.
+    AuthorityCommandCommitted {
+        response: crate::cluster_consensus::AuthorityResponse,
+    },
+    AuthorityPrincipalRegistry {
+        principals: Vec<crate::cluster_principal::AuthorityPrincipal>,
+    },
     ClusterJoinChallenge {
         challenge: crate::cluster_control::ClusterJoinChallenge,
     },
@@ -1747,6 +1758,7 @@ impl std::fmt::Debug for Syscall {
             Self::LoadPackage { .. } => &["manifest_toml"],
             Self::PublishPackage { .. } => &["archive_hex"],
             Self::FencedAgentMutation { .. } => &["mutation"],
+            Self::SubmitSignedAuthorityCommand { .. } => &["command"],
             _ => &[],
         };
         redact_debug_fields(&mut value, fields);
@@ -1815,6 +1827,8 @@ fn role_allows(role: Role, required: AccessLevel) -> bool {
 
 fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
     match call {
+        Syscall::SubmitSignedAuthorityCommand { .. } => (AccessLevel::User, "cluster.principal.submit", None),
+        Syscall::GetAuthorityPrincipalRegistry => (AccessLevel::System, "cluster.principal.registry", None),
         Syscall::CreateTenant { .. } => (AccessLevel::System, "auth.tenant.create", None),
         Syscall::ListTenants => (AccessLevel::System, "auth.tenant.list", None),
         Syscall::RevokeTenant { .. } => (AccessLevel::System, "auth.tenant.revoke", None),
@@ -2316,6 +2330,22 @@ async fn authorize(
     principal: Option<&Principal>,
     call: &Syscall,
 ) -> Result<(), SyscallReply> {
+    // This precedes trusted-system shortcuts and local operation-receipt
+    // lookup. A cached response never substitutes for current key authority.
+    if let Syscall::SubmitSignedAuthorityCommand { command } = call {
+        let authority = configured_cluster_authority(kernel).map_err(authority_io_error)?
+            .ok_or_else(|| principal_proof_error(crate::cluster_principal::PrincipalProofError::Missing))?;
+        let view = authority.linearizable_view().await.map_err(authority_io_error)?;
+        let verified = crate::cluster_principal::verify_authority_principal_view(command, &view, chrono::Utc::now())
+            .map_err(principal_proof_error)?;
+        if verified.kind == crate::cluster_principal::AuthorityPrincipalKind::Tenant
+            && principal.is_none_or(|caller| Some(caller.tenant_id.as_str()) != verified.tenant_id.as_deref()) {
+            return Err(principal_proof_error(crate::cluster_principal::PrincipalProofError::TenantScope));
+        }
+    } else if legacy_authority_mutation(call)
+        && configured_cluster_authority(kernel).map_err(authority_io_error)?.is_some() {
+        return Err(principal_proof_error(crate::cluster_principal::PrincipalProofError::Missing));
+    }
     // Open and shared-secret connections are explicit trusted-system callers.
     // Tenant credentials always take the fail-closed path below.
     let Some(principal) = principal else {
@@ -2569,6 +2599,8 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::SetNodeAvailability { .. }
             | Syscall::SetNodeProfile { .. }
             | Syscall::ListNodeControlAudit { .. }
+            | Syscall::SubmitSignedAuthorityCommand { .. }
+            | Syscall::GetAuthorityPrincipalRegistry
             | Syscall::IssueClusterJoinChallenge { .. }
             | Syscall::RegisterClusterMember { .. }
             | Syscall::PrepareClusterMemberCertificateRollout { .. }
@@ -2982,6 +3014,7 @@ fn authority_command_error(response: AuthorityResponse) -> SyscallReply {
             reason, message, ..
         } => {
             let category = match reason {
+                AuthorityRejection::PrincipalAuthentication(error) => return principal_proof_error(error),
                 AuthorityRejection::InvalidOperationId | AuthorityRejection::InvalidCommand => {
                     "invalid replicated authority command"
                 }
@@ -3004,6 +3037,9 @@ fn authority_command_error(response: AuthorityResponse) -> SyscallReply {
 }
 
 fn authority_io_error(error: std::io::Error) -> SyscallReply {
+    if let Some(proof) = error.get_ref().and_then(|error| error.downcast_ref::<crate::cluster_principal::PrincipalProofError>()) {
+        return principal_proof_error(*proof);
+    }
     let category = match error.kind() {
         std::io::ErrorKind::InvalidData
         | std::io::ErrorKind::InvalidInput
@@ -3013,6 +3049,18 @@ fn authority_io_error(error: std::io::Error) -> SyscallReply {
     SyscallReply::Error {
         message: format!("{category}: {error}"),
     }
+}
+
+fn principal_proof_error(error: crate::cluster_principal::PrincipalProofError) -> SyscallReply {
+    SyscallReply::TypedError { code: WireErrorCode::AuthorizationDenied, message: error.to_string(), retryable: false }
+}
+
+fn legacy_authority_mutation(call: &Syscall) -> bool {
+    matches!(call, Syscall::IssueClusterJoinChallenge { .. } | Syscall::RegisterClusterMember { .. }
+        | Syscall::PrepareClusterMemberCertificateRollout { .. } | Syscall::AbortClusterMemberCertificateRollout { .. }
+        | Syscall::FinalizeClusterMemberCertificateRollout { .. } | Syscall::SetClusterMemberState { .. }
+        | Syscall::ClaimClusterAgentOwnership { .. } | Syscall::RenewClusterAgentOwnership { .. }
+        | Syscall::ReleaseClusterAgentOwnership { .. })
 }
 
 async fn dispatch_scoped_inner_with_fence(
@@ -4691,6 +4739,29 @@ async fn dispatch_scoped_inner_with_fence(
                 message: error.to_string(),
             },
         },
+        Syscall::SubmitSignedAuthorityCommand { command } => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(Some(authority)) => authority,
+                Ok(None) => return principal_proof_error(crate::cluster_principal::PrincipalProofError::Missing),
+                Err(error) => return authority_io_error(error),
+            };
+            match commit_delegated_authority(kernel, &authority, *command).await {
+                Ok(response @ AuthorityResponse::Rejected { .. }) => authority_command_error(response),
+                Ok(response) => SyscallReply::AuthorityCommandCommitted { response },
+                Err(error) => authority_io_error(error),
+            }
+        }
+        Syscall::GetAuthorityPrincipalRegistry => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(Some(authority)) => authority,
+                Ok(None) => return principal_proof_error(crate::cluster_principal::PrincipalProofError::Missing),
+                Err(error) => return authority_io_error(error),
+            };
+            match authority.linearizable_view().await {
+                Ok(view) => SyscallReply::AuthorityPrincipalRegistry { principals: view.principals.into_values().collect() },
+                Err(error) => authority_io_error(error),
+            }
+        }
         Syscall::IssueClusterJoinChallenge {
             operation_id,
             ttl_seconds,
@@ -7226,6 +7297,8 @@ impl SyscallServer {
                         && matches!(
                             &call,
                             Syscall::SendMessageStream { .. }
+                                | Syscall::SubmitSignedAuthorityCommand { .. }
+                                | Syscall::GetAuthorityPrincipalRegistry
                                 | Syscall::ListProviderModels { .. }
                                 | Syscall::SendMessageContent { .. }
                                 | Syscall::SendMessageContentStream { .. }
@@ -7586,7 +7659,11 @@ mod tests {
             reason: "destination verification regression".into(),
         };
         let mut view = crate::cluster_consensus::ReplicatedAuthorityView {
+            principals: crate::cluster_principal::fixture_registry(),
+            principal_audit: Vec::new(),
+            ownership_tenant_scopes: std::collections::BTreeMap::new(),
             genesis: crate::cluster_consensus::AuthorityGenesis {
+                operator_principals: vec![crate::cluster_principal::fixture_operator()],
                 cluster_id: cluster_id.clone(),
                 members: Vec::new(),
             },
@@ -11195,13 +11272,22 @@ memory = ["remember this"]
                 AccessLevel::System,
             ),
         ];
+        let unscoped_calls = unscoped_calls.into_iter().chain([
+            (Syscall::GetAuthorityPrincipalRegistry, AccessLevel::System),
+            (Syscall::SubmitSignedAuthorityCommand {
+                command: Box::new(crate::cluster_principal::fixture_signed(AuthorityCommand::IssueJoinChallenge {
+                    operation_id: uuid::Uuid::new_v4().to_string(), challenge_hex: "00".repeat(32), ttl_seconds: 5, proposed_at: chrono::Utc::now(),
+                }, crate::cluster_principal::FIXTURE_CLUSTER_ID)),
+            }, AccessLevel::User),
+        ]).collect::<Vec<_>>();
         for (call, expected) in &unscoped_calls {
+            let requires_live_principal = matches!(call, Syscall::SubmitSignedAuthorityCommand { .. });
             let (required, action, target) = syscall_policy(call);
             assert_eq!(required, *expected, "wrong access level for {action}");
             assert!(target.is_none(), "unexpected agent target for {action}");
             assert_eq!(
                 authorize(&kernel, Some(&admin), call).await.is_ok(),
-                *expected != AccessLevel::System,
+                *expected != AccessLevel::System && !requires_live_principal,
                 "unexpected admin classification for {action}"
             );
             assert_eq!(
@@ -11209,8 +11295,8 @@ memory = ["remember this"]
                 *expected == AccessLevel::ReadOnly,
                 "unexpected reader classification for {action}"
             );
-            assert!(
-                authorize(&kernel, None, call).await.is_ok(),
+            assert_eq!(
+                authorize(&kernel, None, call).await.is_ok(), !requires_live_principal,
                 "trusted-system path must remain explicit for {action}"
             );
         }
@@ -11245,7 +11331,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 131);
+        assert_eq!(calls.len(), 133);
         assert_eq!(fixture_tags, schema_tags);
     }
 

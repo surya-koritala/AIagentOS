@@ -44,6 +44,11 @@ use tokio::net::ToSocketAddrs;
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::auth::{ApiKeyDescriptor, IssuedApiKey, Role, Tenant, User};
 pub use kernel::cloning::CloneResult;
+pub use kernel::cluster_consensus::{AuthorityCommand, AuthorityResponse};
+pub use kernel::cluster_principal::{
+    sign_authority_principal, AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind,
+    AuthorityPrincipalProof, PrincipalProofError,
+};
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
     ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,
@@ -2401,6 +2406,29 @@ impl KernelClient {
         match self.call(Syscall::GetClusterMembership).await? {
             SyscallReply::ClusterMembership { membership } => Ok(membership),
             other => Err(unexpected("ClusterMembership", &other)),
+        }
+    }
+
+    /// Submit a caller-signed command. The caller retains its own private key;
+    /// this method never creates a proof from a transport/API credential.
+    pub async fn submit_signed_authority_command(&mut self, command: AuthorityCommand) -> Result<AuthorityResponse, SdkError> {
+        if !matches!(command, AuthorityCommand::Authorized { .. }) {
+            return Err(SdkError::Configuration(PrincipalProofError::Missing.to_string()));
+        }
+        let protocol = self.hello().await?;
+        if !protocol.features.iter().any(|feature| feature == "cluster_principal_auth") {
+            return Err(SdkError::Configuration("server does not support independent cluster principal proof".into()));
+        }
+        match self.call(Syscall::SubmitSignedAuthorityCommand { command: Box::new(command) }).await? {
+            SyscallReply::AuthorityCommandCommitted { response } => Ok(response),
+            other => Err(unexpected("AuthorityCommandCommitted", &other)),
+        }
+    }
+
+    pub async fn authority_principal_registry(&mut self) -> Result<Vec<AuthorityPrincipal>, SdkError> {
+        match self.call(Syscall::GetAuthorityPrincipalRegistry).await? {
+            SyscallReply::AuthorityPrincipalRegistry { principals } => Ok(principals),
+            other => Err(unexpected("AuthorityPrincipalRegistry", &other)),
         }
     }
 

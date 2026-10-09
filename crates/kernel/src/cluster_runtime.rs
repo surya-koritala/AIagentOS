@@ -77,6 +77,20 @@ const AUTHORITY_DELEGATION_VERSION: u16 = 1;
 const AUTHORITY_DELEGATION_TTL_SECONDS: i64 = 30;
 const AUTHORITY_DELEGATION_CLOCK_SKEW_SECONDS: i64 = 5;
 
+#[cfg(test)]
+struct InitializationAdmissionCut {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    used: std::sync::atomic::AtomicBool,
+    redirected: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+fn initialization_admission_cuts() -> &'static std::sync::Mutex<BTreeMap<String, Arc<InitializationAdmissionCut>>> {
+    static CUTS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Arc<InitializationAdmissionCut>>>> = std::sync::OnceLock::new();
+    CUTS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
 /// Short-lived, replay-bounded proof that the application node authenticated
 /// the system caller before submitting one external authority command.
 ///
@@ -2850,6 +2864,15 @@ impl ClusterRaftRuntime {
                     ));
                 }
                 submitted = true;
+                #[cfg(test)]
+                let cut = initialization_admission_cuts().lock().unwrap().get(&format!("{}:{}", self.authority_network.cluster_name, self.node_id)).cloned();
+                #[cfg(test)]
+                if let Some(cut) = cut {
+                    if !cut.used.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        cut.reached.notify_one();
+                        cut.release.notified().await;
+                    }
+                }
                 let response = self
                     .raft
                     .client_write(AuthorityCommand::Initialize {
@@ -2857,13 +2880,28 @@ impl ClusterRaftRuntime {
                         genesis: self.authority_genesis.clone(),
                         proposed_at: chrono::Utc::now(),
                     })
-                    .await
-                    .map_err(|error| {
-                        io::Error::new(
+                    .await;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) if error.forward_to_leader().is_some() => {
+                        #[cfg(test)]
+                        if let Some(cut) = initialization_admission_cuts().lock().unwrap().get(&format!("{}:{}", self.authority_network.cluster_name, self.node_id)) {
+                            cut.redirected.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        // The leadership hint may change between metrics and
+                        // admission. Resume the same immutable initialization
+                        // within its existing deadline; no second genesis exists.
+                        submitted = false;
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
                             format!("initialize replicated application authority: {error}"),
-                        )
-                    })?;
+                        ));
+                    }
+                };
                 match response.data {
                     AuthorityResponse::ControlPlaneInitialized { .. } => {}
                     AuthorityResponse::Rejected { message, .. } => {
@@ -5426,6 +5464,56 @@ mod tests {
                 .contains("reuses a durable trust generation"),
             "{transport_drift}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authority_initialization_resumes_same_genesis_after_real_leader_change() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let ca = test_ca();
+            let peers = (1..=3).map(|id| test_peer(&ca, id)).collect::<Vec<_>>();
+            let bound = listeners(3).await;
+            let members = member_map(&peers, &bound);
+            let cluster_name = format!("capacity-init-{}", uuid::Uuid::new_v4());
+            let configs = peers.iter().zip(&bound).map(|(peer, listener)| runtime_config(peer, listener, &members, &cluster_name)).collect::<Vec<_>>();
+            let root = TempDir::new().unwrap();
+            let contexts = (1..=3).map(|id| context(&root, id)).collect::<Vec<_>>();
+            let mut runtimes = Vec::new();
+            for ((config, listener), context) in configs.iter().cloned().zip(bound).zip(&contexts) {
+                runtimes.push(Some(ClusterRaftRuntime::start_on_listener(context.clone(), config, listener).await.unwrap()));
+            }
+            let (one, two, three) = tokio::join!(runtimes[0].as_ref().unwrap().ensure_configured_membership(true), runtimes[1].as_ref().unwrap().ensure_configured_membership(true), runtimes[2].as_ref().unwrap().ensure_configured_membership(true));
+            one.unwrap(); two.unwrap(); three.unwrap();
+            let prior_leader = wait_for_leader(&runtimes, None).await;
+            let prior_index = (prior_leader - 1) as usize;
+            let replacement_index = if prior_index == 0 { 1 } else { 0 };
+            let cut = Arc::new(InitializationAdmissionCut { reached: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(), used: std::sync::atomic::AtomicBool::new(false), redirected: std::sync::atomic::AtomicBool::new(false) });
+            let key = format!("{cluster_name}:{prior_leader}");
+            initialization_admission_cuts().lock().unwrap().insert(key.clone(), cut.clone());
+            let old = runtimes[prior_index].as_ref().unwrap();
+            let new = runtimes[replacement_index].as_ref().unwrap();
+            let (result, ()) = tokio::join!(old.ensure_authority_initialized(), async {
+                tokio::time::timeout(Duration::from_secs(5), cut.reached.notified()).await.unwrap();
+                new.raft.trigger().elect().await.unwrap();
+                let elected = wait_for_leader(&runtimes, Some(prior_leader)).await;
+                assert_ne!(elected, prior_leader);
+                cut.release.notify_one();
+                runtimes[(elected - 1) as usize].as_ref().unwrap().ensure_authority_initialized().await.unwrap();
+            });
+            result.unwrap();
+            assert!(cut.redirected.load(std::sync::atomic::Ordering::SeqCst), "the actual leadership change must reach the typed redirect continuation");
+            initialization_admission_cuts().lock().unwrap().remove(&key);
+            for runtime in runtimes.iter().flatten() { runtime.ensure_authority_initialized().await.unwrap(); }
+            for context in &contexts {
+                let view = read_initialized_authority_view(context).unwrap();
+                assert_eq!(view.genesis, configs[0].authority_genesis);
+                let connection = context.conn.lock().unwrap();
+                let encoded: Vec<u8> = connection.query_row("SELECT authority_state_json FROM cluster_raft_state WHERE singleton = 1", [], |row| row.get(0)).unwrap();
+                let state: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+                assert_eq!(state["receipts"].as_object().unwrap().len(), 1);
+            }
+            for runtime in runtimes.into_iter().flatten() { runtime.shutdown().await.unwrap(); }
+            drop(contexts); root.close().unwrap();
+        }).await.expect("real leader-change initialization remains bounded");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

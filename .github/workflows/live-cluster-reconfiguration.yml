@@ -70,7 +70,8 @@ jobs:
         run: cargo test -p kernel --lib --locked cluster_reconfiguration::tests -- --nocapture
       - name: Check actual four-node live membership and transport behavior
         timeout-minutes: 5
-        run: cargo test -p kernel --lib --locked live_reconfiguration:: -- --nocapture
+        run: |
+          cargo test -p kernel --lib --locked live_reconfiguration:: -- --nocapture
       - name: Preserve generated protocol fixtures and principal storage fences
         timeout-minutes: 5
         run: |

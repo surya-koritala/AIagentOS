@@ -57,7 +57,7 @@ pub use kernel::cluster_principal::{
     AuthorityPrincipalProof, PrincipalProofError,
 };
 pub use kernel::cluster_reconfiguration::{
-    ClusterReconfigurationPlan, ClusterReconfigurationStatus, ClusterReconfigurationTarget,
+    ClusterReconfigurationObservation, ClusterReconfigurationPlan, ClusterReconfigurationStatus, ClusterReconfigurationTarget,
 };
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};

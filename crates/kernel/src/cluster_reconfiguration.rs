@@ -21,6 +21,7 @@ pub(crate) const MAX_RECONFIGURATION_PLAN_BYTES: usize = 512 * 1024;
 pub(crate) struct CommittedReconfigurationProjection {
     pub membership: StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
     pub plan: Option<ClusterReconfigurationPlan>,
+    pub applied_frontier: Option<openraft::LogId<ClusterRaftNodeId>>,
 }
 
 pub(crate) type ReconfigurationProjectionPublisher =
@@ -140,7 +141,15 @@ pub struct ClusterReconfigurationStatus {
     pub target: Option<ClusterReconfigurationTarget>,
     pub operation_id: Option<String>,
     pub settled: bool,
+    /// True only after a fresh quorum barrier, never for a local observation.
+    pub quorum_verified: bool,
+    pub observation: ClusterReconfigurationObservation,
+    pub applied_frontier: Option<openraft::LogId<ClusterRaftNodeId>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterReconfigurationObservation { LocalApplied, QuorumVerified }
 
 impl ClusterReconfigurationTarget {
     pub(crate) fn from_membership(
@@ -363,6 +372,9 @@ mod tests {
                 target: None,
                 operation_id: None,
                 settled: true,
+                quorum_verified: false,
+                observation: ClusterReconfigurationObservation::LocalApplied,
+                applied_frontier: None,
             },
         };
         let bytes = serde_json::to_vec(&reply).unwrap();
@@ -449,5 +461,8 @@ pub(crate) fn status(
         target: plan.map(|plan| plan.target.clone()),
         operation_id: plan.map(|plan| plan.operation_id.clone()),
         settled,
+        quorum_verified: false,
+        observation: ClusterReconfigurationObservation::LocalApplied,
+        applied_frontier: None,
     })
 }

@@ -2227,10 +2227,25 @@ impl ClusterAuthorityHandle {
     pub async fn reconfiguration_status(
         &self,
     ) -> io::Result<crate::cluster_reconfiguration::ClusterReconfigurationStatus> {
-        self.linearizable_view().await?;
-        let (membership, plan) =
-            crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
-        crate::cluster_reconfiguration::status(&membership, plan.as_ref())
+        let has_eligible_leader = {
+            let metrics = self.raft.metrics().borrow().clone();
+            metrics.current_leader.is_some_and(|leader| metrics.membership_config.voter_ids().any(|id| id == leader))
+        };
+        let quorum_verified = if has_eligible_leader {
+            match self.linearizable_view().await {
+                Ok(_) => true,
+                Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionAborted) => false,
+                Err(error) => return Err(error),
+            }
+        } else { false };
+        crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
+        let projection = { self.context.cluster_reconfiguration_projection.borrow().clone() }
+            .ok_or_else(|| invalid_data("committed reconfiguration projection is unavailable"))?;
+        let mut status = crate::cluster_reconfiguration::status(&projection.membership, projection.plan.as_ref())?;
+        status.quorum_verified = quorum_verified;
+        status.applied_frontier = projection.applied_frontier;
+        status.observation = if quorum_verified { crate::cluster_reconfiguration::ClusterReconfigurationObservation::QuorumVerified } else { crate::cluster_reconfiguration::ClusterReconfigurationObservation::LocalApplied };
+        Ok(status)
     }
 
     fn validate_live_proposal(&self, command: &AuthorityCommand) -> io::Result<()> {

@@ -663,12 +663,14 @@ fn publish_reconfiguration_projection(context: &SqliteContextManager, state: &Pe
         crate::cluster_reconfiguration::CommittedReconfigurationProjection {
             membership: state.membership.clone(),
             plan,
+            applied_frontier: state.last_applied,
         },
     );
     context
         .cluster_reconfiguration_projection
         .send_if_modified(|current| {
-            if current.as_deref() == Some(projection.as_ref()) {
+            if current.as_deref().is_some_and(|old| old.membership == projection.membership && old.plan == projection.plan) {
+                *current = Some(projection);
                 return false;
             }
             *current = Some(projection);
@@ -2406,6 +2408,7 @@ impl RaftLogStorage<ClusterRaftTypeConfig> for ClusterRaftLogStore {
     }
 }
 
+#[cfg(test)]
 fn apply_authority_command(
     state: &mut AuthorityState,
     command: AuthorityCommand,

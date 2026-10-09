@@ -102,12 +102,20 @@ authority are checked before durable receipt replay; node keys or the API token
 cannot manufacture operator authority.
 
 A successful mutation reply is a **prepared target**, not proof of convergence.
-Poll `cluster_reconfiguration_status()` until `settled` is true and the current
-catalog/voters equal the proposed target. The elected running leader consumes
+Poll `cluster_reconfiguration_status()` until `settled` and `quorum_verified`
+are true and the current catalog/voters equal the exact proposed UUID/generations
+and digest. `observation = local_applied` exposes the local durable applied
+frontier and transition while no eligible leader/quorum is available; local
+settlement alone is not a fresh authoritative result. A successful current
+barrier yields `observation = quorum_verified`. Different nodes may temporarily
+report different applied frontiers during learner catch-up and handoff. The elected running leader consumes
 the same durable intent, learner catch-up, and joint-consensus path used at
 startup. Followers use the locally applied authorized catalog for inbound and
 outbound peer checks; cached OpenRaft clients refresh it before each connection.
-A removed voter remains a replicated learner. Trust replacement preserves every
+Voter completion first retires removed nodes from the uniform voting membership
+so a retained former leader cannot suppress a new eligible election. The new
+leader catches up and reinstalls those exact prepared catalog entries as learners
+before the full target is settled. Trust replacement preserves every
 current voter and its identity. Concurrent voter/trust proposals fail closed while
 an earlier target remains unresolved. Replaying a completed UUID returns its
 historical prepared record and does not restore that target.

@@ -3,6 +3,16 @@ name: Signed quorum capacity preflight
 on:
   push:
     branches: [codex/signed-node-capacity]
+  pull_request:
+    paths:
+      - 'crates/kernel/src/cluster*.rs'
+      - 'crates/kernel/src/runtime.rs'
+      - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/wire_contract.rs'
+      - 'crates/sdk/**'
+      - 'protocol/**'
+      - '.github/workflows/signed-node-capacity.yml'
   workflow_dispatch:
 
 permissions:
@@ -40,7 +50,10 @@ jobs:
   compile:
     needs: formatting
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     env:
       CARGO_INCREMENTAL: 0
       RUST_BACKTRACE: 1
@@ -49,22 +62,91 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: 1.97.1
+          components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           save-if: false
       - name: Compile all public consumers before native qualification
-        run: cargo check -p kernel -p agent-sdk -p agent-cli -p agent-tui --all-targets --locked
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > capacity-source.txt
+          cargo clippy -p kernel -p agent-sdk -p agent-cli -p agent-tui --all-targets --locked -- -D warnings 2>&1 | tee capacity-clippy.log
       - name: Verify exact node-origin and freshness fences
         run: |
-          cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture
-          cargo test -p kernel --lib --locked signed_capacity_projection_is_bounded -- --nocapture
-          cargo test -p kernel --lib --locked capacity_churn_reclaims_only_retired_epochs -- --nocapture
+          set -o pipefail
+          cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture 2>&1 | tee capacity-origin.log
+          cargo test -p kernel --lib --locked signed_capacity_projection_is_bounded -- --nocapture 2>&1 | tee capacity-projection.log
+          cargo test -p kernel --lib --locked capacity_churn_reclaims_only_retired_epochs -- --nocapture 2>&1 | tee capacity-churn.log
       - name: Exercise actual SDK compatibility and quorum placement
         run: |
-          cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture
-          cargo test -p agent-sdk --test quorum_capacity --locked -- --nocapture
-          cargo test -p agent-sdk --test cluster --locked -- --nocapture
+          set -o pipefail
+          cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture 2>&1 | tee capacity-compatibility.log
+          cargo test -p agent-sdk --test quorum_capacity --locked -- --nocapture 2>&1 | tee capacity-public-quorum.log
+          cargo test -p agent-sdk --test cluster --locked -- --nocapture 2>&1 | tee capacity-cluster-sdk.log
       - name: Reject old readers before signed capacity replay state can be lost
-        run: cargo test -p kernel --lib --locked capacity_cursor_requires_current_reader -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p kernel --lib --locked capacity_cursor_requires_current_reader -- --nocapture 2>&1 | tee capacity-reader.log
       - name: Preserve public wire contracts
-        run: cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture 2>&1 | tee capacity-wire.log
+          python3 -m unittest discover -s scripts/tests -p test_verify_wire_fixtures.py 2>&1 | tee capacity-wire-python.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: capacity-native-linux-${{ github.run_id }}
+          path: |
+            capacity-source.txt
+            capacity-*.log
+          retention-days: 30
+
+  native:
+    needs: compile
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Strict native public consumer lint
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > capacity-source.txt
+          cargo clippy -p kernel -p agent-sdk -p agent-cli -p agent-tui --all-targets --locked -- -D warnings 2>&1 | tee capacity-clippy.log
+      - name: Native origin, replay, epochs, snapshot and churn
+        run: |
+          set -o pipefail
+          cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture 2>&1 | tee capacity-origin.log
+          cargo test -p kernel --lib --locked signed_capacity_projection_is_bounded -- --nocapture 2>&1 | tee capacity-projection.log
+          cargo test -p kernel --lib --locked capacity_churn_reclaims_only_retired_epochs -- --nocapture 2>&1 | tee capacity-churn.log
+      - name: Actual native public SDK and managed ownership proof
+        run: |
+          set -o pipefail
+          cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture 2>&1 | tee capacity-compatibility.log
+          cargo test -p agent-sdk --test quorum_capacity --locked -- --nocapture 2>&1 | tee capacity-public-quorum.log
+          cargo test -p agent-sdk --test cluster --locked -- --nocapture 2>&1 | tee capacity-cluster-sdk.log
+          cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture 2>&1 | tee capacity-wire.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: capacity-native-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            capacity-source.txt
+            capacity-*.log
+          retention-days: 30

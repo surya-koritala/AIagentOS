@@ -105,14 +105,23 @@ fn write_cluster_config(
         cluster_raft: ClusterRaftConfig {
             enabled: true,
             authority_genesis_principals: {
-                let operator = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("generate ephemeral operator public key");
+                let operator = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+                    .expect("generate ephemeral operator public key");
                 vec![kernel::cluster_principal::AuthorityPrincipal {
                     principal_id: "00000000-0000-0000-0000-000000000900".into(),
-                    public_key: operator.public_key_raw().iter().map(|byte| format!("{byte:02x}")).collect(),
+                    public_key: operator
+                        .public_key_raw()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
                     kind: kernel::cluster_principal::AuthorityPrincipalKind::Operator,
                     tenant_id: None,
-                    allowed_command_classes: std::collections::BTreeSet::from([kernel::cluster_principal::AuthorityCommandClass::PrincipalAdmin]),
-                    generation: 1, revoked: false, expires_at: None,
+                    allowed_command_classes: std::collections::BTreeSet::from([
+                        kernel::cluster_principal::AuthorityCommandClass::PrincipalAdmin,
+                    ]),
+                    generation: 1,
+                    revoked: false,
+                    expires_at: None,
                 }]
             },
             bootstrap: true,

@@ -49,15 +49,15 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::cluster_consensus::open_cluster_raft_storage;
 use crate::cluster_consensus::{
-    read_cluster_raft_membership, read_replicated_authority_view,
-    AuthorityCommand, AuthorityGenesis, AuthorityGenesisMember, AuthorityResponse, ClusterRaftNode,
+    read_cluster_raft_membership, read_replicated_authority_view, AuthorityCommand,
+    AuthorityGenesis, AuthorityGenesisMember, AuthorityResponse, ClusterRaftNode,
     ClusterRaftNodeId, ClusterRaftTypeConfig, ReplicatedAuthorityView,
 };
 use crate::config::ClusterRaftConfig;
 use crate::context::SqliteContextManager;
-#[cfg(test)]
-use crate::cluster_consensus::open_cluster_raft_storage;
 
 const CLUSTER_RAFT_WIRE_VERSION: u16 = 3;
 const MIN_FRAME_BYTES: usize = 64 * 1024;
@@ -1270,8 +1270,14 @@ fn configured_voter_set_sha256(generation: u64, voters: &BTreeSet<ClusterRaftNod
 
 fn validate_authority_genesis(genesis: &AuthorityGenesis) -> io::Result<()> {
     crate::cluster_principal::genesis_principal_registry(
-        &genesis.operator_principals, genesis.members.iter().map(|member| member.public_key.clone()), true,
-    ).map_err(invalid_input)?;
+        &genesis.operator_principals,
+        genesis
+            .members
+            .iter()
+            .map(|member| member.public_key.clone()),
+        true,
+    )
+    .map_err(invalid_input)?;
     let cluster_id = uuid::Uuid::parse_str(&genesis.cluster_id)
         .map_err(|_| invalid_input("authority genesis cluster id must be a UUID"))?;
     if cluster_id.to_string() != genesis.cluster_id {
@@ -1960,8 +1966,12 @@ impl ClusterAuthorityHandle {
             &view,
             chrono::Utc::now(),
         )?;
-        crate::cluster_principal::verify_authority_principal_view(&command, &view, chrono::Utc::now())
-            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        crate::cluster_principal::verify_authority_principal_view(
+            &command,
+            &view,
+            chrono::Utc::now(),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
         normalize_forwarded_authority_command(&mut command)?;
         match self.raft.client_write(command.clone()).await {
             Ok(response) => Ok(response.data),
@@ -1987,7 +1997,9 @@ impl ClusterAuthorityHandle {
                             ),
                         )),
                     },
-                    RpcResponse::AuthorityPrincipalRejected(error) => Err(io::Error::new(io::ErrorKind::PermissionDenied, error)),
+                    RpcResponse::AuthorityPrincipalRejected(error) => {
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, error))
+                    }
                     _ => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "replicated authority forwarding returned the wrong response type",
@@ -2256,7 +2268,11 @@ impl ClusterRaftRuntime {
         let authority_network = network.clone();
         let authority_forward_timeout = config.transport.inbound_request_timeout;
         let (log_store, state_machine) =
-            crate::cluster_consensus::open_cluster_raft_storage_pinned(context.clone(), &config.authority_genesis).map_err(|error| {
+            crate::cluster_consensus::open_cluster_raft_storage_pinned(
+                context.clone(),
+                &config.authority_genesis,
+            )
+            .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("open durable Raft storage: {error}"),
@@ -3310,7 +3326,11 @@ async fn handle_connection(
                 &view,
                 chrono::Utc::now(),
             )?;
-            match crate::cluster_principal::verify_authority_principal_view(&command, &view, chrono::Utc::now()) {
+            match crate::cluster_principal::verify_authority_principal_view(
+                &command,
+                &view,
+                chrono::Utc::now(),
+            ) {
                 Err(error) => RpcResponse::AuthorityPrincipalRejected(error),
                 Ok(_) => {
                     normalize_forwarded_authority_command(&mut command)?;
@@ -3355,8 +3375,14 @@ async fn handle_connection(
 
 fn normalize_forwarded_authority_command(command: &mut AuthorityCommand) -> io::Result<()> {
     let command = match command {
-        AuthorityCommand::Authorized { command, .. } if !matches!(command.as_ref(), AuthorityCommand::Authorized { .. }) => command.as_mut(),
-        AuthorityCommand::Authorized { .. } => return Err(invalid_data("nested principal envelope is invalid")),
+        AuthorityCommand::Authorized { command, .. }
+            if !matches!(command.as_ref(), AuthorityCommand::Authorized { .. }) =>
+        {
+            command.as_mut()
+        }
+        AuthorityCommand::Authorized { .. } => {
+            return Err(invalid_data("nested principal envelope is invalid"))
+        }
         command => command,
     };
     let proposed_at = match command {
@@ -5337,36 +5363,99 @@ mod tests {
 
         // Principal enrollment and revocation share the actual three-node
         // majority and follower path, not a node-local authorization cache.
-        let principal_document = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("generate independent fixture principal");
-        let principal_pair = ring::signature::Ed25519KeyPair::from_pkcs8(principal_document.as_ref()).expect("parse fixture principal");
+        let principal_document =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .expect("generate independent fixture principal");
+        let principal_pair =
+            ring::signature::Ed25519KeyPair::from_pkcs8(principal_document.as_ref())
+                .expect("parse fixture principal");
         let mut enrolled = crate::cluster_principal::fixture_operator();
         enrolled.principal_id = Uuid::new_v4().to_string();
-        enrolled.public_key = crate::cluster_control::hex_encode(principal_pair.public_key().as_ref());
-        enrolled.allowed_command_classes = BTreeSet::from([crate::cluster_principal::AuthorityCommandClass::Ownership]);
+        enrolled.public_key =
+            crate::cluster_control::hex_encode(principal_pair.public_key().as_ref());
+        enrolled.allowed_command_classes =
+            BTreeSet::from([crate::cluster_principal::AuthorityCommandClass::Ownership]);
         let enrollment_source = (first_leader_index + 1) % 3;
-        let enroll = crate::cluster_principal::fixture_signed(AuthorityCommand::EnrollPrincipal {
-            operation_id: Uuid::new_v4().to_string(), principal: enrolled.clone(), expected_generation: None,
-            actor: authority_system_actor(&peers[enrollment_source].application_node_id), reason: "quorum principal enrollment fixture".into(), proposed_at: chrono::Utc::now(),
-        }, crate::cluster_principal::FIXTURE_CLUSTER_ID);
+        let enroll = crate::cluster_principal::fixture_signed(
+            AuthorityCommand::EnrollPrincipal {
+                operation_id: Uuid::new_v4().to_string(),
+                principal: enrolled.clone(),
+                expected_generation: None,
+                actor: authority_system_actor(&peers[enrollment_source].application_node_id),
+                reason: "quorum principal enrollment fixture".into(),
+                proposed_at: chrono::Utc::now(),
+            },
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
         let enrollment_delegation = test_authority_delegation(&peers[enrollment_source], &enroll);
-        let response = runtimes[enrollment_source].as_ref().unwrap().authority_handle().commit(enroll, enrollment_delegation).await.expect("majority commit principal enrollment");
-        let AuthorityResponse::PrincipalUpdated { log_id: enrollment_log, .. } = response else { panic!("principal enrollment did not commit") };
+        let response = runtimes[enrollment_source]
+            .as_ref()
+            .unwrap()
+            .authority_handle()
+            .commit(enroll, enrollment_delegation)
+            .await
+            .expect("majority commit principal enrollment");
+        let AuthorityResponse::PrincipalUpdated {
+            log_id: enrollment_log,
+            ..
+        } = response
+        else {
+            panic!("principal enrollment did not commit")
+        };
         wait_for_applied(&runtimes, enrollment_log.index, 3).await;
         for context in &contexts {
-            assert_eq!(read_initialized_authority_view(context).unwrap().principals.get(&enrolled.principal_id), Some(&enrolled));
+            assert_eq!(
+                read_initialized_authority_view(context)
+                    .unwrap()
+                    .principals
+                    .get(&enrolled.principal_id),
+                Some(&enrolled)
+            );
         }
-        let captured = crate::cluster_principal::sign_authority_principal(AuthorityCommand::ClaimOwnership {
-            operation_id: Uuid::new_v4().to_string(), agent_id: Uuid::new_v4().to_string(), owner_node_id: peers[enrollment_source].application_node_id.clone(),
-            ttl_seconds: 60, expected_fencing_token: None, actor: authority_system_actor(&peers[enrollment_source].application_node_id),
-            reason: "captured pre-revocation proof fixture".into(), proposed_at: chrono::Utc::now(),
-        }, crate::cluster_principal::FIXTURE_CLUSTER_ID, &enrolled.principal_id, 1, chrono::Utc::now(), |payload| Ok(principal_pair.sign(payload).as_ref().to_vec())).unwrap();
-        let revoke = crate::cluster_principal::fixture_signed(AuthorityCommand::RevokePrincipal {
-            operation_id: Uuid::new_v4().to_string(), principal_id: enrolled.principal_id.clone(), expected_generation: 1,
-            actor: authority_system_actor(&peers[enrollment_source].application_node_id), reason: "quorum principal revocation fixture".into(), proposed_at: chrono::Utc::now(),
-        }, crate::cluster_principal::FIXTURE_CLUSTER_ID);
+        let captured = crate::cluster_principal::sign_authority_principal(
+            AuthorityCommand::ClaimOwnership {
+                operation_id: Uuid::new_v4().to_string(),
+                agent_id: Uuid::new_v4().to_string(),
+                owner_node_id: peers[enrollment_source].application_node_id.clone(),
+                ttl_seconds: 60,
+                expected_fencing_token: None,
+                actor: authority_system_actor(&peers[enrollment_source].application_node_id),
+                reason: "captured pre-revocation proof fixture".into(),
+                proposed_at: chrono::Utc::now(),
+            },
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+            &enrolled.principal_id,
+            1,
+            chrono::Utc::now(),
+            |payload| Ok(principal_pair.sign(payload).as_ref().to_vec()),
+        )
+        .unwrap();
+        let revoke = crate::cluster_principal::fixture_signed(
+            AuthorityCommand::RevokePrincipal {
+                operation_id: Uuid::new_v4().to_string(),
+                principal_id: enrolled.principal_id.clone(),
+                expected_generation: 1,
+                actor: authority_system_actor(&peers[enrollment_source].application_node_id),
+                reason: "quorum principal revocation fixture".into(),
+                proposed_at: chrono::Utc::now(),
+            },
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
         let revocation_delegation = test_authority_delegation(&peers[enrollment_source], &revoke);
-        let response = runtimes[enrollment_source].as_ref().unwrap().authority_handle().commit(revoke, revocation_delegation).await.expect("majority commit principal revocation");
-        let AuthorityResponse::PrincipalUpdated { log_id: revocation_log, .. } = response else { panic!("principal revocation did not commit") };
+        let response = runtimes[enrollment_source]
+            .as_ref()
+            .unwrap()
+            .authority_handle()
+            .commit(revoke, revocation_delegation)
+            .await
+            .expect("majority commit principal revocation");
+        let AuthorityResponse::PrincipalUpdated {
+            log_id: revocation_log,
+            ..
+        } = response
+        else {
+            panic!("principal revocation did not commit")
+        };
         wait_for_applied(&runtimes, revocation_log.index, 3).await;
         for context in &contexts {
             let view = read_initialized_authority_view(context).unwrap();
@@ -5376,11 +5465,37 @@ mod tests {
         // Bypass only the origin's redundant check to exercise the actual
         // leader RPC boundary with still-valid machine transport/delegation.
         let captured_delegation = test_authority_delegation(&peers[enrollment_source], &captured);
-        let mut factory = runtimes[enrollment_source].as_ref().unwrap().authority_handle().network.clone();
-        let client = factory.new_client(first_leader, members.get(&first_leader).unwrap()).await;
-        let rejection = client.call(RpcRequest::AuthorityWrite(Box::new(DelegatedAuthorityWrite { command: captured, delegation: captured_delegation })), RPCOption::new(Duration::from_secs(5))).await.expect("receive distinct leader principal rejection");
-        assert!(matches!(rejection, RpcResponse::AuthorityPrincipalRejected(crate::cluster_principal::PrincipalProofError::Revoked)));
-        assert!(read_initialized_authority_view(&contexts[first_leader_index]).unwrap().ownerships.is_empty());
+        let mut factory = runtimes[enrollment_source]
+            .as_ref()
+            .unwrap()
+            .authority_handle()
+            .network
+            .clone();
+        let client = factory
+            .new_client(first_leader, members.get(&first_leader).unwrap())
+            .await;
+        let rejection = client
+            .call(
+                RpcRequest::AuthorityWrite(Box::new(DelegatedAuthorityWrite {
+                    command: captured,
+                    delegation: captured_delegation,
+                })),
+                RPCOption::new(Duration::from_secs(5)),
+            )
+            .await
+            .expect("receive distinct leader principal rejection");
+        assert!(matches!(
+            rejection,
+            RpcResponse::AuthorityPrincipalRejected(
+                crate::cluster_principal::PrincipalProofError::Revoked
+            )
+        ));
+        assert!(
+            read_initialized_authority_view(&contexts[first_leader_index])
+                .unwrap()
+                .ownerships
+                .is_empty()
+        );
 
         runtimes[first_leader_index]
             .take()
@@ -5416,7 +5531,10 @@ mod tests {
             reason: "prove failover ownership".into(),
             proposed_at: chrono::Utc::now(),
         };
-        let second_command = crate::cluster_principal::fixture_signed(second_command, crate::cluster_principal::FIXTURE_CLUSTER_ID);
+        let second_command = crate::cluster_principal::fixture_signed(
+            second_command,
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
         let second_delegation =
             test_authority_delegation(&peers[forwarding_index], &second_command);
         let second_write = runtimes[forwarding_index]
@@ -5469,7 +5587,10 @@ mod tests {
             ttl_seconds: 60,
             proposed_at: chrono::Utc::now(),
         };
-        let challenge_command = crate::cluster_principal::fixture_signed(challenge_command, crate::cluster_principal::FIXTURE_CLUSTER_ID);
+        let challenge_command = crate::cluster_principal::fixture_signed(
+            challenge_command,
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
         let challenge_delegation =
             test_authority_delegation(&peers[forwarding_index], &challenge_command);
         let challenge_response = rollout_handle
@@ -5520,7 +5641,10 @@ mod tests {
             reason: "prove rollout survives failover".into(),
             proposed_at: chrono::Utc::now(),
         };
-        let prepare_command = crate::cluster_principal::fixture_signed(prepare_command, crate::cluster_principal::FIXTURE_CLUSTER_ID);
+        let prepare_command = crate::cluster_principal::fixture_signed(
+            prepare_command,
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
         let prepare_delegation =
             test_authority_delegation(&peers[forwarding_index], &prepare_command);
         let prepared_response = rollout_handle
@@ -5634,7 +5758,10 @@ mod tests {
             reason: "must not abort rollout without quorum".into(),
             proposed_at: chrono::Utc::now(),
         };
-        let abort_command = crate::cluster_principal::fixture_signed(abort_command, crate::cluster_principal::FIXTURE_CLUSTER_ID);
+        let abort_command = crate::cluster_principal::fixture_signed(
+            abort_command,
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
         let abort_delegation =
             test_authority_delegation(&peers[isolated_leader_index], &abort_command);
         let no_quorum = tokio::time::timeout(

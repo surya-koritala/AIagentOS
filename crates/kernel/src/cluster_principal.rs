@@ -73,19 +73,29 @@ pub(crate) fn genesis_principal_registry(
     node_public_keys: impl Iterator<Item = String>,
     required: bool,
 ) -> Result<BTreeMap<String, AuthorityPrincipal>, PrincipalProofError> {
-    if seeds.len() > 31 || (required && seeds.is_empty()) { return Err(PrincipalProofError::InvalidPrincipal); }
+    if seeds.len() > 31 || (required && seeds.is_empty()) {
+        return Err(PrincipalProofError::InvalidPrincipal);
+    }
     let node_keys: BTreeSet<_> = node_public_keys.collect();
     let mut principals = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for seed in seeds {
         seed.validate()?;
-        if seed.kind != AuthorityPrincipalKind::Operator || seed.generation != 1 || seed.revoked
+        if seed.kind != AuthorityPrincipalKind::Operator
+            || seed.generation != 1
+            || seed.revoked
             || seed.expires_at.is_some()
-            || !seed.allowed_command_classes.contains(&AuthorityCommandClass::PrincipalAdmin)
+            || !seed
+                .allowed_command_classes
+                .contains(&AuthorityCommandClass::PrincipalAdmin)
             || node_keys.contains(&seed.public_key)
             || !keys.insert(seed.public_key.clone())
-            || principals.insert(seed.principal_id.clone(), seed.clone()).is_some()
-        { return Err(PrincipalProofError::InvalidPrincipal); }
+            || principals
+                .insert(seed.principal_id.clone(), seed.clone())
+                .is_some()
+        {
+            return Err(PrincipalProofError::InvalidPrincipal);
+        }
     }
     Ok(principals)
 }
@@ -139,11 +149,15 @@ fn canonical_uuid(value: &str) -> bool {
 
 fn canonical_hex(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Remove exactly one authorization envelope. Nested envelopes fail closed.
-pub fn unsigned_authority_command(command: &AuthorityCommand) -> Result<&AuthorityCommand, PrincipalProofError> {
+pub fn unsigned_authority_command(
+    command: &AuthorityCommand,
+) -> Result<&AuthorityCommand, PrincipalProofError> {
     match command {
         AuthorityCommand::Authorized { command, .. } => {
             if matches!(command.as_ref(), AuthorityCommand::Authorized { .. }) {
@@ -156,7 +170,9 @@ pub fn unsigned_authority_command(command: &AuthorityCommand) -> Result<&Authori
     }
 }
 
-pub fn authority_command_class(command: &AuthorityCommand) -> Result<AuthorityCommandClass, PrincipalProofError> {
+pub fn authority_command_class(
+    command: &AuthorityCommand,
+) -> Result<AuthorityCommandClass, PrincipalProofError> {
     match unsigned_authority_command(command)? {
         AuthorityCommand::IssueJoinChallenge { .. }
         | AuthorityCommand::RegisterMember { .. }
@@ -167,8 +183,9 @@ pub fn authority_command_class(command: &AuthorityCommand) -> Result<AuthorityCo
         AuthorityCommand::ClaimOwnership { .. }
         | AuthorityCommand::RenewOwnership { .. }
         | AuthorityCommand::ReleaseOwnership { .. } => Ok(AuthorityCommandClass::Ownership),
-        AuthorityCommand::EnrollPrincipal { .. }
-        | AuthorityCommand::RevokePrincipal { .. } => Ok(AuthorityCommandClass::PrincipalAdmin),
+        AuthorityCommand::EnrollPrincipal { .. } | AuthorityCommand::RevokePrincipal { .. } => {
+            Ok(AuthorityCommandClass::PrincipalAdmin)
+        }
         AuthorityCommand::Initialize { .. }
         | AuthorityCommand::Barrier { .. }
         | AuthorityCommand::AdvanceTime { .. }
@@ -178,10 +195,13 @@ pub fn authority_command_class(command: &AuthorityCommand) -> Result<AuthorityCo
 
 /// The same semantic digest used by node delegation and durable retry receipts.
 /// Only the leader-controlled clock and authenticated envelope are excluded.
-pub fn authority_command_semantic_sha256(command: &AuthorityCommand) -> Result<String, PrincipalProofError> {
+pub fn authority_command_semantic_sha256(
+    command: &AuthorityCommand,
+) -> Result<String, PrincipalProofError> {
     let mut value = serde_json::to_value(unsigned_authority_command(command)?)
         .map_err(|_| PrincipalProofError::InvalidProof)?;
-    let fields = value.as_object_mut()
+    let fields = value
+        .as_object_mut()
         .and_then(|outer| outer.values_mut().next())
         .and_then(serde_json::Value::as_object_mut)
         .ok_or(PrincipalProofError::InvalidProof)?;
@@ -200,7 +220,12 @@ fn append_field(payload: &mut Vec<u8>, value: &str) -> Result<(), PrincipalProof
 fn proof_payload(proof: &AuthorityPrincipalProof) -> Result<Vec<u8>, PrincipalProofError> {
     let mut payload = b"AIagentOS independent authority principal v1".to_vec();
     payload.extend_from_slice(&proof.version.to_be_bytes());
-    for value in [&proof.cluster_id, &proof.principal_id, &proof.operation_id, &proof.command_sha256] {
+    for value in [
+        &proof.cluster_id,
+        &proof.principal_id,
+        &proof.operation_id,
+        &proof.command_sha256,
+    ] {
         append_field(&mut payload, value)?;
     }
     payload.extend_from_slice(&proof.principal_generation.to_be_bytes());
@@ -236,14 +261,20 @@ pub fn sign_authority_principal(
         operation_id: command.operation_id().into(),
         command_sha256: authority_command_semantic_sha256(&command)?,
         issued_at: now,
-        expires_at: now.checked_add_signed(chrono::Duration::seconds(PRINCIPAL_PROOF_TTL_SECONDS))
+        expires_at: now
+            .checked_add_signed(chrono::Duration::seconds(PRINCIPAL_PROOF_TTL_SECONDS))
             .ok_or(PrincipalProofError::InvalidProof)?,
         signature_hex: String::new(),
     };
     let signature = sign(&proof_payload(&proof)?)?;
-    if signature.len() != 64 { return Err(PrincipalProofError::InvalidSignature); }
+    if signature.len() != 64 {
+        return Err(PrincipalProofError::InvalidSignature);
+    }
     proof.signature_hex = crate::cluster_control::hex_encode(&signature);
-    Ok(AuthorityCommand::Authorized { command: Box::new(command), principal_proof: proof })
+    Ok(AuthorityCommand::Authorized {
+        command: Box::new(command),
+        principal_proof: proof,
+    })
 }
 
 /// Verify current replicated authorization before either new writes or replay.
@@ -253,7 +284,11 @@ pub fn verify_authority_principal<'a>(
     principals: &'a BTreeMap<String, AuthorityPrincipal>,
     now: DateTime<Utc>,
 ) -> Result<&'a AuthorityPrincipal, PrincipalProofError> {
-    let AuthorityCommand::Authorized { principal_proof: proof, .. } = command else {
+    let AuthorityCommand::Authorized {
+        principal_proof: proof,
+        ..
+    } = command
+    else {
         return Err(PrincipalProofError::Missing);
     };
     let inner = unsigned_authority_command(command)?;
@@ -264,26 +299,55 @@ pub fn verify_authority_principal<'a>(
         || proof.operation_id != inner.operation_id()
         || !canonical_uuid(&proof.operation_id)
         || !canonical_hex(&proof.command_sha256, 32)
-    { return Err(PrincipalProofError::InvalidProof); }
-    let principal = principals.get(&proof.principal_id).ok_or(PrincipalProofError::Unknown)?;
+    {
+        return Err(PrincipalProofError::InvalidProof);
+    }
+    let principal = principals
+        .get(&proof.principal_id)
+        .ok_or(PrincipalProofError::Unknown)?;
     principal.validate()?;
-    if principal.revoked { return Err(PrincipalProofError::Revoked); }
-    if proof.principal_generation != principal.generation { return Err(PrincipalProofError::WrongGeneration); }
+    if principal.revoked {
+        return Err(PrincipalProofError::Revoked);
+    }
+    if proof.principal_generation != principal.generation {
+        return Err(PrincipalProofError::WrongGeneration);
+    }
     if principal.expires_at.is_some_and(|expiry| expiry <= now)
         || proof.expires_at <= now
         || proof.expires_at <= proof.issued_at
-        || proof.issued_at > now.checked_add_signed(chrono::Duration::seconds(PRINCIPAL_PROOF_CLOCK_SKEW_SECONDS)).ok_or(PrincipalProofError::InvalidProof)?
-        || proof.expires_at > proof.issued_at.checked_add_signed(chrono::Duration::seconds(PRINCIPAL_PROOF_TTL_SECONDS)).ok_or(PrincipalProofError::InvalidProof)?
-    { return Err(PrincipalProofError::Expired); }
-    if !principal.allowed_command_classes.contains(&authority_command_class(inner)?) {
+        || proof.issued_at
+            > now
+                .checked_add_signed(chrono::Duration::seconds(
+                    PRINCIPAL_PROOF_CLOCK_SKEW_SECONDS,
+                ))
+                .ok_or(PrincipalProofError::InvalidProof)?
+        || proof.expires_at
+            > proof
+                .issued_at
+                .checked_add_signed(chrono::Duration::seconds(PRINCIPAL_PROOF_TTL_SECONDS))
+                .ok_or(PrincipalProofError::InvalidProof)?
+    {
+        return Err(PrincipalProofError::Expired);
+    }
+    if !principal
+        .allowed_command_classes
+        .contains(&authority_command_class(inner)?)
+    {
         return Err(PrincipalProofError::WrongCommandClass);
     }
     if proof.command_sha256 != authority_command_semantic_sha256(inner)? {
         return Err(PrincipalProofError::WrongDigest);
     }
-    if !canonical_hex(&proof.signature_hex, 64) { return Err(PrincipalProofError::InvalidSignature); }
-    let signature = crate::cluster_control::hex_decode(&proof.signature_hex).ok_or(PrincipalProofError::InvalidSignature)?;
-    if !crate::cluster_control::ClusterControl::verify_challenge(&principal.public_key, &proof_payload(proof)?, &signature) {
+    if !canonical_hex(&proof.signature_hex, 64) {
+        return Err(PrincipalProofError::InvalidSignature);
+    }
+    let signature = crate::cluster_control::hex_decode(&proof.signature_hex)
+        .ok_or(PrincipalProofError::InvalidSignature)?;
+    if !crate::cluster_control::ClusterControl::verify_challenge(
+        &principal.public_key,
+        &proof_payload(proof)?,
+        &signature,
+    ) {
         return Err(PrincipalProofError::InvalidSignature);
     }
     Ok(principal)
@@ -316,7 +380,10 @@ pub(crate) fn command_proposed_at(command: &AuthorityCommand) -> Option<DateTime
 }
 
 pub(crate) fn set_committed_command_time(command: &mut AuthorityCommand, at: DateTime<Utc>) {
-    let command = match command { AuthorityCommand::Authorized { command, .. } => command.as_mut(), command => command };
+    let command = match command {
+        AuthorityCommand::Authorized { command, .. } => command.as_mut(),
+        command => command,
+    };
     match command {
         AuthorityCommand::IssueJoinChallenge { proposed_at, .. }
         | AuthorityCommand::RegisterMember { proposed_at, .. }
@@ -344,7 +411,9 @@ pub(crate) fn set_verified_audit_actor(command: &mut AuthorityCommand, principal
         | AuthorityCommand::RenewOwnership { actor, .. }
         | AuthorityCommand::ReleaseOwnership { actor, .. }
         | AuthorityCommand::EnrollPrincipal { actor, .. }
-        | AuthorityCommand::RevokePrincipal { actor, .. } => *actor = format!("principal:{principal_id}"),
+        | AuthorityCommand::RevokePrincipal { actor, .. } => {
+            *actor = format!("principal:{principal_id}")
+        }
         _ => {}
     }
 }
@@ -355,21 +424,36 @@ pub fn verify_authority_principal_view(
     view: &crate::cluster_consensus::ReplicatedAuthorityView,
     now: DateTime<Utc>,
 ) -> Result<AuthorityPrincipal, PrincipalProofError> {
-    let principal = verify_authority_principal(command, &view.genesis.cluster_id, &view.principals, now.max(view.logical_time))?;
+    let principal = verify_authority_principal(
+        command,
+        &view.genesis.cluster_id,
+        &view.principals,
+        now.max(view.logical_time),
+    )?;
     let inner = unsigned_authority_command(command)?;
-    let existing = ownership_agent(inner).is_some_and(|agent| view.ownerships.iter().any(|row| row.agent_id == agent));
+    let existing = ownership_agent(inner)
+        .is_some_and(|agent| view.ownerships.iter().any(|row| row.agent_id == agent));
     verify_tenant_ownership_scope(principal, inner, &view.ownership_tenant_scopes, existing)?;
     verify_member_key_separation(inner, &view.principals)?;
     Ok(principal.clone())
 }
 
-pub(crate) fn verify_member_key_separation(command: &AuthorityCommand, principals: &BTreeMap<String, AuthorityPrincipal>) -> Result<(), PrincipalProofError> {
+pub(crate) fn verify_member_key_separation(
+    command: &AuthorityCommand,
+    principals: &BTreeMap<String, AuthorityPrincipal>,
+) -> Result<(), PrincipalProofError> {
     let registration = match command {
         AuthorityCommand::RegisterMember { registration, .. }
-        | AuthorityCommand::PrepareMemberCertificateRollout { registration, .. } => Some(registration),
+        | AuthorityCommand::PrepareMemberCertificateRollout { registration, .. } => {
+            Some(registration)
+        }
         _ => None,
     };
-    if registration.is_some_and(|registration| principals.values().any(|principal| principal.public_key == registration.public_key)) {
+    if registration.is_some_and(|registration| {
+        principals
+            .values()
+            .any(|principal| principal.public_key == registration.public_key)
+    }) {
         return Err(PrincipalProofError::InvalidPrincipal);
     }
     Ok(())
@@ -382,12 +466,21 @@ pub(crate) fn verify_tenant_ownership_scope(
     tenant_scopes: &BTreeMap<String, String>,
     existing_ownership: bool,
 ) -> Result<(), PrincipalProofError> {
-    if principal.kind == AuthorityPrincipalKind::Operator { return Ok(()); }
+    if principal.kind == AuthorityPrincipalKind::Operator {
+        return Ok(());
+    }
     let agent = ownership_agent(command).ok_or(PrincipalProofError::TenantScope)?;
-    let tenant = principal.tenant_id.as_deref().ok_or(PrincipalProofError::TenantScope)?;
+    let tenant = principal
+        .tenant_id
+        .as_deref()
+        .ok_or(PrincipalProofError::TenantScope)?;
     match tenant_scopes.get(agent) {
         Some(owner) if owner == tenant => Ok(()),
-        None if !existing_ownership && matches!(command, AuthorityCommand::ClaimOwnership { .. }) => Ok(()),
+        None if !existing_ownership
+            && matches!(command, AuthorityCommand::ClaimOwnership { .. }) =>
+        {
+            Ok(())
+        }
         _ => Err(PrincipalProofError::TenantScope),
     }
 }
@@ -399,8 +492,11 @@ pub(crate) const FIXTURE_CLUSTER_ID: &str = "00000000-0000-0000-0000-00000000010
 fn fixture_key() -> &'static ring::signature::Ed25519KeyPair {
     static KEY: std::sync::OnceLock<ring::signature::Ed25519KeyPair> = std::sync::OnceLock::new();
     KEY.get_or_init(|| {
-        let document = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("generate ephemeral CI principal");
-        ring::signature::Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("parse ephemeral CI principal")
+        let document =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .expect("generate ephemeral CI principal");
+        ring::signature::Ed25519KeyPair::from_pkcs8(document.as_ref())
+            .expect("parse ephemeral CI principal")
     })
 }
 
@@ -412,8 +508,15 @@ pub(crate) fn fixture_operator() -> AuthorityPrincipal {
         public_key: crate::cluster_control::hex_encode(fixture_key().public_key().as_ref()),
         kind: AuthorityPrincipalKind::Operator,
         tenant_id: None,
-        allowed_command_classes: BTreeSet::from([AuthorityCommandClass::Membership, AuthorityCommandClass::Ownership, AuthorityCommandClass::PrincipalAdmin, AuthorityCommandClass::TransportAdmin]),
-        generation: 1, revoked: false, expires_at: None,
+        allowed_command_classes: BTreeSet::from([
+            AuthorityCommandClass::Membership,
+            AuthorityCommandClass::Ownership,
+            AuthorityCommandClass::PrincipalAdmin,
+            AuthorityCommandClass::TransportAdmin,
+        ]),
+        generation: 1,
+        revoked: false,
+        expires_at: None,
     }
 }
 
@@ -429,9 +532,20 @@ pub(crate) fn fixture_signed(command: AuthorityCommand, cluster_id: &str) -> Aut
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_signed_generation(command: AuthorityCommand, cluster_id: &str, generation: u64) -> AuthorityCommand {
+pub(crate) fn fixture_signed_generation(
+    command: AuthorityCommand,
+    cluster_id: &str,
+    generation: u64,
+) -> AuthorityCommand {
     let principal = fixture_operator();
     let now = command_proposed_at(&command).unwrap_or_else(Utc::now);
-    sign_authority_principal(command, cluster_id, &principal.principal_id, generation, now, |payload| Ok(fixture_key().sign(payload).as_ref().to_vec()))
-        .expect("sign explicit CI command fixture")
+    sign_authority_principal(
+        command,
+        cluster_id,
+        &principal.principal_id,
+        generation,
+        now,
+        |payload| Ok(fixture_key().sign(payload).as_ref().to_vec()),
+    )
+    .expect("sign explicit CI command fixture")
 }

@@ -658,8 +658,12 @@ impl ClusterRaftConfig {
         }
         crate::cluster_principal::genesis_principal_registry(
             &self.authority_genesis_principals,
-            self.members.iter().map(|member| member.identity_public_key.clone()), true,
-        ).map_err(|error| format!("cluster_raft.authority_genesis_principals: {error}"))?;
+            self.members
+                .iter()
+                .map(|member| member.identity_public_key.clone()),
+            true,
+        )
+        .map_err(|error| format!("cluster_raft.authority_genesis_principals: {error}"))?;
         let mut genesis_node_ids = BTreeSet::new();
         let mut genesis_endpoints = BTreeSet::new();
         let mut genesis_tls_fingerprints = BTreeSet::new();

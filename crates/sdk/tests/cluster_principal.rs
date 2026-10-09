@@ -49,7 +49,7 @@ async fn sdk_uses_own_key_proof_and_never_falls_back_to_node_or_token_authority(
         node.identity.public_key
     );
     let signed = sign_authority_principal(
-        command,
+        command.clone(),
         "00000000-0000-0000-0000-000000000100",
         "00000000-0000-0000-0000-000000000900",
         1,
@@ -61,6 +61,13 @@ async fn sdk_uses_own_key_proof_and_never_falls_back_to_node_or_token_authority(
         Err(SdkError::Wire { code: WireErrorCode::AuthorizationDenied, message, retryable: false }) => assert_eq!(message, PrincipalProofError::Missing.to_string()),
         result => panic!("default authority must not silently accept an independent quorum operation: {result:?}"),
     }
+    assert!(matches!(client.submit_authority_command_with_signer(
+        command,
+        "00000000-0000-0000-0000-000000000100",
+        "00000000-0000-0000-0000-000000000900",
+        1,
+        |_| Err(PrincipalProofError::InvalidSignature),
+    ).await, Err(SdkError::Configuration(_))));
     assert!(kernel
         .cluster_control
         .agent_ownerships(None, 10)

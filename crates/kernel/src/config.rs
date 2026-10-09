@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::ProviderId;
 
+/// Read a caller-owned principal PKCS#8 key through the existing private-file
+/// boundary. The bytes remain local to the caller and are erased on drop.
+pub fn read_private_principal_key(path: &Path) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    let mut file = crate::learning::open_private_existing(path)?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.by_ref().take(4097).read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "principal key must contain 1 to 4096 bytes",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Per-token-class pricing in USD per 1,000 tokens.
 ///
 /// `cached_input_usd_per_1k_tokens` applies only to the cached subset of

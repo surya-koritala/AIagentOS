@@ -153,8 +153,28 @@ impl CapacityQuorum {
         for runtime in &runtimes {
             runtime.ensure_configured_membership(true).await.unwrap();
         }
-        for runtime in &runtimes {
-            runtime.ensure_authority_initialized().await.unwrap();
+        // Every node must enter initialization concurrently: a follower waits
+        // for the leader's command and cannot prevent that leader from starting.
+        match runtimes.as_slice() {
+            [one, two] => {
+                let (one, two) = tokio::join!(
+                    one.ensure_authority_initialized(),
+                    two.ensure_authority_initialized()
+                );
+                one.unwrap();
+                two.unwrap();
+            }
+            [one, two, three] => {
+                let (one, two, three) = tokio::join!(
+                    one.ensure_authority_initialized(),
+                    two.ensure_authority_initialized(),
+                    three.ensure_authority_initialized()
+                );
+                one.unwrap();
+                two.unwrap();
+                three.unwrap();
+            }
+            _ => panic!("owned capacity fixture requires two or three real nodes"),
         }
         let mut publishers = Vec::new();
         for (index, (kernel, runtime)) in kernels.iter().zip(&runtimes).enumerate() {

@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Add a bounded nine-SLI observation producer over raw Prometheus history or
+  retained sample archives, with reset/gap checks, conservative latency buckets,
+  durable alert-history validation and exact provider/restore/game-day bindings.
+  A separate CI workflow exercises the schemas and negative contracts. The
+  30-day target campaign and independent release evidence remain open (#324).
+
 - Indexed exact fact payload byte counts for storage quota aggregation, retaining
   agent, tenant and global limits. Raw-write, rollback, reopen and rejected-update
   regressions verify accounting; a same-run hosted 100k comparison preserves

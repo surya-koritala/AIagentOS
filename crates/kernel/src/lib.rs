@@ -1249,6 +1249,7 @@ pub struct AgentKernelImpl {
     /// Stable, bounded-cardinality request outcomes and latency. Correlation
     /// identifiers remain in trace spans and never become metric labels.
     pub(crate) request_telemetry: crate::telemetry::RequestTelemetry,
+    pub(crate) provider_outcomes: Arc<crate::telemetry::ProviderOutcomeCounters>,
     /// Kernel background loops ended by a panic in this process. Non-zero means
     /// restart policy, the turn watchdog, procfs publication, or scheduled
     /// backup has stopped running and will not resume without a restart.
@@ -1809,6 +1810,7 @@ impl AgentKernelImpl {
             active_requests: DashMap::new(),
             lifecycle_counters: crate::metrics::LifecycleCounters::default(),
             request_telemetry: crate::telemetry::RequestTelemetry::default(),
+            provider_outcomes: Arc::new(crate::telemetry::ProviderOutcomeCounters::default()),
             background_task_panics: std::sync::atomic::AtomicU64::new(0),
             service_operation_lock: tokio::sync::Mutex::new(()),
             service_health_checks: DashMap::new(),
@@ -5363,9 +5365,13 @@ impl AgentKernelImpl {
             return Ok((AgentState::Running, None, None));
         };
 
-        let stored =
-            self.context_manager
-                .claim_generation_checkpoint(checkpoint_id, agent_id, &tenant)?;
+        let mut recovery_observation = self.context_manager.checkpoint_recovery_observation();
+        let stored = self.context_manager.claim_generation_checkpoint_observed(
+            checkpoint_id,
+            agent_id,
+            &tenant,
+            &mut recovery_observation,
+        )?;
         let executor = match self.ensure_executor(agent_id).await {
             Ok(executor) => executor,
             Err(error) => {
@@ -5418,6 +5424,8 @@ impl AgentKernelImpl {
         };
         self.scheduler.set_running(agent_id);
         let baseline = stored.checkpoint.clone();
+        recovery_observation.recovered();
+        drop(recovery_observation);
         let run_result = executor.resume(stored.checkpoint).await;
         self.active_cancellations.remove(&agent_id);
         match self.agent_manager.get_agent_state(agent_id) {
@@ -5540,6 +5548,7 @@ impl AgentKernelImpl {
         }
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
+        executor.set_provider_outcomes(self.provider_outcomes.clone());
         executor.set_context_budget(self.context_budget_tokens);
         let tenant_id = self
             .context_manager

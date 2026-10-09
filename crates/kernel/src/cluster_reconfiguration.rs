@@ -297,7 +297,6 @@ pub(crate) fn prepare_trust_target(
     Ok(target)
 }
 
-
 fn check_generation(current: u64, expected: u64, target: u64) -> io::Result<()> {
     if expected != current {
         return Err(io::Error::new(

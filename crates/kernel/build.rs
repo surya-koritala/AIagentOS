@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod source_proof;
+
 fn git(root: &Path, arguments: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .current_dir(root)
@@ -22,6 +24,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-changed=build.rs");
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let packaged_root = manifest.parent().and_then(Path::parent);
+    println!("cargo:rerun-if-changed=source_proof.rs");
     let root =
         git(&manifest, &["rev-parse", "--show-toplevel"]).map(|value| PathBuf::from(value.trim()));
     let mut commit = "0000000000000000000000000000000000000000".to_owned();
@@ -64,6 +68,24 @@ fn main() {
                 }
             }
         }
+    } else if let Some(root) = packaged_root {
+        let proof_path = root.join(source_proof::PROOF_FILE);
+        if std::fs::symlink_metadata(&proof_path).is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink()) {
+            println!("cargo:rerun-if-changed={}", proof_path.display());
+        }
+        match source_proof::verify_packaged_source(root) {
+            Ok(value) => {
+                commit=value.commit;
+                verified=true;
+                for path in value.files.into_iter().chain(value.directories) {
+                    println!("cargo:rerun-if-changed={}", root.join(path).display());
+                }
+            }
+            Err(reason) => println!("cargo:warning=Compiled source is unverified: {reason}"),
+        }
+        // Context generation and Docker COPY create a fresh source layer with
+        // no prior target artifacts. Never recursively watch Cargo output or
+        // a missing optional proof: those force repeated expensive rebuilds.
     }
     println!("cargo:rustc-env=AGENTOS_COMPILED_SOURCE_SHA={commit}");
     println!(

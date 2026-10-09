@@ -7,9 +7,8 @@ target/
 
 # Version control + CI metadata.
 .git/
-.gitignore
-.gitattributes
-.github/
+# Tracked public Git attributes/ignore rules and CI source definitions remain
+# in an attested context so its complete commit/tree/blob proof can verify.
 
 # Frontend / Node — only used by tauri-app, which we never build here.
 **/node_modules/

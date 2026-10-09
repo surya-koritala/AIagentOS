@@ -1,0 +1,123 @@
+name: Docker source identity proof
+
+on:
+  push:
+    branches: [codex/docker-source-proof]
+    paths:
+      - 'crates/kernel/build.rs'
+      - 'crates/kernel/source_proof.rs'
+      - 'crates/kernel/tests/source_proof.rs'
+      - 'crates/kernel/Cargo.toml'
+      - 'crates/kernel/src/metrics.rs'
+      - 'scripts/prepare_source_context.py'
+      - 'scripts/qualify_docker_source_identity.py'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/docker-source-proof.yml'
+  pull_request:
+    paths:
+      - 'crates/kernel/build.rs'
+      - 'crates/kernel/source_proof.rs'
+      - 'crates/kernel/tests/source_proof.rs'
+      - 'scripts/prepare_source_context.py'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/docker-source-proof.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-source-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formatting:
+    name: Source proof formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Retain hosted formatting patch
+        run: |
+          git rev-parse HEAD > source-proof-format-source.txt
+          cargo fmt --all
+          git diff --binary > source-proof-format.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: source-proof-format-${{ github.run_id }}
+          path: |
+            source-proof-format-source.txt
+            source-proof-format.patch
+          retention-days: 30
+      - name: Require committed formatting
+        run: git diff --exit-code
+  proof:
+    name: Git object proof and actual Docker metric identity
+    needs: formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Native positive and real Git negative proofs
+        shell: bash
+        env:
+          AGENTOS_SOURCE_PROOF_NATIVE_RECEIPT_FILE: ${{ runner.temp }}/native-source.prom
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > source-proof-source.txt
+          cargo test -p kernel --test source_proof --locked -- --nocapture 2>&1 | tee source-proof-tests.log
+          cargo clippy -p kernel --test source_proof --locked -- -D warnings 2>&1 | tee source-proof-clippy.log
+      - name: Stage only clean Git source objects and public proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/prepare_source_context.py --output "$RUNNER_TEMP/source-context" | tee source-proof-context.json
+          test ! -e "$RUNNER_TEMP/source-context/.git"
+          test ! -e "$RUNNER_TEMP/source-context/.env"
+      - name: Build actual image without Git metadata or unchecked source arguments
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --iidfile "$RUNNER_TEMP/source-image-id.txt" "$RUNNER_TEMP/source-context" 2>&1 | tee source-proof-image-build.log
+      - name: Actual keyless boot and source metric parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify_docker_source_identity.py \
+            --image-id-file "$RUNNER_TEMP/source-image-id.txt" \
+            --native-metrics "$RUNNER_TEMP/native-source.prom" \
+            --output source-proof-image.json 2>&1 | tee source-proof-image.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: docker-source-proof-${{ github.run_id }}
+          path: |
+            source-proof-source.txt
+            source-proof-tests.log
+            source-proof-clippy.log
+            source-proof-context.json
+            source-proof-image-build.log
+            source-proof-image.log
+            source-proof-image.json
+            source-proof-image.prom
+            source-proof-image.node.json
+            ${{ runner.temp }}/native-source.prom
+            ${{ runner.temp }}/source-image-id.txt
+          if-no-files-found: error
+          retention-days: 30

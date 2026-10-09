@@ -43,10 +43,18 @@ request, tenant, agent, tool, or provider labels.
 Compiled runtime identity uses five `agentos_build_source_sha1{part}` gauges
 with fixed `part` values `0` through `4`, each carrying one exact 32-bit segment,
 and `agentos_build_source_verified`. The build script reads the actual tracked
-Git source and marks missing metadata or dirty source unverified. Numeric
+Git source, or verifies a packaged source against bounded Git commit/tree/blob
+objects and actual file bytes. Missing/invalid proof or dirty source is unverified. Numeric
 segments preserve fixed label cardinality across builds. Target observations
 require every segment to reconstruct the expected clean commit; package builds
-without Git metadata remain usable but cannot supply eligible source evidence.
+without Git metadata or a valid object-bound source proof remain usable but cannot
+supply eligible source evidence. Docker contexts are prepared from clean Git
+objects before building, keeping `.git`, untracked files and credentials out;
+the runtime image carries only shipped binaries and its entrypoint. An unchecked
+SHA build argument or clean boolean never establishes verified source identity.
+Prepared contexts must be new, outside the checkout, and free of Cargo output.
+The container refuses pre-existing `target/`; source proof watches only present
+authenticated source inputs, keeping missing-proof builds from repeating work.
 
 `RequestSubsystem::request_class` defines the latency split in one place.
 Agent, checkpoint, memory, storage and tool traffic use the `agent` class;

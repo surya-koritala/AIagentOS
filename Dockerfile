@@ -41,9 +41,15 @@ RUN apt-get update \
 
 WORKDIR /build
 
-# Copy the whole workspace. The .dockerignore keeps target/, .git/,
-# node_modules, *.db and friends out of the build context so this stays small.
+# For source-qualified images, prepare a clean object-bound context with
+# scripts/prepare_source_context.py on CI before this COPY. The build script
+# verifies its commit/tree/blob proof against actual source bytes without Git.
+# Missing/invalid proof keeps ordinary boot usable but source-unverified.
 COPY . .
+
+# A prepared context never contains prior Cargo output. Prevent stale binaries
+# or cached source claims from being reused across changed proof contexts.
+RUN test ! -e target
 
 # Build exactly the binaries we ship — never `--workspace` (that would drag in
 # tauri-app and its GTK/WebKit deps). Cargo.lock is committed, so --locked is

@@ -62,5 +62,10 @@ rcgen = { workspace = true }
 wiremock = { workspace = true }
 tempfile = "3"
 
+[build-dependencies]
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_NetworkManagement_NetManagement", "Wdk_System_Threading"] }

@@ -8,16 +8,18 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use agent_sdk::{
+    AuthorityCommand, AuthorityResponse, KernelClient, PrincipalProofError, WireErrorCode,
+};
 use kernel::cluster_runtime::ClusterRaftTls;
 use kernel::config::{ClusterRaftConfig, ClusterRaftMemberConfig, Config};
 use kernel::syscall_server::{Syscall, SyscallReply, PROTOCOL_VERSION};
 use kernel::AgentKernelImpl;
-use agent_sdk::{AuthorityCommand, AuthorityResponse, KernelClient, PrincipalProofError, WireErrorCode};
-use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
 };
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 struct TestRoot(PathBuf);
 
@@ -175,7 +177,8 @@ fn agent_server_owns_configured_raft_startup_and_sigterm_shutdown() {
     drop(application_reserved);
     let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
         .expect("generate ephemeral caller key");
-    let operator = Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("load ephemeral caller key");
+    let operator =
+        Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("load ephemeral caller key");
     let config_path = write_cluster_config(&root.0, raft_addr, application_addr, &operator);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-server"))
@@ -300,25 +303,59 @@ fn agent_server_owns_configured_raft_startup_and_sigterm_shutdown() {
     };
     let runtime = tokio::runtime::Runtime::new().expect("SDK fixture runtime");
     runtime.block_on(async {
-        let mut client = KernelClient::connect(application_addr).await.expect("connect SDK to daemon");
+        let mut client = KernelClient::connect(application_addr)
+            .await
+            .expect("connect SDK to daemon");
         let mut responses = Vec::new();
         for _ in 0..2 {
-            responses.push(tokio::time::timeout(Duration::from_secs(5), client.submit_authority_command_with_signer(
+            let signed_claim = client.submit_authority_command_with_signer(
                 command.clone(),
                 "00000000-0000-0000-0000-000000000100",
                 "00000000-0000-0000-0000-000000000900",
                 1,
                 |payload| Ok(operator.sign(payload).as_ref().to_vec()),
-            )).await.expect("bounded SDK daemon claim").expect("independent caller authorizes daemon ownership"));
+            );
+            let response = tokio::time::timeout(Duration::from_secs(5), signed_claim)
+                .await
+                .expect("bounded SDK daemon claim")
+                .expect("independent caller authorizes daemon ownership");
+            responses.push(response);
         }
-        let AuthorityResponse::OwnershipUpdated {ownership: first, replayed: false, ..} = &responses[0] else { panic!("first signed daemon claim was not committed") };
-        let AuthorityResponse::OwnershipUpdated {ownership: second, replayed: true, ..} = &responses[1] else { panic!("same signed daemon operation was not replayed") };
-        assert_eq!(first, second, "same operation id must replay the exact committed ownership result");
+        let AuthorityResponse::OwnershipUpdated {
+            ownership: first,
+            replayed: false,
+            ..
+        } = &responses[0]
+        else {
+            panic!("first signed daemon claim was not committed")
+        };
+        let AuthorityResponse::OwnershipUpdated {
+            ownership: second,
+            replayed: true,
+            ..
+        } = &responses[1]
+        else {
+            panic!("same signed daemon operation was not replayed")
+        };
+        assert_eq!(
+            first, second,
+            "same operation id must replay the exact committed ownership result"
+        );
         assert_eq!(first.agent_id, agent_id);
         assert_eq!(first.fencing_token, 1);
-        let audit = client.cluster_agent_ownership_audit(Some(agent_id), 10).await.expect("read verified daemon ownership audit");
-        assert_eq!(audit.len(), 1, "replay must not append a second ownership audit row");
-        assert_eq!(audit[0].actor, "principal:00000000-0000-0000-0000-000000000900");
+        let audit = client
+            .cluster_agent_ownership_audit(Some(agent_id), 10)
+            .await
+            .expect("read verified daemon ownership audit");
+        assert_eq!(
+            audit.len(),
+            1,
+            "replay must not append a second ownership audit row"
+        );
+        assert_eq!(
+            audit[0].actor,
+            "principal:00000000-0000-0000-0000-000000000900"
+        );
         client.close().await.expect("close SDK fixture connection");
     });
 

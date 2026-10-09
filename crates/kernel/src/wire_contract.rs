@@ -21,6 +21,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
     "agent_gate_statistics",
     "authorized_cluster_membership",
+    "cluster_principal_auth",
     crate::cluster_operation_receipts::FEATURE,
     "bounded_certificate_rollout",
     "cluster_ownership_leases",
@@ -705,6 +706,14 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "submit_signed_authority_command",
+        fields: &[Field::required("command", O)],
+    },
+    Variant {
+        tag: "get_authority_principal_registry",
+        fields: &[],
+    },
+    Variant {
         tag: "register_cluster_member",
         fields: &[
             Field::optional("operation_id", S),
@@ -969,6 +978,8 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                 || !matches!(
                     variant.tag,
                     "send_message_stream"
+                        | "submit_signed_authority_command"
+                        | "get_authority_principal_registry"
                         | "list_provider_models"
                         | "send_message_content"
                         | "send_message_content_stream"
@@ -1041,6 +1052,16 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("state", JsonKind::String) => Value::String("left".into()),
                     ("kind", JsonKind::String) => Value::String("tools".into()),
                     ("request", JsonKind::Object) => serde_json::json!({"path":if variant.tag == "vfs_open_at" { "file.bin" } else { "/workspace/file.bin" },"kind":"file","rights":["read","stat"],"allow_missing":false}),
+                    ("command", JsonKind::Object) => serde_json::json!({"Authorized": {
+                        "command": {"IssueJoinChallenge": {
+                            "operation_id":"00000000-0000-0000-0000-000000000006", "challenge_hex":"00", "ttl_seconds":5,
+                            "proposed_at":"2026-01-01T00:00:00Z"
+                        }},
+                        "principal_proof": {"version":1,"cluster_id":"00000000-0000-0000-0000-000000000005",
+                            "principal_id":"00000000-0000-0000-0000-000000000007", "principal_generation":1,
+                            "operation_id":"00000000-0000-0000-0000-000000000006", "command_sha256":"00".repeat(32),
+                            "issued_at":"2026-01-01T00:00:00Z", "expires_at":"2026-01-01T00:00:30Z", "signature_hex":"00".repeat(64)}
+                    }}),
                     ("registration", JsonKind::Object) => serde_json::json!({
                         "node_id": "00000000-0000-0000-0000-000000000004",
                         "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -1417,6 +1438,14 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "cluster_join_challenge",
         fields: &[Field::required("challenge", O)],
+    },
+    Variant {
+        tag: "authority_command_committed",
+        fields: &[Field::required("response", O)],
+    },
+    Variant {
+        tag: "authority_principal_registry",
+        fields: &[Field::required("principals", A)],
     },
     Variant {
         tag: "cluster_member_updated",
@@ -1912,7 +1941,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 131);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 133);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

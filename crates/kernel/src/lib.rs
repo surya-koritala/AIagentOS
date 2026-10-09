@@ -14,6 +14,7 @@ pub mod cloning;
 pub mod cluster_consensus;
 pub mod cluster_control;
 mod cluster_operation_receipts;
+pub mod cluster_principal;
 pub mod cluster_reconfiguration;
 pub mod cluster_runtime;
 pub mod config;

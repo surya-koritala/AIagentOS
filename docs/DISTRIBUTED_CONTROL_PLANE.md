@@ -139,13 +139,36 @@ leaves, oversized frames, and invalid bounds.
 
 Configured Raft peers can no longer forward a bare external command or claim
 another node's actor: the leader independently verifies the application-node
-delegation described above. The currently supported cluster-authority surface
-is system-scoped, so this proof delegates a system-node principal rather than
-an end-user API-key/session principal. A host compromise that exposes both the
-Raft and application private keys can still act as that system node, and there
-is not yet a tenant credential or external operator signature that the quorum
-can validate independently. Compromised-host isolation and end-user
-operator/tenant delegation therefore remain unchecked #122 requirements.
+delegation described above. Each external mutation additionally requires an
+independent operator or tenant Ed25519 signature over that same canonical
+command digest. A token or system-node label cannot substitute for this proof.
+The origin and leader check the current replicated public-key registry,
+principal generation, allowed command class, cluster, operation UUID, digest,
+signature and bounded expiration. Replicated application repeats the check
+before new execution or receipt replay; a revoked principal cannot replay an
+old proof. Proof generation, issuance and signature are authentication envelope
+fields, so a newly authorized proof can replay the same principal/operation/body
+without changing the durable semantic request identity.
+
+Membership, principal enrollment/revocation and transport administration are
+operator classes. Tenant principals have ownership permission only, tied to
+one canonical tenant and immutable ownership-directory scope. They cannot
+adopt foreign or legacy unscoped ownership records. A fresh tenant claim binds
+an unused authority UUID to that tenant; it does not establish a distributed
+atomic destination creation transaction. Authority membership, certificate
+and ownership audit actors record `principal:<verified-id>`; older actor-string
+rows remain readable. No node stores the operator/tenant private key. The SDK
+signing callback stays on the caller side, and token-only mutable quorum paths
+fail closed. Legacy single-node authority remains the separate disabled-mode
+compatibility path.
+
+A host compromise that exposes both the Raft and application private keys
+does not supply an enrolled principal signature. Production state machines pin
+the immutable operator public-key genesis even on pristine snapshot receivers.
+Incoming snapshots cannot replace applied receipts, the seed or the known
+clock floor, and signed projections are reproduced from verified committed
+history. This implements independent command authorization; external
+compromised-host, partition and clock qualification remains required by #122.
 
 `agent-server` constructs and owns this runtime when `[cluster_raft].enabled`
 is true. Startup reads bounded no-follow PEM inputs, requires owner-only private
@@ -178,8 +201,14 @@ exists, application endpoint/TLS validation waits for a linearizable quorum
 read that advances the replicated clock; a restarted minority cannot use stale
 persisted time to extend a rollout window.
 
-All voters supply one identical immutable application genesis document on the
-first bootstrap. Later transport changes continue to publish that exact seed
+All voters supply one identical immutable application genesis document and
+initial operator public-key set on the first bootstrap. Operator seeds must
+have generation one, principal-admin permission, no revocation/expiry, unique
+canonical IDs/keys, and keys distinct from application-node identities. Live
+enrollment and revocation are majority-committed commands; they cannot change
+the original configured seed. Nodes refuse missing seeds or mismatched seed
+keys/permissions rather than inventing machine-derived principal credentials.
+Later transport changes continue to publish that exact seed
 separately from the complete current challenged application membership and the
 current Raft transport subset. The replicated state machine owns challenged
 join, membership generation and audit, leave/revocation, bounded
@@ -407,7 +436,7 @@ paths are rejected.
 
 | Object | System of record now | Current consistency | Production requirement |
 |---|---|---|---|
-| Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, signs external forwarding with a short-lived application-node delegation, binds the signer to the authenticated Raft source and active membership, and uses linearizable reads; application leaves use bounded prepare/activate/finalize trust generations; voter changes use learner catch-up and joint consensus; separate digest-pinned transport-trust generations add/remove learners and rotate exact peer leaves/CA roots | End-user operator/tenant proof beyond the system-node principal, live administration, compromised-host isolation, and external partition/clock qualification |
+| Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, requires independent principal key proof plus short-lived application-node delegation, binds the machine to the authenticated Raft source and active membership, and uses linearizable reads; principal enroll/revoke is quorum-backed; application leaves use bounded prepare/activate/finalize trust generations; voter changes use learner catch-up and joint consensus; separate digest-pinned transport-trust generations add/remove learners and rotate exact peer leaves/CA roots | Live administration, independently qualified compromised-host isolation, and external partition/clock qualification |
 | Node identity | Node-local Ed25519 key plus authority membership certificate fingerprint | Stable across restart; fresh challenges sign application-listener prepare and activation; candidate and previous leaf acceptance expire against replicated time; Raft peer leaves and roots use separately bounded trust epochs | Independent compromised-node and multi-host partition/clock qualification |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Authority reservation plus owning-node SQLite database | Managed creation reserves one UUID before exact destination creation; duplicates cannot overwrite a local agent | Quorum-allocated immutable identity and migration-aware placement record |
@@ -418,6 +447,12 @@ paths are rejected.
 | Quotas and accounting | Node-local durable quota ledger | Restart-safe per node; the same tenant can consume limits independently on several nodes | Cluster-wide reservation/commit protocol or conservatively partitioned quota grants |
 | Audit | Node-local audit stores; membership audit on the authority | Durable and ordered only within its store | Globally attributable event identity, node/authority terms, durable collection, and gap detection |
 | IPC and delegation | Owning-node kernel | Authorized locally; no cross-node delivery protocol | End-to-end principal/namespace propagation, ordering scope, idempotency key, and delivery guarantee |
+
+The required production gaps are tracked explicitly: [destination authority
+contract #432](https://github.com/surya-koritala/AIagentOS/issues/432), [globally
+attributable durable audit #433](https://github.com/surya-koritala/AIagentOS/issues/433)
+and [quorum-allocated immutable agent identity #434](https://github.com/surya-koritala/AIagentOS/issues/434).
+Independent principal proof does not complete these requirements or epic #122.
 
 ## Current operation semantics
 

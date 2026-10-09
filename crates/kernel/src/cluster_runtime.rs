@@ -4873,6 +4873,27 @@ mod tests {
                 .expect("node 4")
                 .ensure_configured_membership(false),
         );
+        let final_metrics = added
+            .iter()
+            .flatten()
+            .map(|runtime| {
+                let metrics = runtime.metrics().borrow().clone();
+                (
+                    metrics.id,
+                    metrics.current_term,
+                    metrics.current_leader,
+                    metrics.state,
+                    metrics.running_state,
+                    metrics.membership_config,
+                    metrics.last_log_index,
+                    metrics.last_applied,
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "bounded learner-add settlement: results={:?}; final_metrics={final_metrics:?}",
+            (&first, &second, &third, &learner)
+        );
         first.expect("settle catalog addition on node 1");
         second.expect("settle catalog addition on node 2");
         third.expect("settle catalog addition on node 3");

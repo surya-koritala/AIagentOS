@@ -11,6 +11,15 @@ on:
       - 'crates/cli/tests/workspace_ownership_commands.rs'
       - 'tests/src/managed_workspace_ownership.rs'
   workflow_dispatch:
+  pull_request:
+    branches: [main, 'codex/**']
+    paths:
+      - '.github/workflows/workspace-recovery-resolution.yml'
+      - 'crates/kernel/src/**'
+      - 'crates/cli/src/bin/agentctl.rs'
+      - 'crates/cli/tests/storage_commands.rs'
+      - 'crates/cli/tests/workspace_ownership_commands.rs'
+      - 'tests/src/managed_workspace_ownership.rs'
 
 permissions:
   contents: read
@@ -85,7 +94,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p integration-tests --lib --features kernel/qualification --locked managed_workspace_ownership -- --nocapture --test-threads=1 2>&1 | tee recovery-namespace.log
+          cargo test -p integration-tests --lib --features workspace-qualification --locked managed_workspace_ownership -- --nocapture --test-threads=1 2>&1 | tee recovery-namespace.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

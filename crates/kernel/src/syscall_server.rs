@@ -734,12 +734,16 @@ pub enum Syscall {
     },
     /// Generation-fenced active/draining/quarantined transition.
     SetNodeAvailability {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         availability: crate::cluster_control::NodeAvailability,
         expected_generation: u64,
         reason: String,
     },
     /// Generation-fenced replacement of placement constraint metadata.
     SetNodeProfile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         profile: crate::cluster_control::NodeProfile,
         expected_generation: u64,
         reason: String,
@@ -874,6 +878,8 @@ pub enum Syscall {
     /// Install the highest authority-issued token accepted by this workload
     /// node for one local agent.
     InstallAgentMutationFence {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         agent_id: String,
         cluster_id: String,
         owner_node_id: String,
@@ -885,6 +891,8 @@ pub enum Syscall {
     },
     /// Retire the exact active destination token while retaining its tombstone.
     RetireAgentMutationFence {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         agent_id: String,
         cluster_id: String,
         owner_node_id: String,
@@ -1198,7 +1206,7 @@ pub enum WireErrorCode {
 }
 
 impl WireErrorCode {
-    fn classify(message: &str) -> (Self, bool) {
+    pub(crate) fn classify(message: &str) -> (Self, bool) {
         let message = message.to_ascii_lowercase();
         if message == AUTHORIZATION_DENIED {
             // Foreign and absent resources deliberately share this safe
@@ -3143,7 +3151,15 @@ async fn dispatch_scoped_inner_with_fence(
     let package_actor = principal
         .map(|principal| principal.user_id.as_str())
         .unwrap_or("system");
-    match call {
+    let receipt = match crate::cluster_operation_receipts::prepare(
+        &kernel.context_manager, &kernel.cluster_control.identity().node_id, &call, principal,
+    ) {
+        Ok(crate::cluster_operation_receipts::Admission::Legacy) => None,
+        Ok(crate::cluster_operation_receipts::Admission::Prepared(receipt)) => Some(receipt),
+        Ok(crate::cluster_operation_receipts::Admission::Replay(reply)) => return reply,
+        Err(reply) => return reply,
+    };
+    let reply = async { match call {
         Syscall::CreateTenant { name } => {
             if !valid_identity_label(&name, 256) {
                 return identity_error("invalid tenant name");
@@ -4648,6 +4664,7 @@ async fn dispatch_scoped_inner_with_fence(
             }
         }
         Syscall::SetNodeAvailability {
+            operation_id: _,
             availability,
             expected_generation,
             reason,
@@ -4668,6 +4685,7 @@ async fn dispatch_scoped_inner_with_fence(
             }
         }
         Syscall::SetNodeProfile {
+            operation_id: _,
             profile,
             expected_generation,
             reason,
@@ -5346,6 +5364,7 @@ async fn dispatch_scoped_inner_with_fence(
             }
         }
         Syscall::InstallAgentMutationFence {
+            operation_id: _,
             agent_id,
             cluster_id,
             owner_node_id,
@@ -5402,6 +5421,7 @@ async fn dispatch_scoped_inner_with_fence(
             }
         }
         Syscall::RetireAgentMutationFence {
+            operation_id: _,
             agent_id,
             cluster_id,
             owner_node_id,
@@ -5992,7 +6012,13 @@ async fn dispatch_scoped_inner_with_fence(
                 },
             }
         }
+    }}.await;
+    if let Some(receipt) = receipt {
+        if let Err(error) = crate::cluster_operation_receipts::complete(&kernel.context_manager, receipt, &reply) {
+            return error;
+        }
     }
+    reply
 }
 
 fn public_stream_event(event: crate::execution::StreamEvent) -> Option<MessageStreamEvent> {
@@ -8719,6 +8745,7 @@ mod tests {
         let drained = match dispatch(
             &kernel,
             Syscall::SetNodeAvailability {
+                operation_id: None,
                 availability: NodeAvailability::Draining,
                 expected_generation: 0,
                 reason: "rolling maintenance".into(),
@@ -8755,6 +8782,7 @@ mod tests {
             dispatch(
                 &kernel,
                 Syscall::SetNodeAvailability {
+                    operation_id: None,
                     availability: NodeAvailability::Active,
                     expected_generation: 0,
                     reason: "stale operator".into(),
@@ -8767,6 +8795,7 @@ mod tests {
         let quarantined = match dispatch(
             &kernel,
             Syscall::SetNodeAvailability {
+                operation_id: None,
                 availability: NodeAvailability::Quarantined,
                 expected_generation: drained.generation,
                 reason: "security response".into(),
@@ -8789,6 +8818,7 @@ mod tests {
         let restored = match dispatch(
             &kernel,
             Syscall::SetNodeAvailability {
+                operation_id: None,
                 availability: NodeAvailability::Active,
                 expected_generation: quarantined.generation,
                 reason: "incident cleared".into(),
@@ -9008,6 +9038,7 @@ mod tests {
             dispatch(
                 &kernel,
                 Syscall::InstallAgentMutationFence {
+                    operation_id: None,
                     agent_id: agent_id.clone(),
                     cluster_id: cluster_id.clone(),
                     owner_node_id: owner_node_id.clone(),
@@ -9027,6 +9058,7 @@ mod tests {
             }
         ));
         let handoff_call = Syscall::InstallAgentMutationFence {
+            operation_id: None,
             agent_id: agent_id.clone(),
             cluster_id: cluster_id.clone(),
             owner_node_id: owner_node_id.clone(),
@@ -9168,6 +9200,7 @@ mod tests {
             dispatch(
                 &kernel,
                 Syscall::InstallAgentMutationFence {
+                    operation_id: None,
                     agent_id: agent_id.clone(),
                     cluster_id: cluster_id.clone(),
                     owner_node_id: owner_node_id.clone(),
@@ -9209,6 +9242,7 @@ mod tests {
             dispatch(
                 &handoff_kernel,
                 Syscall::InstallAgentMutationFence {
+                    operation_id: None,
                     agent_id: handoff_agent_id,
                     cluster_id: handoff_cluster_id,
                     owner_node_id: handoff_owner_node_id,
@@ -9326,6 +9360,7 @@ mod tests {
         let owner_node_id = kernel.cluster_control.identity().node_id.clone();
         let proof_expires_at = Utc::now() + chrono::Duration::seconds(60);
         let install_call = Syscall::InstallAgentMutationFence {
+            operation_id: None,
             agent_id: agent_id.clone(),
             cluster_id,
             owner_node_id,
@@ -10906,6 +10941,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::SetNodeAvailability {
+                    operation_id: None,
                     availability: crate::cluster_control::NodeAvailability::Draining,
                     expected_generation: 0,
                     reason: "test".into(),
@@ -10914,6 +10950,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::SetNodeProfile {
+                    operation_id: None,
                     profile: crate::cluster_control::NodeProfile::default(),
                     expected_generation: 0,
                     reason: "test".into(),
@@ -11065,6 +11102,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::InstallAgentMutationFence {
+                    operation_id: None,
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
                     cluster_id: "00000000-0000-0000-0000-000000000005".into(),
                     owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
@@ -11078,6 +11116,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::RetireAgentMutationFence {
+                    operation_id: None,
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
                     cluster_id: "00000000-0000-0000-0000-000000000005".into(),
                     owner_node_id: "00000000-0000-0000-0000-000000000004".into(),

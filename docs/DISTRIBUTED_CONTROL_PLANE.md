@@ -5,6 +5,90 @@ multi-node foundation tracked by issue #122. It describes the implementation
 that exists now and the invariants a production distributed kernel must add.
 It is not a production-readiness claim.
 
+## Operating a cluster with agentctl
+
+`agentctl cluster --help` lists the existing kernel-backed operator commands and
+the tracked commands whose backends remain unavailable. The operator uses the
+normal authenticated `KernelClient` boundary. No Rust program is required to
+admit nodes or inspect the resulting membership.
+
+Configure `AGENT_SERVER_TOKEN` for the authorized operator connection and the
+shared verified TLS profile with `AGENTOS_TLS_CA` and
+`AGENTOS_TLS_SERVER_NAME`. Joining a node requires both live connections:
+
+```sh
+agentctl cluster join --authority 127.0.0.1:7777 --node 127.0.0.1:7777 \
+  --node-server-name authority.example --reason "initial authority membership"
+agentctl cluster join --authority 127.0.0.1:7777 --node 127.0.0.1:7778 \
+  --node-server-name node-two.example --reason "admit second node"
+agentctl cluster join --authority 127.0.0.1:7777 --node 127.0.0.1:7779 \
+  --node-server-name node-three.example --reason "admit third node"
+agentctl --addr 127.0.0.1:7777 cluster members
+```
+
+The node inherits the authority's verified TLS CA profile. Use `--node-ca` and
+`--node-server-name` together for a distinct trust profile, and `--node-token`
+when the node uses a different credential. The full challenged admission checks
+the node information, negotiated protocol and live signature before registration;
+an identity change during that sequence fails closed with a distinct diagnostic.
+The commands do not configure Raft voters, peer transport trust or bootstrap;
+those remain governed by the existing startup configuration.
+
+Node availability and profile changes require the reviewed `--generation`:
+
+```sh
+agentctl --addr 127.0.0.1:7778 cluster node-availability draining \
+  "stop new placement" --generation 0 --operation-id 550e8400-e29b-41d4-a716-446655440000
+agentctl --addr 127.0.0.1:7777 cluster member-state NODE_ID left \
+  "clean leave" --generation 1
+agentctl --addr 127.0.0.1:7777 cluster ownerships --limit 100
+```
+
+Other backed verbs are `node-profile`, `cert-prepare`, `cert-activate`,
+`cert-abort`, `cert-finalize`, `fence-install`, `fence-retire` and `fence-show`.
+Certificate staging/abort/finalization require the configured replicated
+authority. Activation reconnects to the candidate leaf and runs the challenged
+re-admission at the exact returned member generation. Fence mutations consume
+the exact JSON ownership proof, retaining its term, generation, token and expiry;
+they do not manufacture ownership or weaken the destination admission barrier.
+
+Every write prints its attempted UUID before network I/O and returns the UUID
+with the actual kernel record on success. Supply `--operation-id` to retain one
+before the first attempt and reuse the exact generation, reason and payload on
+retry. Challenged writes derive a distinct stable challenge UUID from that
+mutation UUID, or accept an explicit `--challenge-operation-id`. Read verbs print
+JSON directly. New writes refuse a server that lacks
+`cluster-operation-receipts-v1`, because older local servers could ignore UUIDs.
+
+The schema-v14 local operator ledger binds canonical UUID, request digest and
+the admitted principal/node scope after current authorization. It reserves
+bounded reply capacity before dispatch, retains at most 4,096 receipts and
+64 MiB of reply/reservation bytes, and never automatically evicts an unresolved
+entry. Completed replies are historical outcomes; replay does not restore an old
+node generation or reactivate a retired fence. Read current state before using
+the record for another operation. Autonomous ownership claim/renew/release
+retain their existing replicated receipt behavior; this operator ledger does
+not add a lifetime quota to lease maintenance or promise local lease replay.
+
+An interrupted operation can leave a durable `pending` receipt before or after
+the underlying mutation commits. Reusing that UUID returns a non-retryable
+conflict requiring explicit state/audit reconciliation, without re-executing the
+mutation. A successfully persisted reply can be replayed after restart or a lost
+network response. This is bounded at-most-once admission with fail-closed
+ambiguity, not an atomic exactly-once mutation-and-receipt transaction or the
+distributed side-effect guarantee tracked in #316. Shared-secret connections
+remain trusted-system actors; independent end-user authority delegation remains
+a separate control-plane requirement.
+
+`draining` already rejects new work at the destination and in placement. It
+does not relocate existing agents, report completed drain, or prove safe stop.
+`reconfigure-voters`, `reconfigure-trust` and `reconfiguration-status` remain
+unavailable under #306; `migrate-agent` under #310; and `drain-node`,
+`upgrade-node` and `remove-node` under #314, which depends on #306 and #310.
+They are listed in help and fail with a nonzero exit until their kernels exist.
+Issue #307 retains that complete dependency scope and must not close merely
+because the currently backed commands can land first.
+
 ## Current maturity and authority model
 
 The default, single-node configuration retains the original designated

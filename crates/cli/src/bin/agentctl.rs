@@ -9,7 +9,7 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenant TENANT_ID] \
-         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|clone|list|inspect|message|message-content|stream|stream-content|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|models|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|clone|list|inspect|message|message-content|stream|stream-content|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|models|metrics|protocol|policy-validate|policy-explain|gate-stats|cluster|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] tenant-create NAME\n\
@@ -68,6 +68,7 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] gate-stats [AGENT_ID]\n\
            With AGENT_ID: owned-agent ReadOnly counters; without: System-wide counters.\n\
            Counters are process-local and reset on restart.\n\
+           agentctl [SERVER OPTIONS] cluster COMMAND [OPTIONS] (see cluster --help)\n\
            agentctl [SERVER OPTIONS] node-control-audit [LIMIT]\n\
            agentctl [SERVER OPTIONS] cluster-membership-audit [LIMIT]\n\
            agentctl [SERVER OPTIONS] cluster-certificate-rollout-audit [LIMIT]\n\
@@ -387,6 +388,10 @@ async fn run() {
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h" | "help"))
     {
+        if argv.iter().any(|argument| argument == "cluster") {
+            println!("{}", agent_cli::cluster::USAGE);
+            return;
+        }
         help();
     }
 
@@ -431,6 +436,25 @@ async fn run() {
         if agent_sdk::Role::parse(&role).is_none() {
             usage();
         }
+    }
+
+    if command == "cluster" {
+        let command = agent_cli::cluster::parse(args).unwrap_or_else(|error| {
+            eprintln!("agentctl cluster: {error}\n{}", agent_cli::cluster::USAGE);
+            std::process::exit(2);
+        });
+        if let Some(ids) = command.attempt_ids() {
+            eprintln!("{ids}");
+        }
+        let mut profile = ConnectionProfile::from_env().unwrap_or_else(|error| {
+            eprintln!("agentctl cluster: {error}");
+            std::process::exit(2);
+        });
+        if let Some(address) = address_override { profile.address = address; }
+        let record = Box::pin(agent_cli::cluster::run(command, profile, token.as_deref()))
+            .await.unwrap_or_else(|error| fail(error));
+        print_json(&record, "cluster operation record");
+        return;
     }
 
     // Keep recovery's kernel construction outside the wire-command frame.

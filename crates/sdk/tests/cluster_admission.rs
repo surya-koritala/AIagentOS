@@ -50,7 +50,13 @@ async fn challenged_admission_forms_three_distinct_members_through_public_client
         let mut identities = std::collections::BTreeSet::new();
         for server in [&authority, &peers[0], &peers[1]] {
             let mut node_client = server.client().await;
-            let identity = node_client.node_info().await.unwrap().control.unwrap().identity;
+            let identity = node_client
+                .node_info()
+                .await
+                .unwrap()
+                .control
+                .unwrap()
+                .identity;
             let member = ClusterClient::admit_node_with_operation_ids(
                 &mut authority_client,
                 &mut node_client,
@@ -71,7 +77,14 @@ async fn challenged_admission_forms_three_distinct_members_through_public_client
         }
         let membership = authority_client.cluster_membership().await.unwrap();
         assert_eq!(membership.members.len(), 3);
-        assert_eq!(membership.members.iter().map(|member| member.node_id.clone()).collect::<std::collections::BTreeSet<_>>(), identities);
+        assert_eq!(
+            membership
+                .members
+                .iter()
+                .map(|member| member.node_id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            identities
+        );
         authority_client.close().await.unwrap();
     })
     .await
@@ -94,40 +107,67 @@ async fn duplicate_challenge_and_mutation_ids_refuse_before_either_endpoint_rece
                 let mut read = BufReader::new(read);
                 let mut greeting = String::new();
                 read.read_line(&mut greeting).await.unwrap();
-                assert!(matches!(serde_json::from_str::<Syscall>(&greeting).unwrap(), Syscall::Hello { .. }));
+                assert!(matches!(
+                    serde_json::from_str::<Syscall>(&greeting).unwrap(),
+                    Syscall::Hello { .. }
+                ));
                 let mut response = serde_json::to_vec(&SyscallReply::Hello {
                     protocol_version: agent_sdk::PROTOCOL_VERSION,
                     min_protocol_version: 1,
                     server_version: "cluster-admission-fixture".into(),
                     features: Vec::new(),
-                }).unwrap();
+                })
+                .unwrap();
                 response.push(b'\n');
                 write.write_all(&response).await.unwrap();
                 let mut after_greeting = Vec::new();
                 read.read_to_end(&mut after_greeting).await.unwrap();
                 write.shutdown().await.unwrap();
                 after_greeting
-            }).await.expect("bounded endpoint request capture")
+            })
+            .await
+            .expect("bounded endpoint request capture")
         }));
         clients.push(KernelClient::connect(address).await.unwrap());
     }
     let id = uuid::Uuid::new_v4();
-    let operation_ids = ClusterAdmissionOperationIds { challenge: id, mutation: id };
+    let operation_ids = ClusterAdmissionOperationIds {
+        challenge: id,
+        mutation: id,
+    };
     let mut node = clients.pop().unwrap();
     let mut authority = clients.pop().unwrap();
     let error = ClusterClient::admit_node_with_operation_ids(
-        &mut authority, &mut node, "127.0.0.1:7443", None,
-        "duplicate operation receipt rejection", operation_ids,
-    ).await.unwrap_err();
+        &mut authority,
+        &mut node,
+        "127.0.0.1:7443",
+        None,
+        "duplicate operation receipt rejection",
+        operation_ids,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.wire_code(), Some(WireErrorCode::InvalidArgument));
     let error = ClusterClient::prepare_node_certificate_rollout_with_operation_ids(
-        &mut authority, &mut node, "127.0.0.1:7443", "11".repeat(32),
-        1, 30, 5, "duplicate certificate receipt rejection", operation_ids,
-    ).await.unwrap_err();
+        &mut authority,
+        &mut node,
+        "127.0.0.1:7443",
+        "11".repeat(32),
+        1,
+        30,
+        5,
+        "duplicate certificate receipt rejection",
+        operation_ids,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.wire_code(), Some(WireErrorCode::InvalidArgument));
     authority.close().await.unwrap();
     node.close().await.unwrap();
     for endpoint in endpoints {
-        assert!(endpoint.await.unwrap().is_empty(), "a refused admission wrote a request after the opening handshake");
+        assert!(
+            endpoint.await.unwrap().is_empty(),
+            "a refused admission wrote a request after the opening handshake"
+        );
     }
 }

@@ -666,6 +666,17 @@ macro_rules! boundary_entry {
 /// File, process-memory, and external boundaries outside logical SQLite rows.
 pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
     boundary_entry!(
+        "file/local-cli-corrections",
+        "durable-owner-only-file",
+        "current filesystem operator",
+        "explicit local operator and default tenant; never implicitly shared with remote agents",
+        "correction text, operator provenance, and bounded conversation-agent-tenant ownership IDs",
+        "until local operator removal; 32 corrections, 128 conversation bindings, 256 KiB total",
+        "not application-encrypted; owner-only Unix mode or protected current-user Windows DACL",
+        "excluded from database backups; operator must protect and recover separately",
+        "unlearn removes a correction; operator-owned file retirement clears bindings; erased or stale agents cannot resume"
+    ),
+    boundary_entry!(
         "file/sqlite-wal-and-shm",
         "durable-file-sidecar",
         "system",

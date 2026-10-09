@@ -1,8 +1,13 @@
-# AI Agent OS — Full Linux Replication Roadmap
+# AI Agent OS — Historical Linux Analogy Roadmap
+
+> **Historical design inventory; current support is not defined here.** Remaining
+> work is tracked in [#105](https://github.com/surya-koritala/AIagentOS/issues/105)
+> and current evidence in [capabilities.toml](capabilities.toml). Linux concepts
+> below are analogies for a user-space runtime, not Linux ABI or hardware promises.
 
 ## The Complete Picture
 
-Linux isn't just a kernel. It's a kernel + userspace + ecosystem. Here's EVERYTHING mapped:
+This archival checklist maps Linux concepts to proposed agent-runtime concepts.
 
 ---
 

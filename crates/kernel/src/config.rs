@@ -980,6 +980,10 @@ pub struct Config {
     pub embeddings: Option<crate::memory_manager::HttpEmbeddingConfig>,
     #[serde(default)]
     pub provider_routing: HashMap<ProviderId, crate::connector::ProviderRoutingPolicy>,
+    /// Explicit conservative image input bounds for exact models/deployments.
+    /// Empty means image accounting is unknown and image requests fail closed.
+    #[serde(default)]
+    pub image_input_profiles: HashMap<ProviderId, crate::message_content::ImageInputProfile>,
     #[serde(default)]
     pub huggingface_api_mode: HuggingFaceApiMode,
     #[serde(default)]
@@ -1264,6 +1268,7 @@ impl Default for Config {
             default_model: "gpt-4o".to_string(),
             embeddings: None,
             provider_routing: HashMap::new(),
+            image_input_profiles: HashMap::new(),
             huggingface_api_mode: HuggingFaceApiMode::default(),
             huggingface_base_url: None,
             api_keys: HashMap::new(),
@@ -1434,6 +1439,51 @@ impl Config {
     pub fn try_load() -> Result<Self, ConfigLoadError> {
         let path = config_file_path();
         Self::try_load_from(&path)
+    }
+
+    /// Terminal credentials and policy require current-owner-only storage.
+    pub fn try_load_private() -> Result<Self, ConfigLoadError> {
+        match Self::try_load_private_from(&config_file_path()) {
+            Err(ConfigLoadError::Read { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(Self::default())
+            }
+            result => result,
+        }
+    }
+
+    /// Read a bounded private config without following a final symlink or
+    /// Windows reparse object. Legacy general configuration loading is unchanged.
+    pub fn try_load_private_from(path: &Path) -> Result<Self, ConfigLoadError> {
+        let mut file = match crate::learning::open_private_existing(path) {
+            Ok(file) => file,
+            Err(source) => {
+                return Err(ConfigLoadError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        };
+        use std::io::Read;
+        let mut content = String::new();
+        file.by_ref()
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut content)
+            .map_err(|source| ConfigLoadError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if content.len() > 1024 * 1024 {
+            return Err(ConfigLoadError::Read {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "private terminal configuration exceeds 1 MiB",
+                ),
+            });
+        }
+        Self::from_toml_at(&content, path)
     }
 
     /// Load config from a specific path.
@@ -1743,6 +1793,36 @@ fn default_data_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_terminal_config_rejects_missing_oversized_and_non_private_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private-config.toml");
+        assert!(Config::try_load_private_from(&path).is_err());
+        let config = Config::default();
+        config.save_to(&path).unwrap();
+        assert_eq!(
+            Config::try_load_private_from(&path).unwrap().llm_provider,
+            config.llm_provider
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let alias = root.path().join("config-alias.toml");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            assert!(Config::try_load_private_from(&alias).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(Config::try_load_private_from(&path).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            crate::windows_private_fs::grant_world_read_for_test(&path, false);
+            assert!(Config::try_load_private_from(&path).is_err());
+            config.save_to(&path).unwrap();
+        }
+        super::write_owner_only_atomic(&path, &vec![b'a'; 1024 * 1024 + 1]).unwrap();
+        assert!(Config::try_load_private_from(&path).is_err());
+    }
     use super::*;
 
     #[test]

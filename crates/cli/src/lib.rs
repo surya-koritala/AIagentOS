@@ -14,6 +14,7 @@ pub mod policy;
 /// Keeping this in the library prevents the server, interactive CLI, and
 /// desktop shell from drifting on credential-source or endpoint behavior.
 pub mod providers;
+pub mod slash;
 
 /// An authenticated (or deliberately unauthenticated) `agentctl` session.
 ///

@@ -12,6 +12,9 @@ const MATURITY_MODEL: [&str; 5] = [
     "production-qualified",
 ];
 
+#[path = "public_claims.rs"]
+mod public_claims;
+
 #[derive(Debug, Deserialize)]
 struct Registry {
     schema_version: u32,
@@ -1595,7 +1598,7 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "signed-updater foundation",
         "TAURI_SIGNING_PRIVATE_KEY",
         "automatic downgrade is not enabled",
-        "public `v*` tag is deliberately rejected",
+        "that requests desktop assets is deliberately rejected",
         "failed-update, and operator-led rollback evidence",
     ] {
         assert!(

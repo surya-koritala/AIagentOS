@@ -27,6 +27,9 @@ use std::time::Duration;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+pub use crate::message_content::{
+    ContentPart, ImageInput, ImageInputProfile, ImageMediaType, MessageContent,
+};
 use crate::{AgentId, ConnectorError, ProviderId};
 
 /// Classify a connector error as transient (worth retrying) or permanent.
@@ -51,8 +54,10 @@ pub fn is_transient(err: &ConnectorError) -> bool {
         | ConnectorError::Authorization(_)
         | ConnectorError::InvalidRequest(_)
         | ConnectorError::ToolIncompatiblePrimary(_)
+        | ConnectorError::UnsupportedContent(_)
         | ConnectorError::ContentFiltered(_)
-        | ConnectorError::Cancelled(_) => false,
+        | ConnectorError::Cancelled(_)
+        | ConnectorError::UnsupportedFeature(_) => false,
     }
 }
 
@@ -197,7 +202,7 @@ pub struct ProviderInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StandardMessage {
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,10 +306,20 @@ pub fn validate_provider_history(
 }
 
 impl StandardMessage {
+    pub fn user_content(content: MessageContent) -> Self {
+        Self {
+            role: "user".into(),
+            content,
+            tool_call_id: None,
+            tool_calls: None,
+            provider_metadata: None,
+        }
+    }
+
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             tool_call_id: None,
             tool_calls: None,
             provider_metadata: None,
@@ -313,7 +328,7 @@ impl StandardMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             tool_call_id: None,
             tool_calls: None,
             provider_metadata: None,
@@ -322,7 +337,7 @@ impl StandardMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             tool_call_id: None,
             tool_calls: None,
             provider_metadata: None,
@@ -331,7 +346,7 @@ impl StandardMessage {
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".into(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
             provider_metadata: None,
@@ -548,6 +563,13 @@ pub trait LlmSession: Send + Sync {
         None
     }
 
+    /// Preflight user content before compaction, budget reservation and I/O.
+    /// Custom/text-only sessions conservatively reject attachments.
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::message_content::reject_unsupported(messages, self.provider_id())?;
+        Ok(0)
+    }
+
     /// Actual provider and model that served the latest successful call.
     fn last_attribution(&self) -> Option<(ProviderId, String)> {
         None
@@ -681,6 +703,36 @@ pub trait LlmProviderAdapter: Send + Sync {
     fn provider_type(&self) -> ProviderType;
     async fn is_available(&self) -> bool;
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError>;
+    /// Explicit discovery using this adapter's configured endpoint/credential.
+    /// Older and on-device adapters conservatively report unsupported.
+    async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
+        Err(ConnectorError::unsupported_feature(
+            self.id().clone(),
+            "model discovery is not supported by this adapter",
+        ))
+    }
+    /// Dropping the discovery future stops transport I/O. Catalog lookup does
+    /// not retry, fail over, create a session, or execute any model.
+    async fn list_models_controlled(
+        &self,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<String>, ConnectorError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ConnectorError::cancelled(self.id().clone(), None)),
+            result = tokio::time::timeout(crate::model_discovery::MODEL_DISCOVERY_TIMEOUT, self.list_models()) => {
+                result.map_err(|_| ConnectorError::timeout(self.id().clone(), "model discovery deadline exceeded", None))?
+            }
+        }
+    }
+
+    fn image_input_profile(&self) -> Option<&ImageInputProfile> {
+        None
+    }
+
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        crate::message_content::validate_messages(messages, self.id(), self.image_input_profile())
+    }
     /// Conservative HTTP/inference attempts one adapter session may start.
     /// Protocol negotiation retries must be reserved before provider I/O.
     fn max_provider_attempts(&self) -> u32 {
@@ -814,10 +866,70 @@ impl AgentConnectorImpl {
         }
     }
 
+    /// Retrieve only a registered provider's identifier catalog. Release the
+    /// registry guard before I/O and recheck bounds for third-party adapters.
+    pub async fn list_provider_models(
+        &self,
+        provider_id: &ProviderId,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model_discovery::ModelCatalog, ConnectorError> {
+        let adapter = self
+            .providers
+            .get(provider_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| {
+                ConnectorError::ProviderUnavailable("configured provider not registered".into())
+            })?;
+        if !adapter.capabilities().model_discovery {
+            return Err(ConnectorError::unsupported_feature(
+                adapter.id().clone(),
+                "model discovery is not supported by this adapter",
+            ));
+        }
+        let models = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ConnectorError::cancelled(adapter.id().clone(), None)),
+            result = tokio::time::timeout(crate::model_discovery::MODEL_DISCOVERY_TIMEOUT, adapter.list_models_controlled(cancellation)) => {
+                result.map_err(|_| ConnectorError::timeout(adapter.id().clone(), "model discovery deadline exceeded", None))??
+            }
+        };
+        Ok(crate::model_discovery::ModelCatalog {
+            provider_id: adapter.id().clone(),
+            models: crate::model_discovery::normalize_model_ids(models)?,
+        })
+    }
+
     /// Override the retry/backoff policy (builder-style).
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
+    }
+
+    /// Reserve the largest supported model-specific image bound before the
+    /// first attempt. Unsupported backups never receive attachment bytes.
+    fn content_token_bound(
+        &self,
+        primary: &ProviderId,
+        messages: &[StandardMessage],
+    ) -> Result<u32, ConnectorError> {
+        let primary_adapter = self
+            .providers
+            .get(primary)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| ConnectorError::ProviderUnavailable(primary.clone()))?;
+        let mut bound = primary_adapter.validate_content(messages)?;
+        for id in self.failover_chain(primary).into_iter().skip(1) {
+            if let Some(adapter) = self
+                .providers
+                .get(&id)
+                .map(|entry| Arc::clone(entry.value()))
+            {
+                if let Ok(candidate) = adapter.validate_content(messages) {
+                    bound = bound.max(candidate);
+                }
+            }
+        }
+        Ok(bound)
     }
 
     /// Probe each registered adapter at snapshot time. Unlike
@@ -1083,6 +1195,7 @@ impl AgentConnectorImpl {
             return Err(ConnectorError::cancelled(primary.clone(), None));
         }
         self.validate_primary_tool_policy(primary, tools)?;
+        self.content_token_bound(primary, &messages)?;
         let primary_type = self
             .providers
             .get(primary)
@@ -1097,6 +1210,13 @@ impl AgentConnectorImpl {
                     continue;
                 }
             };
+            if let Err(error) = adapter.validate_content(&messages) {
+                if provider_index == 0 {
+                    return Err(error);
+                }
+                last_err = Some(error);
+                continue;
+            }
             if !self.provider_is_compatible(
                 &primary_type,
                 adapter.as_ref(),
@@ -1373,6 +1493,9 @@ struct ResilientSession {
 
 #[async_trait::async_trait]
 impl LlmSession for ResilientSession {
+    fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+        self.connector.content_token_bound(&self.primary, messages)
+    }
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
         self.send_with_tools(messages, &[]).await
     }

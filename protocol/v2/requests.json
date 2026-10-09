@@ -245,6 +245,27 @@
   },
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",
+    "content": [
+      {
+        "text": "fixture",
+        "type": "text"
+      }
+    ],
+    "op": "send_message_content"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "content": [
+      {
+        "text": "fixture",
+        "type": "text"
+      }
+    ],
+    "op": "send_message_content_stream",
+    "request_id": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
     "message": "fixture",
     "op": "send_message_stream",
     "request_id": "fixture"
@@ -289,6 +310,10 @@
   },
   {
     "op": "list_providers"
+  },
+  {
+    "op": "list_provider_models",
+    "provider_id": "fixture"
   },
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",

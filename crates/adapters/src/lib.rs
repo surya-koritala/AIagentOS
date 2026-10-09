@@ -259,6 +259,7 @@ pub mod gemini;
 pub mod groq;
 pub mod huggingface;
 pub mod local;
+mod model_discovery;
 /// In-process, pure-Rust GGUF inference. Heavy; only compiled with `--features
 /// candle`. The on-device counterpart to [`local`].
 #[cfg(feature = "candle")]
@@ -266,6 +267,9 @@ pub mod on_device;
 pub mod openai;
 mod openai_chat;
 pub mod streaming;
+mod vision;
+#[cfg(test)]
+mod vision_tests;
 pub mod vllm;
 
 #[cfg(test)]
@@ -302,3 +306,6 @@ mod native_messages_streaming_tests;
 
 #[cfg(test)]
 mod local_streaming_tests;
+
+#[cfg(test)]
+mod model_discovery_tests;

@@ -34,7 +34,11 @@ pub mod mac;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory_manager;
+pub mod message_content;
 pub mod metrics;
+pub mod model_discovery;
+#[cfg(test)]
+mod model_discovery_tests;
 pub mod models;
 #[cfg(feature = "wasm")]
 pub mod modules;
@@ -464,6 +468,9 @@ pub enum ConnectorError {
     #[error("Primary provider tool incompatibility: {0:?}")]
     ToolIncompatiblePrimary(ProviderErrorContext),
 
+    #[error("Provider content unsupported: {0:?}")]
+    UnsupportedContent(ProviderErrorContext),
+
     #[error("Provider content filter blocked request: {0:?}")]
     ContentFiltered(ProviderErrorContext),
 
@@ -472,9 +479,20 @@ pub enum ConnectorError {
 
     #[error("Provider request cancelled: {0:?}")]
     Cancelled(ProviderErrorContext),
+
+    #[error("Provider feature unsupported: {0:?}")]
+    UnsupportedFeature(ProviderErrorContext),
 }
 
 impl ConnectorError {
+    pub fn unsupported_content(provider: ProviderId) -> Self {
+        Self::UnsupportedContent(Self::provider_context(
+            provider,
+            "image or audio input is unsupported or lacks a bounded model profile",
+            None,
+        ))
+    }
+
     fn provider_context(
         provider: ProviderId,
         message: impl Into<String>,
@@ -555,6 +573,10 @@ impl ConnectorError {
         ))
     }
 
+    pub fn unsupported_feature(provider: ProviderId, message: impl Into<String>) -> Self {
+        Self::UnsupportedFeature(Self::provider_context(provider, message, None))
+    }
+
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Authentication(context)
@@ -562,9 +584,11 @@ impl ConnectorError {
             | Self::ServiceUnavailable(context)
             | Self::InvalidRequest(context)
             | Self::ToolIncompatiblePrimary(context)
+            | Self::UnsupportedContent(context)
             | Self::ContentFiltered(context)
             | Self::Timeout(context)
-            | Self::Cancelled(context) => context.request_id.as_deref(),
+            | Self::Cancelled(context)
+            | Self::UnsupportedFeature(context) => context.request_id.as_deref(),
             Self::RateLimited(limit) => limit.context.request_id.as_deref(),
             Self::ProviderUnavailable(_)
             | Self::ConnectionFailed(_)
@@ -5413,8 +5437,107 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         message: &str,
     ) -> Result<AgentOutput, KernelError> {
-        self.send_message_inner(agent_id, message, None, None, None)
+        self.send_message_inner(agent_id, message.into(), None, None, None, false)
             .await
+    }
+
+    /// Configure the trusted embedded terminal's executor. This host-only
+    /// operation is deliberately absent from the remote syscall interface.
+    pub async fn configure_local_cli_agent(
+        &self,
+        agent_id: AgentId,
+        store: Arc<crate::learning::RuleStore>,
+        system_prompt: String,
+        conversation: Option<&str>,
+    ) -> Result<String, KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        let lifecycle = self.lifecycle_lock(agent_id);
+        let _guard = lifecycle.lock().await;
+        if store.scope() != &crate::learning::RuleScope::local_cli()
+            || !store.is_durable()
+            || store.operator()
+                != crate::config::local_operator_identity()
+                    .map_err(|error| KernelError::Policy(error.to_string()))?
+            || self.context_manager.agent_tenant(agent_id)?.as_deref()
+                != Some(crate::context::DEFAULT_TENANT)
+        {
+            return Err(KernelError::Policy(
+                "local CLI corrections require the local operator scope and tenant".into(),
+            ));
+        }
+        if self.get_agent_status(agent_id)? != AgentState::Running
+            || self.syscall_gate.pid_of(agent_id).is_none()
+        {
+            return Err(KernelError::Policy(
+                "local CLI conversation owner is not an eligible running agent".into(),
+            ));
+        }
+        self.syscall_gate
+            .cgroup_quota_constraints(agent_id)
+            .map_err(|error| KernelError::Policy(error.message()))?;
+        if let Some(conversation) = conversation {
+            let binding = store
+                .cli_conversation(conversation)
+                .map_err(|error| KernelError::Policy(error.to_string()))?
+                .ok_or_else(|| {
+                    KernelError::Policy(
+                        "conversation is not registered to this local operator".into(),
+                    )
+                })?;
+            if binding.agent_id != agent_id || binding.tenant_id != crate::context::DEFAULT_TENANT {
+                return Err(KernelError::Policy(
+                    "conversation registry owner does not match this agent and tenant".into(),
+                ));
+            }
+            if self.context_manager.conversation_owner(conversation)? != agent_id {
+                return Err(KernelError::Policy(
+                    "conversation belongs to another agent".into(),
+                ));
+            }
+            if !self
+                .context_manager
+                .list_generation_checkpoints(&binding.tenant_id, Some(agent_id))?
+                .is_empty()
+            {
+                return Err(KernelError::Policy("conversation has an unfinished checkpoint; use the governed checkpoint-resume flow".into()));
+            }
+        }
+        let executor = self.ensure_executor(agent_id).await?;
+        let mut executor = executor.try_lock().map_err(|_| {
+            KernelError::Policy("cannot configure CLI corrections during an active turn".into())
+        })?;
+        executor.configure_terminal_prompt(system_prompt, conversation)?;
+        executor.set_rule_store(store)?;
+        Ok(executor.conversation_id.clone())
+    }
+
+    /// Generate text-only steps under ordinary turn admission, provider
+    /// quotas, cancellation, retries, output limits, and usage accounting.
+    pub async fn generate_plan(
+        &self,
+        agent_id: AgentId,
+        task: &str,
+    ) -> Result<crate::planning::Plan, KernelError> {
+        crate::planning::validate_plan_task(task)?;
+        let output = self
+            .send_message_inner(agent_id, task.into(), None, None, None, true)
+            .await?;
+        let result: Result<crate::planning::Plan, String> = serde_json::from_str(&output.content)
+            .map_err(|error| {
+            KernelError::Policy(format!("invalid governed plan result: {error}"))
+        })?;
+        result.map_err(KernelError::Policy)
+    }
+
+    /// Trusted embedded hosts may interrupt an active turn. Remote clients
+    /// use their separately authorized exact-request cancellation syscall.
+    pub fn cancel_local_turn(&self, agent_id: AgentId) -> bool {
+        if let Some(cancellation) = self.active_cancellations.get(&agent_id) {
+            cancellation.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     /// Send a message while publishing bounded execution events and registering
@@ -5446,10 +5569,11 @@ impl AgentKernelImpl {
         }
         self.send_message_inner(
             agent_id,
-            message,
+            message.into(),
             Some(request_id.to_string()),
             Some(events),
             request_fence,
+            false,
         )
         .await
     }
@@ -5486,13 +5610,58 @@ impl AgentKernelImpl {
         true
     }
 
+    pub async fn send_message_content(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_inner(agent_id, content, None, None, None, false)
+            .await
+    }
+
+    pub async fn send_message_content_stream(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_content_stream_with_fence(agent_id, content, request_id, events, None)
+            .await
+    }
+
+    pub(crate) async fn send_message_content_stream_with_fence(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+        request_fence: Option<ActiveRequestFence>,
+    ) -> Result<AgentOutput, KernelError> {
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err(KernelError::Policy(
+                "request id must contain 1..=128 bytes".into(),
+            ));
+        }
+        self.send_message_inner(
+            agent_id,
+            content,
+            Some(request_id.into()),
+            Some(events),
+            request_fence,
+            false,
+        )
+        .await
+    }
+
     async fn send_message_inner(
         &self,
         agent_id: AgentId,
-        message: &str,
+        message: crate::message_content::MessageContent,
         request_id: Option<String>,
         events: Option<tokio::sync::mpsc::Sender<crate::execution::StreamEvent>>,
         request_fence: Option<ActiveRequestFence>,
+        planning: bool,
     ) -> Result<AgentOutput, KernelError> {
         // Serialize executor creation against pause/stop/kill and reject work
         // unless the agent is currently runnable.
@@ -5601,7 +5770,16 @@ impl AgentKernelImpl {
         // Set/clear around `run` (not via `?`) so the slot is freed even when
         // the turn errors.
         self.scheduler.set_running(agent_id);
-        let run_result = executor.run_resumable(message).await;
+        let run_result = if planning {
+            match message.legacy_text() {
+                Some(task) => executor.run_plan(task).await,
+                None => Err(KernelError::Policy(
+                    "planning requires legacy text input".into(),
+                )),
+            }
+        } else {
+            executor.run_content_resumable(message).await
+        };
         executor.clear_event_channel();
         drop(registration);
         let output = match run_result? {
@@ -6230,7 +6408,23 @@ mod tests {
         database: &LiveErasureCrashDatabase,
         scope: &str,
     ) -> (String, String, AgentId) {
-        let kernel = AgentKernelImpl::from_config(&database.config()).unwrap();
+        let opened = AgentKernelImpl::from_config(&database.config());
+        #[cfg(windows)]
+        if opened.is_err() {
+            let mut lock_name = database.path.as_os_str().to_os_string();
+            lock_name.push(".lock");
+            let lock = std::path::PathBuf::from(lock_name);
+            for (label, path, directory) in [
+                ("parent", &database.root, true),
+                ("database", &database.path, false),
+                ("lease", &lock, false),
+            ] {
+                let exists = std::fs::symlink_metadata(path).is_ok();
+                let verified = crate::windows_private_fs::verify_path(path, directory);
+                eprintln!("erasure_seed_object label={label} exists={exists} protected={} error_kind={:?} os_error={:?}", verified.is_ok(), verified.as_ref().err().map(std::io::Error::kind), verified.as_ref().err().and_then(std::io::Error::raw_os_error));
+            }
+        }
+        let kernel = opened.unwrap();
         let tenant = kernel
             .create_tenant(&format!("{scope}-live-erasure"))
             .await
@@ -6310,6 +6504,8 @@ mod tests {
         subject: &str,
         step: &str,
     ) {
+        let child_temporary = database.root.join("crash-process-temp");
+        std::fs::create_dir(&child_temporary).unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--ignored")
             .arg("live_erasure_crash_child_only")
@@ -6320,9 +6516,11 @@ mod tests {
             // Rehydration reconciles the process-local managed workspace root.
             // Give every crash child its own root so it cannot classify a
             // concurrently running test process's workspaces as orphaned.
-            .env("TMPDIR", &database.root)
-            .env("TMP", &database.root)
-            .env("TEMP", &database.root)
+            // Keep this separate from the private database parent, whose ACL
+            // must not be mistaken for a shared temporary-root mutation.
+            .env("TMPDIR", &child_temporary)
+            .env("TMP", &child_temporary)
+            .env("TEMP", &child_temporary)
             .status()
             .unwrap();
         assert_eq!(

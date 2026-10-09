@@ -2564,18 +2564,21 @@ mod tests {
     struct PackageCrashDatabase {
         path: std::path::PathBuf,
         archive_path: std::path::PathBuf,
+        _directory: tempfile::TempDir,
     }
 
     impl PackageCrashDatabase {
         fn new(operation: &str, step: usize) -> Self {
             let id = uuid::Uuid::new_v4();
+            let directory = tempfile::tempdir().unwrap();
             Self {
-                path: std::env::temp_dir().join(format!(
+                path: directory.path().join(format!(
                     "aiagentos-package-crash-{operation}-{step}-{id}.db"
                 )),
-                archive_path: std::env::temp_dir().join(format!(
+                archive_path: directory.path().join(format!(
                     "aiagentos-package-crash-{operation}-{step}-{id}.agent"
                 )),
+                _directory: directory,
             }
         }
     }
@@ -3405,8 +3408,8 @@ mod tests {
 
     #[test]
     fn installed_state_survives_restart_and_backup_boundary() {
-        let path =
-            std::env::temp_dir().join(format!("agentos-package-{}.db", uuid::Uuid::new_v4()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("package.db");
         let store = Arc::new(SqliteContextManager::new(&path).unwrap());
         let registry = PackageRegistry::from_store(store);
         let (key, _) = PackageSigningKey::generate("alice", "release-1").unwrap();
@@ -3442,10 +3445,7 @@ mod tests {
             .unwrap();
         drop(registry);
 
-        let backup_path = std::env::temp_dir().join(format!(
-            "agentos-package-backup-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let backup_path = directory.path().join("package-backup.db");
         std::fs::copy(&path, &backup_path).unwrap();
         let reopened =
             PackageRegistry::from_store(Arc::new(SqliteContextManager::new(&backup_path).unwrap()));
@@ -3457,6 +3457,7 @@ mod tests {
                 .len(),
             1
         );
+        drop(reopened);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));

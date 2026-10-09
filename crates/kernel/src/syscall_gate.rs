@@ -608,6 +608,7 @@ impl SyscallGate {
             .map(|record| (record.cgroup, record.pid, record.accepting_tool_calls))
             .ok_or(GateDenial::UnknownAgent)?;
         self.acquire_tool_call_for_record(cgroup, pid, accepting_tool_calls)
+            .inspect_err(|error| self.record_agent_denial(kid, error))
     }
     /// Create a gate with the production baseline: enforcing MAC, profile-based
     /// allow rules, and a default-deny fallthrough. Tests that intentionally
@@ -1861,6 +1862,15 @@ impl SyscallGate {
             .get(&agent_id)
             .map(|stats| *stats)
             .unwrap_or_default()
+    }
+
+    /// Registry declaration rejection happens before policy admission. Count
+    /// that terminal verdict without exposing declaration or resource details.
+    pub(crate) fn record_invalid_tool_declaration(&self, agent_id: uuid::Uuid) {
+        self.denied_unknown.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut stats) = self.agent_stats.get_mut(&agent_id) {
+            stats.denied_unknown = stats.denied_unknown.saturating_add(1);
+        }
     }
 
     /// Sum only the supplied identities, used for tenant-safe operations

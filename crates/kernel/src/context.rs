@@ -22,6 +22,8 @@ mod branching;
 mod clone_store;
 #[path = "context/fact_index.rs"]
 pub(crate) mod fact_index;
+#[cfg(test)]
+mod image_input_tests;
 #[path = "context/shared_spills.rs"]
 mod shared_spills;
 pub use branching::{
@@ -4310,6 +4312,7 @@ impl SqliteContextManager {
     ) -> Result<(), ContextError> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4352,7 +4355,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let text_content: String = tail_messages
             .iter()
-            .map(|m| m.content.as_str())
+            .map(|m| m.content.text_projection())
             .collect::<Vec<_>>()
             .join(" ");
         transaction.execute(
@@ -4366,6 +4369,20 @@ impl SqliteContextManager {
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(())
+    }
+
+    /// Load a conversation's messages.
+    pub fn conversation_owner(&self, id: &str) -> Result<AgentId, ContextError> {
+        let owner: String = self
+            .locked_conn()
+            .query_row(
+                "SELECT agent_id FROM conversations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        uuid::Uuid::parse_str(&owner)
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))
     }
 
     /// Load a conversation's messages.
@@ -4712,7 +4729,7 @@ impl SqliteContextManager {
                 &format!("WITH shared_spill_bytes AS ({}), context_bytes(agent_id, byte_count) AS (
                     SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM contexts
                     UNION ALL
-                    SELECT agent_id, SUM(LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0)) FROM facts GROUP BY agent_id
+                    SELECT agent_id, SUM({fact_bytes}) FROM facts INDEXED BY idx_facts_storage_bytes GROUP BY agent_id
                     UNION ALL
                     SELECT c.agent_id, LENGTH(CAST(c.messages_json AS BLOB)) + COALESCE(s.logical_bytes - 2, 0)
                         + CASE WHEN s.message_count > 0 AND json_array_length(c.messages_json) > 0 THEN 1 ELSE 0 END
@@ -4736,7 +4753,7 @@ impl SqliteContextManager {
                         'default'
                     ) = ?2 THEN byte_count ELSE 0 END), 0),
                     COALESCE(SUM(byte_count), 0)
-                FROM context_bytes",shared_spills::LOGICAL_SPILL_BYTES),
+                FROM context_bytes",shared_spills::LOGICAL_SPILL_BYTES, fact_bytes = fact_index::STORAGE_BYTE_EXPRESSION),
                 params![agent_id.to_string(), tenant_id],
                 |row| {
                     Ok((
@@ -4854,6 +4871,7 @@ impl SqliteContextManager {
             ));
         }
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         Self::purge_expired_spills_locked(&mut conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -5636,6 +5654,7 @@ impl SqliteContextManager {
         let json = serde_json::to_string(checkpoint)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -7651,6 +7670,10 @@ impl SqliteContextManager {
         self.list_snapshots(agent_id)
     }
 }
+
+#[cfg(test)]
+#[path = "context/storage_index_tests.rs"]
+mod storage_index_tests;
 
 #[cfg(test)]
 mod tests {
@@ -9952,15 +9975,18 @@ mod tests {
 
     struct QuotaTestDatabase {
         path: std::path::PathBuf,
+        _directory: tempfile::TempDir,
     }
 
     impl QuotaTestDatabase {
         fn new(label: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
             Self {
-                path: std::env::temp_dir().join(format!(
+                path: directory.path().join(format!(
                     "aiagentos-quota-{label}-{}.db",
                     uuid::Uuid::new_v4()
                 )),
+                _directory: directory,
             }
         }
     }

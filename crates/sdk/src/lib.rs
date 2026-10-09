@@ -54,6 +54,10 @@ pub use kernel::cluster_control::{
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
+pub use kernel::message_content::{
+    ContentPart, ImageInput, ImageInputProfile, ImageMediaType, MessageContent,
+};
+pub use kernel::model_discovery::ModelCatalog;
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::package::{
     InstallPolicy, InstalledPackage, LockedPackage, PackageArchive, PackageDep, PackageFile,
@@ -457,7 +461,7 @@ pub struct LifecycleResult {
 }
 
 /// Snapshot of the syscall gate's enforcement counters.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct GateStats {
     pub allowed: u64,
     pub denied_capability: u64,
@@ -469,12 +473,29 @@ pub struct GateStats {
     pub audited: u64,
 }
 
+impl From<kernel::syscall_gate::GateStats> for GateStats {
+    fn from(stats: kernel::syscall_gate::GateStats) -> Self {
+        Self {
+            allowed: stats.allowed,
+            denied_capability: stats.denied_capability,
+            denied_mac: stats.denied_mac,
+            denied_approval: stats.denied_approval,
+            denied_cgroup: stats.denied_cgroup,
+            denied_namespace: stats.denied_namespace,
+            denied_unknown: stats.denied_unknown,
+            audited: stats.audited,
+        }
+    }
+}
+
 /// One agent's gate-enforced process identity and granted namespaces.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AgentEnforcementInfo {
     pub pid: u64,
     pub capabilities: Vec<String>,
     pub namespaces: Vec<u64>,
+    /// Process-local decisions; reset on restart. Older servers default to zero.
+    pub gate_decisions: GateStats,
 }
 
 /// A kernel node's load/health snapshot (reply to `node_info`).
@@ -1053,6 +1074,111 @@ impl KernelClient {
             }),
             other => Err(unexpected("Message", &other)),
         }
+    }
+
+    pub async fn send_message_content(
+        &mut self,
+        agent_id: impl Into<String>,
+        content: MessageContent,
+    ) -> Result<MessageResult, SdkError> {
+        match self
+            .call(Syscall::SendMessageContent {
+                agent_id: agent_id.into(),
+                content,
+            })
+            .await?
+        {
+            SyscallReply::Message {
+                content,
+                tool_calls,
+                tokens,
+            } => Ok(MessageResult {
+                content,
+                tool_calls,
+                tokens,
+            }),
+            other => Err(unexpected("Message", &other)),
+        }
+    }
+
+    pub async fn send_message_content_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        content: MessageContent,
+    ) -> Result<MessageResult, SdkError> {
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::SendMessageContent { agent_id, content },
+            )
+            .await?
+        {
+            SyscallReply::Message {
+                content,
+                tool_calls,
+                tokens,
+            } => Ok(MessageResult {
+                content,
+                tool_calls,
+                tokens,
+            }),
+            other => Err(unexpected("Message", &other)),
+        }
+    }
+
+    pub async fn send_message_content_stream<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        content: MessageContent,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let request_id = request_id.into();
+        self.send_message_stream_call(
+            request_id.clone(),
+            Syscall::SendMessageContentStream {
+                request_id,
+                agent_id: agent_id.into(),
+                content,
+            },
+            on_event,
+        )
+        .await
+    }
+
+    pub async fn send_message_content_stream_fenced<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        content: MessageContent,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let request_id = request_id.into();
+        let agent_id = agent_id.into();
+        self.send_message_stream_call(
+            request_id.clone(),
+            Syscall::FencedAgentMutation {
+                agent_id: agent_id.clone(),
+                proof,
+                mutation: Box::new(Syscall::SendMessageContentStream {
+                    request_id,
+                    agent_id,
+                    content,
+                }),
+            },
+            on_event,
+        )
+        .await
     }
 
     /// Drive one turn and deliver ordered stream events as they arrive.
@@ -1810,13 +1936,26 @@ impl KernelClient {
                 pid,
                 capabilities,
                 namespaces,
+                gate_decisions,
             } => Ok(AgentEnforcementInfo {
                 pid,
                 capabilities,
                 namespaces,
+                gate_decisions: gate_decisions.into(),
             }),
             other => Err(unexpected("AgentInfo", &other)),
         }
+    }
+
+    /// Read one owned agent's gate decisions with ReadOnly tenant authority.
+    /// Counters are process-local and reset on restart. Compatible older
+    /// servers omit them and return zero; inspect `agent_gate_statistics` in
+    /// the protocol feature list to distinguish unsupported exposure.
+    pub async fn agent_gate_stats(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<GateStats, SdkError> {
+        Ok(self.agent_info(agent_id).await?.gate_decisions)
     }
 
     /// Negotiate the wire protocol with the server.
@@ -2610,6 +2749,23 @@ impl KernelClient {
         match self.call(Syscall::ListProviders).await? {
             SyscallReply::Providers { providers } => Ok(providers),
             other => Err(unexpected("Providers", &other)),
+        }
+    }
+
+    /// Explicit configured-provider discovery. Requires a trusted system
+    /// connection; tenant users and tenant admins cannot enumerate catalogs.
+    pub async fn list_provider_models(
+        &mut self,
+        provider_id: impl Into<String>,
+    ) -> Result<ModelCatalog, SdkError> {
+        match self
+            .call(Syscall::ListProviderModels {
+                provider_id: provider_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::ProviderModels { catalog } => Ok(catalog),
+            other => Err(unexpected("ProviderModels", &other)),
         }
     }
 
@@ -3630,6 +3786,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::GateStats
             | Syscall::AgentInfo { .. }
             | Syscall::ListProviders
+            | Syscall::ListProviderModels { .. }
             | Syscall::MemoryQuery { .. }
             | Syscall::StorageGet { .. }
             | Syscall::StorageList { .. }
@@ -3683,7 +3840,10 @@ fn mutation_operation_name(call: &Syscall) -> &'static str {
         Syscall::CallTool { .. } | Syscall::VfsInvoke { .. } => "tool call",
         Syscall::VfsOpen { .. } => "VFS open",
         Syscall::VfsClose { .. } => "VFS close",
-        Syscall::SendMessage { .. } | Syscall::SendMessageStream { .. } => "agent turn",
+        Syscall::SendMessage { .. }
+        | Syscall::SendMessageStream { .. }
+        | Syscall::SendMessageContent { .. }
+        | Syscall::SendMessageContentStream { .. } => "agent turn",
         Syscall::FencedAgentMutation { mutation, .. } => mutation_operation_name(mutation),
         _ => "side-effecting syscall",
     }

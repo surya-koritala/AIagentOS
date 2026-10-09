@@ -1,9 +1,9 @@
 # Production observability contract
 
-AgentOS telemetry contract v1 defines the names, types, units, and complete
+AgentOS telemetry contract v2 defines the names, types, units, and complete
 bounded label sets of every Prometheus family exported by the kernel. The
 machine-readable source of truth is
-[`observability/telemetry-contract-v1.toml`](../observability/telemetry-contract-v1.toml);
+[`observability/telemetry-contract-v2.toml`](../observability/telemetry-contract-v2.toml);
 regression tests compare every rendered `# TYPE` family with that catalog and
 reject forbidden high-cardinality label classes.
 
@@ -40,9 +40,72 @@ records `cancelled`, so transport cancellation cannot leak the in-flight gauge.
 The fixed request-latency histogram supports p95/p99 calculations without
 request, tenant, agent, tool, or provider labels.
 
+Compiled runtime identity uses five `agentos_build_source_sha1{part}` gauges
+with fixed `part` values `0` through `4`, each carrying one exact 32-bit segment,
+and `agentos_build_source_verified`. The build script reads the actual tracked
+Git source and marks missing metadata or dirty source unverified. Numeric
+segments preserve fixed label cardinality across builds. Target observations
+require every segment to reconstruct the expected clean commit; package builds
+without Git metadata remain usable but cannot supply eligible source evidence.
+
+`RequestSubsystem::request_class` defines the latency split in one place.
+Agent, checkpoint, memory, storage and tool traffic use the `agent` class;
+authentication, cluster, operator, package, protocol, service and system traffic
+use `control`. The split is by subsystem, so every storage request remains in
+the agent class, including a privileged storage operation. Exporters must use
+this declared split rather than independently reclassifying operations.
+
+`agentos_request_class_total` is a request counter with only the fixed `class`
+label. `agentos_request_class_duration_seconds` is a seconds histogram with
+`class` and the existing fixed bucket boundaries. Both project the same
+completed observations as the subsystem families, including all outcomes, and
+add no second observation path. Existing v1 subsystem families are retained;
+class counters also reset on process restart.
+
+`agentos_llm_requests_total{outcome}` counts admitted provider-adapter invocations
+as success, failed, timed out or cancelled. A dropped invocation future is counted
+as cancelled. Admission and content/policy refusals before invocation do not enter
+this denominator; quota denials retain their existing counters. Executor retries
+are separate invocations, while retries inside one adapter remain part of that
+adapter invocation. The family carries no provider, model, tenant or agent label.
+
+`agentos_quota_storage_healthy_seconds_total` and
+`agentos_quota_storage_unhealthy_seconds_total` are fractional-second counters
+derived from monotonic time and the actual durable-ledger health transition.
+They start with the limiter, retain subsecond intervals and require no scrape
+frequency assumption. Persistence failures latch the ledger unhealthy until
+restart, so every guard/drop failure uses the same transition source. Counters
+reset on restart; qualification must detect restarts and cannot infer a 30-day
+continuous observation from one process's counters after a reset.
+
+`agentos_checkpoint_recovery_attempts_total` counts completed restoration
+attempts. `agentos_checkpoint_recovery_total{outcome}` distinguishes recovered
+context from safe rejection before continuation execution. Their coherent
+snapshot maintains `recovered + safe_rejected = attempted`; running restores
+are not included until classified. Provider failure after context restoration
+is represented by the provider outcome family. Explicit foreign-tenant
+checkpoint IDs are measured by `agentos_checkpoint_cross_tenant_attempts_total`,
+and an observed foreign restoration increments
+`agentos_checkpoint_cross_tenant_recoveries_total`. Corrupt payload identity,
+version and serialized content fail before continuation execution.
+
+Expected-denial probes use trusted in-process harness entry points, with no
+wire, MCP or package operation for tagging ordinary traffic.
+`SyscallGate::probe_expected_tool_denial` exercises actual gate authorization
+without executing a provider; `probe_expected_tenant_denial` resolves a current
+leased credential and checks the same recorded-target authorization as public
+dispatch. Both declare deny explicitly and count only completed decisions.
+Ordinary calls cannot inflate these denominators. Auth/sandbox probes emit
+`agentos_adversarial_attempts_total` and `agentos_unexpected_allows_total`;
+tenant probes emit `agentos_tenant_boundary_attempts_total` and
+`agentos_confirmed_violations_total`. Invalid credentials/targets and cancelled
+unclassified probes do not establish a decision and cannot satisfy the minimum
+attempt requirement. These counters establish measured authorization decisions;
+native sandbox breakout qualification remains separate.
+
 Protocol negotiation, malformed framing rejected before dispatch, the raw HTTP
 scrape handler, and external provider-side spans are not yet separate metric
-series. External OpenTelemetry export is not bundled in contract v1; JSON logs
+series. External OpenTelemetry export is not bundled in contract v2; JSON logs
 are the supported trace export.
 
 ## Export, disable, and privacy
@@ -70,14 +133,14 @@ already met them:
 | Required SLI | Measurement | Target | Window |
 | --- | --- | --- | --- |
 | Availability | `success / (success + failed + timed_out + cancelled)` | at least 99.5% | rolling 30 days |
-| Syscall latency | request histogram, split by bounded subsystem | non-agent/tool p95 below 1 second; agent p95 below 30 seconds with provider profile | rolling 24 hours |
+| Syscall latency | `agentos_request_class_duration_seconds` and class request counts | control p95 below 1 second; agent p95 below 30 seconds with provider profile | rolling 24 hours |
 | Queue wait | turn/LLM wait-time deltas divided by admissions, plus waiting/capacity and starvation totals | mean below 250 ms and zero starvation increments under the qualified profile | rolling 24 hours |
-| LLM success | eligible `agent` request outcomes, provider health/circuit state, and exact live-provider qualification | at least 99% excluding policy/quota rejection | rolling 24 hours |
+| LLM success | admitted `agentos_llm_requests_total` adapter outcomes and exact live-provider qualification | at least 99% excluding policy/quota rejection before invocation | rolling 24 hours |
 | Tool success | eligible `tool` request outcomes and gate decisions | at least 99.5% after allowed admission | rolling 24 hours |
-| Auth and sandbox denial | rejected auth requests and bounded gate denial reasons | zero unexpected allows; denial volume has no success target | per release and incident |
-| Data durability | quota-ledger health, storage encryption state, signed-backup success/freshness, and restore drill | ledger healthy continuously; verified backup within 25 hours; restore drill passes | continuous/per release |
-| Checkpoint recovery | exact release checkpoint pause/restart/resume qualification report | 100% recovered or documented safe rejection; zero cross-tenant recovery | per release |
-| Tenant isolation | authorization/gate evidence plus adversarial cross-tenant suite and game day | zero confirmed isolation violations | per release |
+| Auth and sandbox denial | explicit expected-denial probe attempts/unexpected allows, plus native isolation qualification | zero unexpected allows; ordinary denial volume has no success target | per release and incident |
+| Data durability | monotonic ledger healthy/unhealthy seconds, storage encryption state, signed-backup success/freshness, and restore drill | ledger healthy continuously without unobserved resets; verified backup within 25 hours; restore drill passes | continuous/per release |
+| Checkpoint recovery | coherent completed recovery counts and exact release pause/restart/resume report | 100% recovered or documented safe rejection; zero cross-tenant recovery | per release |
+| Tenant isolation | explicit leased-credential probe attempts/confirmed violations plus adversarial suite and game day | zero confirmed isolation violations | per release |
 
 Eligible availability requests are `success + failed + timed_out + cancelled`.
 `rejected` is excluded because policy enforcement and invalid input are expected
@@ -108,7 +171,7 @@ underlying signal recovers. This qualifies PromQL evaluation and rule state
 transitions, not delivery through a deployment's Alertmanager receiver.
 The importable
 [`observability/grafana-dashboard.json`](../observability/grafana-dashboard.json)
-uses only contract-v1 families and includes request success/rate/p95, queues,
+uses the retained v1 subset of contract v2 and includes request success/rate/p95, queues,
 gate decisions, durability, backup, and lifecycle panels.
 
 Credential compromise, tenant leak, malicious package, node/process loss,

@@ -35,17 +35,28 @@ pub mod mac;
 mod managed_workspace;
 
 /// Bounded local maintenance output; no wire or tool grants this authority.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceOwnershipStatus {
     pub admitted_agents: Vec<AgentId>,
     pub unresolved: Vec<WorkspaceOwnershipIssue>,
     pub truncated: bool,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOwnershipKind {
+    LegacyNamespace,
+    ForeignDatastore,
+    MalformedLifecycle,
+    MalformedConfiguration,
+    VerificationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceOwnershipIssue {
     pub agent_id: AgentId,
     pub recorded_workspace: std::path::PathBuf,
-    pub reason: &'static str,
+    pub kind: WorkspaceOwnershipKind,
+    pub reason: String,
 }
 pub mod mcp;
 pub mod mcp_server;
@@ -665,6 +676,9 @@ pub enum SandboxError {
 
     #[error("Sandbox boundary violation: {0}")]
     BoundaryViolation(String),
+
+    #[error("Recorded workspace ownership requires explicit local resolution: {0:?}")]
+    OwnershipResolutionRequired(WorkspaceOwnershipKind),
 }
 
 // ─── Built-in Resource Providers ─────────────────────────────────────────────
@@ -1236,6 +1250,7 @@ pub struct AgentKernelImpl {
     /// Stable, bounded-cardinality request outcomes and latency. Correlation
     /// identifiers remain in trace spans and never become metric labels.
     pub(crate) request_telemetry: crate::telemetry::RequestTelemetry,
+    pub(crate) provider_outcomes: Arc<crate::telemetry::ProviderOutcomeCounters>,
     /// Kernel background loops ended by a panic in this process. Non-zero means
     /// restart policy, the turn watchdog, procfs publication, or scheduled
     /// backup has stopped running and will not resume without a restart.
@@ -1348,6 +1363,7 @@ pub struct PeripheralRevocation {
 enum ConfigStartupMode {
     Runtime,
     WorkspaceMaintenance,
+    RecoveryQualification,
 }
 
 impl AgentKernelImpl {
@@ -1451,7 +1467,7 @@ impl AgentKernelImpl {
         Ok(())
     }
 
-    pub(crate) fn from_config_with_storage_lease(
+    pub(crate) fn from_config_with_storage_lease_for_recovery(
         config: &crate::config::Config,
         storage_lease: crate::storage::StorageLease,
     ) -> Result<Self, KernelError> {
@@ -1459,7 +1475,7 @@ impl AgentKernelImpl {
         Self::from_validated_config_with_storage_lease(
             config,
             storage_lease,
-            ConfigStartupMode::Runtime,
+            ConfigStartupMode::RecoveryQualification,
         )
     }
 
@@ -1547,7 +1563,7 @@ impl AgentKernelImpl {
         if let Some(service_dir) = config
             .service_dir
             .as_ref()
-            .filter(|_| matches!(mode, ConfigStartupMode::Runtime))
+            .filter(|_| !matches!(mode, ConfigStartupMode::WorkspaceMaintenance))
         {
             *kernel
                 .service_directory
@@ -1795,6 +1811,7 @@ impl AgentKernelImpl {
             active_requests: DashMap::new(),
             lifecycle_counters: crate::metrics::LifecycleCounters::default(),
             request_telemetry: crate::telemetry::RequestTelemetry::default(),
+            provider_outcomes: Arc::new(crate::telemetry::ProviderOutcomeCounters::default()),
             background_task_panics: std::sync::atomic::AtomicU64::new(0),
             service_operation_lock: tokio::sync::Mutex::new(()),
             service_health_checks: DashMap::new(),
@@ -1925,7 +1942,8 @@ impl AgentKernelImpl {
                         .map(|config| config.workspace_dir)
                         .unwrap_or_default();
                     unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:path,
-                        reason:"recorded lifecycle status is malformed; original status, identity and owned data were preserved; repair the record before admission" });
+                        kind: WorkspaceOwnershipKind::MalformedLifecycle,
+                        reason:"recorded lifecycle status is malformed; original status, identity and owned data were preserved; repair the record before admission".into() });
                     continue;
                 }
             }
@@ -1947,21 +1965,26 @@ impl AgentKernelImpl {
                         break;
                     }
                     unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:std::path::PathBuf::new(),
-                        reason:"recorded sandbox configuration is malformed; original JSON, status and data were preserved; repair the record before admission" });
+                        kind: WorkspaceOwnershipKind::MalformedConfiguration,
+                        reason:"recorded sandbox configuration is malformed; original JSON, status and data were preserved; repair the record before admission".into() });
                     continue;
                 }
             };
-            if self
+            if let Err(error) = self
                 .sandbox_manager
                 .restored_workspace_is_managed(&config, record.id)
-                .is_err()
             {
                 if unresolved.len() == 256 {
                     truncated = true;
                     break;
                 }
+                let kind = match error {
+                    SandboxError::OwnershipResolutionRequired(kind) => kind,
+                    _ => WorkspaceOwnershipKind::VerificationFailed,
+                };
                 unresolved.push(WorkspaceOwnershipIssue { agent_id: record.id, recorded_workspace: config.workspace_dir,
-                    reason: "recorded workspace ownership is unresolved; data and identity were preserved" });
+                    kind,
+                    reason: "recorded workspace ownership is unresolved; data and identity were preserved".into() });
             }
         }
         Ok(WorkspaceOwnershipStatus {
@@ -3592,9 +3615,19 @@ impl AgentKernelImpl {
     /// Best-effort: a rehydration error is logged, not fatal, so a kernel still
     /// boots on a partially-readable DB.
     fn rehydrate_agents_blocking(&self) {
+        match self.rehydrate_agents_checked_blocking() {
+            Ok(ids) if !ids.is_empty() => {
+                tracing::info!("Rehydrated {} agent(s) from persistent store", ids.len());
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("Agent rehydration failed: {error}"),
+        }
+    }
+
+    pub(crate) fn rehydrate_agents_checked_blocking(&self) -> Result<Vec<AgentId>, KernelError> {
         // SAFETY/scoping: `std::thread::scope` lets the spawned thread borrow
         // `self` for its lifetime, so no `'static`/`Arc` is required here.
-        let result = std::thread::scope(|s| {
+        std::thread::scope(|s| {
             s.spawn(|| {
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -3607,15 +3640,12 @@ impl AgentKernelImpl {
                 }
             })
             .join()
-        });
-        match result {
-            Ok(Ok(ids)) if !ids.is_empty() => {
-                tracing::info!("Rehydrated {} agent(s) from persistent store", ids.len());
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!("Agent rehydration failed: {e}"),
-            Err(_) => tracing::warn!("Agent rehydration thread panicked"),
-        }
+        })
+        .map_err(|_| {
+            KernelError::Context(ContextError::StorageError(
+                "agent rehydration thread panicked".into(),
+            ))
+        })?
     }
 
     /// Rebind durable service ownership only after agent rehydration. A live
@@ -5336,9 +5366,13 @@ impl AgentKernelImpl {
             return Ok((AgentState::Running, None, None));
         };
 
-        let stored =
-            self.context_manager
-                .claim_generation_checkpoint(checkpoint_id, agent_id, &tenant)?;
+        let mut recovery_observation = self.context_manager.checkpoint_recovery_observation();
+        let stored = self.context_manager.claim_generation_checkpoint_observed(
+            checkpoint_id,
+            agent_id,
+            &tenant,
+            &mut recovery_observation,
+        )?;
         let executor = match self.ensure_executor(agent_id).await {
             Ok(executor) => executor,
             Err(error) => {
@@ -5391,6 +5425,8 @@ impl AgentKernelImpl {
         };
         self.scheduler.set_running(agent_id);
         let baseline = stored.checkpoint.clone();
+        recovery_observation.recovered();
+        drop(recovery_observation);
         let run_result = executor.resume(stored.checkpoint).await;
         self.active_cancellations.remove(&agent_id);
         match self.agent_manager.get_agent_state(agent_id) {
@@ -5513,6 +5549,7 @@ impl AgentKernelImpl {
         }
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
+        executor.set_provider_outcomes(self.provider_outcomes.clone());
         executor.set_context_budget(self.context_budget_tokens);
         let tenant_id = self
             .context_manager

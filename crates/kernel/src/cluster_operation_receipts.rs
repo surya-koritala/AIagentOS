@@ -578,11 +578,30 @@ mod tests {
         let store = SqliteContextManager::in_memory().unwrap();
         let original = call(uuid::Uuid::new_v4());
         let receipt = prepared(&store, &original, None);
-        let diagnostic = SyscallReply::Error { message: "TLS certificate binding cannot be removed during rejoin".into() };
+        let diagnostic = SyscallReply::Error {
+            message: "TLS certificate binding cannot be removed during rejoin".into(),
+        };
         let returned = complete(&store, receipt, &diagnostic).unwrap_err();
-        assert_eq!(serde_json::to_value(returned).unwrap(), serde_json::to_value(diagnostic).unwrap());
-        code(prepare(&store, "receipt-node", &original, None).err().unwrap(), WireErrorCode::Conflict);
-        let pending: bool = store.conn.lock().unwrap().query_row("SELECT phase = 'pending' AND reply_json IS NULL FROM cluster_operation_receipts", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(diagnostic).unwrap()
+        );
+        code(
+            prepare(&store, "receipt-node", &original, None)
+                .err()
+                .unwrap(),
+            WireErrorCode::Conflict,
+        );
+        let pending: bool = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT phase = 'pending' AND reply_json IS NULL FROM cluster_operation_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(pending);
     }
 }

@@ -3125,6 +3125,8 @@ pub async fn start_configured_cluster_runtime(
     context: Arc<SqliteContextManager>,
     config: &ClusterRaftConfig,
 ) -> io::Result<Option<ClusterRaftRuntime>> {
+    crate::destination_authority::bind_runtime_configuration(&context, config)
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "destination authority contract refused startup"))?;
     let Some(runtime_config) = ClusterRaftRuntimeConfig::from_operator_config(config)? else {
         return Ok(None);
     };

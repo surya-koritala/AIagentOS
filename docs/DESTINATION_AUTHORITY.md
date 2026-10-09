@@ -1,9 +1,10 @@
 # Online quorum destination admission
 
 This is the destination contract required by #432, coordinated with immutable
-agent reservations in #434. The current branch implements the signature and
-request-binding primitives. Configuration, dispatch, protocol discovery,
-reservation persistence, clients and fault qualification remain in progress.
+agent reservations in #434. The current branch implements signature and request
+binding, explicit configuration and a durable installation-mode binding.
+Dispatch, protocol discovery, reservation persistence, clients and fault
+qualification remain in progress; compiler and runtime results remain pending.
 The feature is not yet advertised by `hello` and is not production-qualified.
 
 ## Mode and trust

@@ -1528,6 +1528,12 @@ impl AgentKernelImpl {
             context_store = context_store.with_embedder(Arc::new(embedding));
         }
         let context_manager = Arc::new(context_store);
+        if matches!(mode, ConfigStartupMode::Runtime) {
+            crate::destination_authority::bind_runtime_configuration(
+                &context_manager,
+                &config.cluster_raft,
+            ).map_err(KernelError::Context)?;
+        }
         tracing::info!(
             target: "agentos::storage",
             storage_encryption_enabled = context_manager.storage_encryption_key_id().is_some(),

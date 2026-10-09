@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p kernel --lib --locked destination_authority::tests -- --nocapture 2>&1 | tee destination-proof.log
+          cargo test -p kernel --lib --locked destination_ -- --nocapture 2>&1 | tee destination-proof.log
           cargo test -p integration-tests --locked capability_registry -- --nocapture 2>&1 | tee destination-registry.log
           cargo clippy -p kernel --all-targets --locked -- -D warnings 2>&1 | tee destination-clippy.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

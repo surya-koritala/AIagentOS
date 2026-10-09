@@ -12,13 +12,15 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 16;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 // Older readers flatten native stream boundaries and cannot retain ordered
 // multipart user content, durable cluster-operation receipts, or independent
 // principal genesis/proofs and their committed clock evidence. Refuse them
 // before mutation or snapshot replay can discard required authorization.
-pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 15;
+// The destination contract also persists a required mode that older readers
+// cannot enforce after a configuration change or restore.
+pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 16;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
@@ -36,6 +38,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (13, "preserve-ordered-multipart-message-content"),
     (14, "retain-actor-bound-cluster-operation-receipts"),
     (15, "require-independent-principal-authority-history"),
+    (16, "retain-required-online-destination-contract"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +96,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "cluster_node_control",
     "cluster_node_control_audit",
     "cluster_operation_receipts",
+    "destination_authority_contract",
     "cluster_membership_authority",
     "cluster_join_challenges",
     "cluster_members",
@@ -447,6 +451,7 @@ pub(crate) fn verify(connection: &Connection) -> Result<(), ContextError> {
         ));
     }
     crate::accounting_integrity::verify(connection)?;
+    crate::destination_authority::validate_contract_store(connection)?;
     Ok(())
 }
 

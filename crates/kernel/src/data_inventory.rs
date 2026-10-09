@@ -609,6 +609,15 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "retain applied consensus state"
     ),
     sqlite_entry!(
+        "destination_authority_contract",
+        "system",
+        "none",
+        "required destination mode, cluster binding and immutable installation identity",
+        "for installation lifetime",
+        "database confidentiality and integrity apply",
+        "retain required admission contract across restore and never erase on tenant deletion"
+    ),
+    sqlite_entry!(
         "cluster_raft_snapshot",
         "system",
         "none",

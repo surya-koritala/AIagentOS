@@ -471,6 +471,15 @@ pub struct AuthorityPrincipalAudit {
     pub changed_at: DateTime<Utc>,
 }
 
+/// Startup contract checks use the validated durable projection, including
+/// signed history and snapshot/frontier checks, rather than a partial JSON read.
+pub(crate) fn destination_contract_cluster(
+    connection: &Connection,
+) -> Result<Option<String>, AnyError> {
+    let state = load_persistent_state(connection)?;
+    Ok(state.authority.control_plane.map(|control| control.cluster_id))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredAuthorityReceipt {
     command: AuthorityCommand,

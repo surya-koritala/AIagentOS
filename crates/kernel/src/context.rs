@@ -1989,6 +1989,13 @@ impl SqliteContextManager {
                 admitted_at TEXT NOT NULL,
                 CHECK ((phase = 'pending' AND reply_json IS NULL) OR (phase = 'complete' AND reply_json IS NOT NULL))
             );
+            CREATE TABLE IF NOT EXISTS destination_authority_contract (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                contract_version INTEGER NOT NULL CHECK (contract_version = 1),
+                mode TEXT NOT NULL CHECK (mode = 'online_quorum_v1'),
+                cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+                installation_id TEXT NOT NULL CHECK (length(installation_id) = 36)
+            );
             CREATE TABLE IF NOT EXISTS cluster_node_control_audit (
                 generation INTEGER PRIMARY KEY,
                 previous_availability TEXT NOT NULL,

@@ -1975,6 +1975,48 @@ mod tests {
     }
 
     #[test]
+    fn destination_contract_survives_reopen_and_refuses_disabled_foreign_and_old_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent_os.db");
+        let configured = valid_cluster_raft_config();
+        {
+            let store = crate::context::SqliteContextManager::new(&path).unwrap();
+            crate::destination_authority::bind_runtime_configuration(&store, &configured).unwrap();
+            assert!(crate::destination_authority::bind_runtime_configuration(
+                &store, &ClusterRaftConfig::default(),
+            ).is_err());
+            let mut foreign = configured.clone();
+            foreign.authority_cluster_id = uuid::Uuid::new_v4().to_string();
+            assert!(crate::destination_authority::bind_runtime_configuration(&store, &foreign).is_err());
+            let connection = store.conn.lock().unwrap();
+            assert!(crate::schema::preflight_for_reader(&connection, 15).is_err());
+        }
+        let reopened = crate::context::SqliteContextManager::new(&path).unwrap();
+        crate::destination_authority::bind_runtime_configuration(&reopened, &configured).unwrap();
+        assert!(crate::destination_authority::bind_runtime_configuration(
+            &reopened, &ClusterRaftConfig::default(),
+        ).is_err());
+        let connection = reopened.conn.lock().unwrap();
+        let exact: String = connection.query_row(
+            "SELECT cluster_id FROM destination_authority_contract WHERE singleton = 1", [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(exact, configured.authority_cluster_id);
+        connection.execute(
+            "UPDATE destination_authority_contract SET installation_id = ?1 WHERE singleton = 1",
+            [uuid::Uuid::new_v4().to_string()],
+        ).unwrap();
+        assert!(crate::destination_authority::validate_contract_store(&connection).is_err());
+    }
+
+    #[test]
+    fn unknown_destination_mode_cannot_deserialize_as_a_legacy_default() {
+        assert!(serde_json::from_value::<ClusterRaftConfig>(serde_json::json!({
+            "enabled": false, "destination_authority_mode": "legacy_fallback",
+        })).is_err());
+    }
+
+    #[test]
     fn cluster_raft_configuration_rejects_partial_and_ambiguous_identity() {
         let mut config = valid_cluster_raft_config();
         config.enabled = false;

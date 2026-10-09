@@ -16,6 +16,73 @@ pub const FEATURE: &str = "destination-authority-online-v1";
 const DOMAIN: &[u8] = b"AIagentOS independent destination admission v1\0";
 const MAX_PROOF_TTL_SECONDS: i64 = 30;
 
+fn storage_failure(message: &str) -> crate::ContextError {
+    crate::ContextError::StorageError(message.to_owned())
+}
+
+fn stored_contract(connection: &rusqlite::Connection) -> Result<Option<String>, crate::ContextError> {
+    use rusqlite::OptionalExtension;
+    let saved: Option<(i64, String, String, String)> = connection.query_row(
+        "SELECT contract_version, mode, cluster_id, installation_id
+         FROM destination_authority_contract WHERE singleton = 1", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional().map_err(|_| storage_failure("destination contract cannot be read"))?;
+    let Some((version, mode, cluster_id, installation_id)) = saved else { return Ok(None); };
+    let expected_installation: String = connection.query_row(
+        "SELECT installation_id FROM storage_meta WHERE singleton = 1", [], |row| row.get(0),
+    ).map_err(|_| storage_failure("destination contract has no valid installation metadata"))?;
+    if version != 1 || mode != "online_quorum_v1" || !canonical_uuid(&cluster_id)
+        || !canonical_uuid(&installation_id) || installation_id != expected_installation {
+        return Err(storage_failure("destination contract identity or mode is invalid"));
+    }
+    Ok(Some(cluster_id))
+}
+
+pub(crate) fn validate_contract_store(connection: &rusqlite::Connection) -> Result<(), crate::ContextError> {
+    stored_contract(connection).map(|_| ())
+}
+
+fn legacy_quorum_cluster(connection: &rusqlite::Connection) -> Result<Option<String>, crate::ContextError> {
+    crate::cluster_consensus::destination_contract_cluster(connection)
+        .map_err(|_| storage_failure("previous authority is malformed or inconsistent"))
+}
+
+/// Persist the operator-selected requirement before kernel reconciliation or boot.
+/// No operation clears this record or infers system ownership from a legacy row.
+pub(crate) fn bind_runtime_configuration(
+    store: &crate::context::SqliteContextManager,
+    config: &crate::config::ClusterRaftConfig,
+) -> Result<(), crate::ContextError> {
+    config.validate().map_err(|_| storage_failure("destination contract configuration is invalid"))?;
+    let mut connection = store.conn.lock()
+        .map_err(|_| storage_failure("destination contract store is unavailable"))?;
+    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| storage_failure("destination contract transaction failed"))?;
+    let saved = stored_contract(&transaction)?;
+    let legacy = legacy_quorum_cluster(&transaction)?;
+    if saved.as_ref().zip(legacy.as_ref()).is_some_and(|(saved, legacy)| saved != legacy) {
+        return Err(storage_failure("destination contract differs from the durable quorum identity"));
+    }
+    let prior = saved.or(legacy);
+    if prior.as_ref().is_some_and(|cluster|
+        !config.enabled || config.destination_authority_mode != Some(DestinationAuthorityMode::OnlineQuorumV1)
+            || cluster != &config.authority_cluster_id) {
+        return Err(storage_failure("destination contract refuses disabled, foreign or legacy runtime configuration"));
+    }
+    if config.enabled {
+        transaction.execute(
+            "INSERT OR IGNORE INTO destination_authority_contract
+             (singleton, contract_version, mode, cluster_id, installation_id)
+             SELECT 1, 1, 'online_quorum_v1', ?1, installation_id FROM storage_meta WHERE singleton = 1",
+            [&config.authority_cluster_id],
+        ).map_err(|_| storage_failure("destination contract persistence failed"))?;
+        if stored_contract(&transaction)?.as_deref() != Some(config.authority_cluster_id.as_str()) {
+            return Err(storage_failure("destination contract persistence did not retain the exact identity"));
+        }
+    }
+    transaction.commit().map_err(|_| storage_failure("destination contract commit failed"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DestinationAuthorityMode {

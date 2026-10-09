@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 SUPPORTED_VERSIONS = (1, 2)
 V2_ONLY_OPERATIONS = {
+    "get_destination_contract",
     "submit_signed_authority_command",
     "get_authority_principal_registry",
     "abort_cluster_member_certificate_rollout",

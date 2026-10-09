@@ -3259,7 +3259,7 @@ async fn dispatch_scoped_inner_with_fence(
             };
         }
         return Box::pin(dispatch_scoped_inner_with_fence(
-            kernel, *mutation, None, true, true,
+            kernel, *mutation, principal, true, true,
         ))
         .await;
     }

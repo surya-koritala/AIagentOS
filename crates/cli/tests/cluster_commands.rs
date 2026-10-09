@@ -46,7 +46,11 @@ fn certificate_config(
         .unwrap()
         .signed_by(&key, ca)
         .unwrap();
-    let fingerprint = ring::digest::digest(&ring::digest::SHA256, certificate.der().as_ref()).as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+    let fingerprint = ring::digest::digest(&ring::digest::SHA256, certificate.der().as_ref())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
@@ -579,7 +583,9 @@ async fn actual_cli_drives_certificate_prepare_abort_activate_and_finalize_on_li
     let aborted = run(&authority, &ca_path, &abort).await;
     assert_eq!(aborted["record"].as_object().unwrap().len(), 1);
     let after_abort = run(&authority, &ca_path, &args(&["cluster", "members"])).await;
-    assert!(after_abort.get("certificate_rollouts").is_none_or(|rollouts| rollouts.as_array().unwrap().is_empty()));
+    assert!(after_abort
+        .get("certificate_rollouts")
+        .is_none_or(|rollouts| rollouts.as_array().unwrap().is_empty()));
     assert_eq!(run(&authority, &ca_path, &abort).await, aborted);
     let previous_candidate = candidate_fingerprint;
     let (candidate_config, candidate_fingerprint) = certificate_config(&issuer, &node.hostname);
@@ -685,7 +691,9 @@ async fn actual_cli_drives_certificate_prepare_abort_activate_and_finalize_on_li
     let finalized = run(&authority, &ca_path, &finalize).await;
     assert_eq!(finalized["record"].as_object().unwrap().len(), 1);
     let after_finalize = run(&authority, &ca_path, &args(&["cluster", "members"])).await;
-    assert!(after_finalize.get("certificate_rollouts").is_none_or(|rollouts| rollouts.as_array().unwrap().is_empty()));
+    assert!(after_finalize
+        .get("certificate_rollouts")
+        .is_none_or(|rollouts| rollouts.as_array().unwrap().is_empty()));
     assert_eq!(run(&authority, &ca_path, &finalize).await, finalized);
     tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
         .await

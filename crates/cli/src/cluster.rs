@@ -169,7 +169,8 @@ fn join(
         let mut material = b"AIagentOS cluster CLI challenge operation v1".to_vec();
         material.extend_from_slice(mutation.as_bytes());
         let digest = ring::digest::digest(&ring::digest::SHA256, &material);
-        Uuid::from_slice(&digest.as_ref()[..16]).map_err(|_| "invalid derived challenge UUID".to_string())?
+        Uuid::from_slice(&digest.as_ref()[..16])
+            .map_err(|_| "invalid derived challenge UUID".to_string())?
     };
     if challenge == mutation {
         return Err("challenge and mutation operation UUIDs must differ".into());

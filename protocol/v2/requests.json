@@ -396,6 +396,9 @@
     "op": "describe_protocol"
   },
   {
+    "op": "get_destination_contract"
+  },
+  {
     "op": "ping"
   },
   {

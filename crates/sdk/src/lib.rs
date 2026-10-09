@@ -2028,6 +2028,27 @@ impl KernelClient {
         }
     }
 
+    /// Discover the exact destination contract before sending credentials.
+    pub async fn destination_contract(
+        &mut self,
+    ) -> Result<kernel::destination_authority::DestinationContractDescription, SdkError> {
+        let protocol = self.hello().await?;
+        if !protocol.features.iter().any(|feature|
+            feature == kernel::destination_authority::DISCOVERY_FEATURE) {
+            return Err(SdkError::Wire {
+                code: WireErrorCode::Unsupported,
+                message: "destination contract discovery is unsupported".into(), retryable: false,
+            });
+        }
+        match self.call(Syscall::GetDestinationContract).await? {
+            SyscallReply::DestinationContract { description } if description.version == 1
+                && description.required_mode.is_some() == description.cluster_id.is_some()
+                && (!description.admission_supported || (description.installation_bound
+                    && description.quorum_configured && description.required_mode.is_some())) => Ok(description),
+            other => Err(unexpected("DestinationContract", &other)),
+        }
+    }
+
     /// Verify that this protocol-v2 connection is responsive and reset the
     /// server's established idle deadline.
     pub async fn ping(&mut self) -> Result<(), SdkError> {
@@ -3968,6 +3989,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::Hello { .. }
             | Syscall::Authenticate { .. }
             | Syscall::DescribeProtocol
+            | Syscall::GetDestinationContract
             | Syscall::Ping
             | Syscall::FetchPackage { .. }
             | Syscall::SearchPackages { .. }

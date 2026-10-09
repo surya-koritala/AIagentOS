@@ -646,6 +646,8 @@ pub enum Syscall {
     /// feature identifiers, compatibility behavior, and transport bounds.
     /// Like `Hello`, this is safe before authentication.
     DescribeProtocol,
+    /// Read the required destination contract before presenting credentials.
+    GetDestinationContract,
     /// Prove that a quiet protocol-v2 connection is still responsive and reset
     /// its established idle deadline. Safe before authentication and free of
     /// kernel side effects.
@@ -1338,6 +1340,9 @@ impl WireErrorCode {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SyscallReply {
+    DestinationContract {
+        description: crate::destination_authority::DestinationContractDescription,
+    },
     AgentCloned {
         result: crate::cloning::CloneResult,
     },
@@ -1989,6 +1994,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::Hello { .. } => (AccessLevel::ReadOnly, "protocol.hello", None),
         Syscall::DescribeProtocol => (AccessLevel::ReadOnly, "protocol.describe", None),
+        Syscall::GetDestinationContract => (AccessLevel::ReadOnly, "protocol.destination_contract", None),
         Syscall::Ping => (AccessLevel::ReadOnly, "protocol.ping", None),
         Syscall::Authenticate { .. } => (AccessLevel::ReadOnly, "auth.authenticate", None),
         Syscall::LoadPackage { .. } => (AccessLevel::Admin, "package.load", None),
@@ -2662,6 +2668,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
         call,
         Syscall::Hello { .. }
             | Syscall::DescribeProtocol
+            | Syscall::GetDestinationContract
             | Syscall::Ping
             | Syscall::Authenticate { .. }
             | Syscall::NodeInfo
@@ -4456,6 +4463,13 @@ async fn dispatch_scoped_inner_with_fence(
         },
         Syscall::DescribeProtocol => SyscallReply::ProtocolDescription {
             description: crate::wire_contract::protocol_description(),
+        },
+        Syscall::GetDestinationContract => match crate::destination_authority::describe_contract(kernel) {
+            Ok(description) => SyscallReply::DestinationContract { description },
+            Err(_) => SyscallReply::TypedError {
+                code: WireErrorCode::Unavailable,
+                message: "destination contract is unavailable".into(), retryable: true,
+            },
         },
         Syscall::Ping => SyscallReply::Pong,
         Syscall::LoadPackage { manifest_toml } => {
@@ -7361,6 +7375,16 @@ impl SyscallServer {
                 }
                 Ok(Syscall::DescribeProtocol) => SyscallReply::ProtocolDescription {
                     description: crate::wire_contract::protocol_description(),
+                },
+                Ok(Syscall::GetDestinationContract) if negotiated_version >= 2 => match crate::destination_authority::describe_contract(&kernel) {
+                    Ok(description) => SyscallReply::DestinationContract { description },
+                    Err(_) => SyscallReply::TypedError {
+                        code: WireErrorCode::Unavailable,
+                        message: "destination contract is unavailable".into(), retryable: true,
+                    },
+                },
+                Ok(Syscall::GetDestinationContract) => SyscallReply::Error {
+                    message: "destination contract discovery requires protocol v2".into(),
                 },
                 // Authentication accepts two credentials, tried in order:
                 //   1. the server's shared secret (unchanged legacy path), and
@@ -11116,6 +11140,7 @@ memory = ["remember this"]
                 AccessLevel::ReadOnly,
             ),
             (Syscall::DescribeProtocol, AccessLevel::ReadOnly),
+            (Syscall::GetDestinationContract, AccessLevel::ReadOnly),
             (Syscall::Ping, AccessLevel::ReadOnly),
             (
                 Syscall::LoadPackage {

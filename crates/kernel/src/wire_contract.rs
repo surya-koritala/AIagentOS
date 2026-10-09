@@ -22,6 +22,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "agent_gate_statistics",
     "authorized_cluster_membership",
     "cluster_principal_auth",
+    crate::destination_authority::DISCOVERY_FEATURE,
     crate::cluster_operation_receipts::FEATURE,
     "bounded_certificate_rollout",
     "cluster_ownership_leases",
@@ -591,6 +592,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[],
     },
     Variant {
+        tag: "get_destination_contract",
+        fields: &[],
+    },
+    Variant {
         tag: "ping",
         fields: &[],
     },
@@ -978,6 +983,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                 || !matches!(
                     variant.tag,
                     "send_message_stream"
+                        | "get_destination_contract"
                         | "submit_signed_authority_command"
                         | "get_authority_principal_registry"
                         | "list_provider_models"
@@ -1370,6 +1376,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "protocol_description",
+        fields: &[Field::required("description", O)],
+    },
+    Variant {
+        tag: "destination_contract",
         fields: &[Field::required("description", O)],
     },
     Variant {
@@ -1941,7 +1951,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 133);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 134);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

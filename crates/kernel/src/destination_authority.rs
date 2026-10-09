@@ -13,6 +13,7 @@ use crate::cluster_control::{ClusterMemberState, ClusterOwnershipState};
 use crate::cluster_principal::{AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind};
 
 pub const FEATURE: &str = "destination-authority-online-v1";
+pub const DISCOVERY_FEATURE: &str = "destination-contract-discovery-v1";
 const DOMAIN: &[u8] = b"AIagentOS independent destination admission v1\0";
 const MAX_PROOF_TTL_SECONDS: i64 = 30;
 
@@ -128,6 +129,46 @@ pub(crate) fn bind_runtime_configuration(
 #[serde(rename_all = "snake_case")]
 pub enum DestinationAuthorityMode {
     OnlineQuorumV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationContractDescription {
+    pub version: u16,
+    pub supported_mode: DestinationAuthorityMode,
+    pub required_mode: Option<DestinationAuthorityMode>,
+    pub cluster_id: Option<String>,
+    pub installation_bound: bool,
+    pub quorum_configured: bool,
+    pub admission_supported: bool,
+}
+
+/// Discovery never claims a configured handle is a fresh available quorum.
+pub(crate) fn describe_contract(
+    kernel: &crate::AgentKernelImpl,
+) -> Result<DestinationContractDescription, crate::ContextError> {
+    let connection = kernel.context_manager.conn.lock()
+        .map_err(|_| storage_failure("destination contract store is unavailable"))?;
+    let saved = stored_contract(&connection)?;
+    let prior = legacy_quorum_cluster(&connection)?;
+    if saved.as_ref().zip(prior.as_ref()).is_some_and(|(saved, prior)| saved != prior) {
+        return Err(storage_failure("destination contract differs from durable authority"));
+    }
+    let installation_bound = saved.is_some();
+    let cluster_id = saved.or(prior);
+    drop(connection);
+    Ok(DestinationContractDescription {
+        version: 1,
+        supported_mode: DestinationAuthorityMode::OnlineQuorumV1,
+        required_mode: cluster_id.as_ref().map(|_| DestinationAuthorityMode::OnlineQuorumV1),
+        cluster_id,
+        installation_bound,
+        quorum_configured: kernel.cluster_authority()
+            .map_err(|_| storage_failure("destination authority handle is unavailable"))?.is_some(),
+        // The signed dispatcher must replace this while implementing the full
+        // admission contract. A client must not treat discovery as enforcement.
+        admission_supported: false,
+    })
 }
 
 /// Every ownership field and the full actual mutation are part of the signature.

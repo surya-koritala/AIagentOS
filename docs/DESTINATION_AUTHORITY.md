@@ -5,7 +5,11 @@ agent reservations in #434. The current branch implements signature and request
 binding, explicit configuration and a durable installation-mode binding.
 Dispatch, protocol discovery, reservation persistence, clients and fault
 qualification remain in progress; compiler and runtime results remain pending.
-The feature is not yet advertised by `hello` and is not production-qualified.
+Only `destination-contract-discovery-v1` is advertised by `hello`. Discovery
+reports supported and required modes, cluster binding, installation binding and
+whether a quorum handle is configured. It does not report that quorum is live.
+Signed admission remains unavailable (`admission_supported = false`) until the
+dispatcher is complete; discovery alone never grants permission to mutate.
 
 ## Mode and trust
 

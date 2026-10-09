@@ -51,28 +51,45 @@ pub struct ClusterReconfigurationTarget {
 
 pub(crate) mod canonical_node_catalog {
     use super::*;
-    use serde::{Deserializer, Serializer};
     use serde::de::{Error, MapAccess, Visitor};
     use serde::ser::SerializeMap;
+    use serde::{Deserializer, Serializer};
     use std::fmt;
 
-    pub fn serialize<S: Serializer>(catalog: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>, serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        catalog: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(catalog.len()))?;
-        for (id, node) in catalog { map.serialize_entry(&id.to_string(), node)?; }
+        for (id, node) in catalog {
+            map.serialize_entry(&id.to_string(), node)?;
+        }
         map.end()
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<ClusterRaftNodeId, ClusterRaftNode>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<ClusterRaftNodeId, ClusterRaftNode>, D::Error> {
         struct CatalogVisitor;
         impl<'de> Visitor<'de> for CatalogVisitor {
             type Value = BTreeMap<ClusterRaftNodeId, ClusterRaftNode>;
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str("a bounded catalog with canonical nonzero decimal node keys") }
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded catalog with canonical nonzero decimal node keys")
+            }
             fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
                 let mut catalog = BTreeMap::new();
                 while let Some((key, node)) = access.next_entry::<String, ClusterRaftNode>()? {
-                    let id = key.parse::<u64>().map_err(|_| A::Error::custom("invalid catalog node key"))?;
-                    if id == 0 || id.to_string() != key || catalog.len() >= 31 || catalog.insert(id, node).is_some() {
-                        return Err(A::Error::custom("noncanonical, duplicate, or excess catalog node key"));
+                    let id = key
+                        .parse::<u64>()
+                        .map_err(|_| A::Error::custom("invalid catalog node key"))?;
+                    if id == 0
+                        || id.to_string() != key
+                        || catalog.len() >= 31
+                        || catalog.insert(id, node).is_some()
+                    {
+                        return Err(A::Error::custom(
+                            "noncanonical, duplicate, or excess catalog node key",
+                        ));
                     }
                 }
                 Ok(catalog)
@@ -341,13 +358,23 @@ mod tests {
     #[test]
     fn public_tagged_status_preserves_numeric_catalog_ids_and_rejects_aliases() {
         let reply = crate::syscall_server::SyscallReply::ClusterReconfigurationStatus {
-            reconfiguration: ClusterReconfigurationStatus { current: current(), target: None, operation_id: None, settled: true },
+            reconfiguration: ClusterReconfigurationStatus {
+                current: current(),
+                target: None,
+                operation_id: None,
+                settled: true,
+            },
         };
         let bytes = serde_json::to_vec(&reply).unwrap();
         let decoded: crate::syscall_server::SyscallReply = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(serde_json::to_value(decoded).unwrap(), serde_json::to_value(&reply).unwrap());
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(&reply).unwrap()
+        );
         let mut invalid = serde_json::to_value(reply).unwrap();
-        let catalog = invalid["reconfiguration"]["current"]["catalog"].as_object_mut().unwrap();
+        let catalog = invalid["reconfiguration"]["current"]["catalog"]
+            .as_object_mut()
+            .unwrap();
         let node = catalog.remove("1").unwrap();
         catalog.insert("01".into(), node);
         assert!(serde_json::from_value::<crate::syscall_server::SyscallReply>(invalid).is_err());

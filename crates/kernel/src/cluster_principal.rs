@@ -245,28 +245,6 @@ fn encode_canonical_json(
     Ok(())
 }
 
-#[cfg(test)]
-mod canonical_tests {
-    use super::*;
-
-    #[test]
-    fn canonical_bytes_sort_nested_objects_and_preserve_array_order() {
-        let value: serde_json::Value =
-            serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":[{"y":true,"x":"quoted"},3]}"#).unwrap();
-        let mut encoded = Vec::new();
-        encode_canonical_json(&value, &mut encoded).unwrap();
-        assert_eq!(
-            encoded,
-            br#"{"a":[{"x":"quoted","y":true},3],"z":{"a":2,"b":1}}"#
-        );
-        let reordered: serde_json::Value =
-            serde_json::from_str(r#"{"a":[3,{"x":"quoted","y":true}],"z":{"a":2,"b":1}}"#).unwrap();
-        let mut other = Vec::new();
-        encode_canonical_json(&reordered, &mut other).unwrap();
-        assert_ne!(encoded, other);
-    }
-}
-
 fn append_field(payload: &mut Vec<u8>, value: &str) -> Result<(), PrincipalProofError> {
     let length = u32::try_from(value.len()).map_err(|_| PrincipalProofError::InvalidProof)?;
     payload.extend_from_slice(&length.to_be_bytes());
@@ -605,4 +583,26 @@ pub(crate) fn fixture_signed_generation(
         |payload| Ok(fixture_key().sign(payload).as_ref().to_vec()),
     )
     .expect("sign explicit CI command fixture")
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_bytes_sort_nested_objects_and_preserve_array_order() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":[{"y":true,"x":"quoted"},3]}"#).unwrap();
+        let mut encoded = Vec::new();
+        encode_canonical_json(&value, &mut encoded).unwrap();
+        assert_eq!(
+            encoded,
+            br#"{"a":[{"x":"quoted","y":true},3],"z":{"a":2,"b":1}}"#
+        );
+        let reordered: serde_json::Value =
+            serde_json::from_str(r#"{"a":[3,{"x":"quoted","y":true}],"z":{"a":2,"b":1}}"#).unwrap();
+        let mut other = Vec::new();
+        encode_canonical_json(&reordered, &mut other).unwrap();
+        assert_ne!(encoded, other);
+    }
 }

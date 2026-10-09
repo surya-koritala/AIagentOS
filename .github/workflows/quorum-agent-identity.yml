@@ -94,11 +94,20 @@ jobs:
       - name: Require formatted source before compilation
         run: test ! -s target/qualification/agent-identity-format/rustfmt.patch
   evidence:
-    name: Immutable identity protocol and quorum evidence
+    name: Immutable identity protocol and quorum evidence (${{ matrix.os }})
     needs: format
     if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.stage != 'format'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -109,7 +118,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
-          shared-key: quorum-agent-identity
+          shared-key: quorum-agent-identity-${{ matrix.os }}
       - name: Retain source identity
         run: |
           mkdir -p target/qualification/agent-identity
@@ -118,7 +127,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo check -p kernel -p agent-sdk --all-targets 2>&1 | tee target/qualification/agent-identity/compiler.txt
+          cargo check -p kernel -p agent-sdk -p agent-cli -p agent-tui --all-targets --locked 2>&1 | tee target/qualification/agent-identity/compiler.txt
       - name: Immutable identity transitions and corruption refusal
         if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.stage == 'focused'
         shell: bash
@@ -133,10 +142,12 @@ jobs:
           cargo test -p kernel wire_contract --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/wire-rust.txt
           python3 -m unittest discover -s scripts/tests -p test_verify_wire_fixtures.py 2>&1 | tee target/qualification/agent-identity/wire-python.txt
       - name: Strict lint
-        run: cargo clippy -p kernel -p agent-sdk --all-targets -- -D warnings
+        run: |
+          set -o pipefail
+          cargo clippy -p kernel -p agent-sdk -p agent-cli -p agent-tui --all-targets --locked -- -D warnings 2>&1 | tee target/qualification/agent-identity/clippy.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: agent-identity-proof-${{ github.event.pull_request.head.sha || github.sha }}
+          name: agent-identity-proof-${{ matrix.os }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: target/qualification/agent-identity
           retention-days: 30

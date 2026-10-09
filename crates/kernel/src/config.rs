@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::ProviderId;
 
+/// Read a caller-owned principal PKCS#8 key through the existing private-file
+/// boundary. The bytes remain local to the caller and are erased on drop.
+pub fn read_private_principal_key(path: &Path) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    let mut file = crate::learning::open_private_existing(path)?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.by_ref().take(4097).read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "principal key must contain 1 to 4096 bytes",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Per-token-class pricing in USD per 1,000 tokens.
 ///
 /// `cached_input_usd_per_1k_tokens` applies only to the cached subset of
@@ -304,6 +320,9 @@ pub struct ClusterRaftConfig {
     /// must retain the original node-id/public-key list here while publishing
     /// each identity's current challenged endpoint/TLS binding.
     pub authority_genesis_members: Vec<ClusterAuthorityGenesisMemberConfig>,
+    /// Immutable public-only operator seed. No principal private key is held
+    /// by a node; each caller supplies its independently signed command.
+    pub authority_genesis_principals: Vec<crate::cluster_principal::AuthorityPrincipal>,
     /// Complete current challenged application membership, including members
     /// no longer present in the Raft transport catalog. Empty derives this
     /// list from `members` while the two catalogs are still identical.
@@ -353,6 +372,7 @@ impl Default for ClusterRaftConfig {
             node_id: 0,
             authority_cluster_id: String::new(),
             authority_genesis_members: Vec::new(),
+            authority_genesis_principals: Vec::new(),
             authority_members: Vec::new(),
             listen_addr: "127.0.0.1:8788".into(),
             cluster_name: "ai-agent-os".into(),
@@ -652,6 +672,14 @@ impl ClusterRaftConfig {
                 "cluster_raft.authority_genesis_members cannot contain more than 31 members".into(),
             );
         }
+        crate::cluster_principal::genesis_principal_registry(
+            &self.authority_genesis_principals,
+            self.members
+                .iter()
+                .map(|member| member.identity_public_key.clone()),
+            true,
+        )
+        .map_err(|error| format!("cluster_raft.authority_genesis_principals: {error}"))?;
         let mut genesis_node_ids = BTreeSet::new();
         let mut genesis_endpoints = BTreeSet::new();
         let mut genesis_tls_fingerprints = BTreeSet::new();
@@ -1880,6 +1908,7 @@ mod tests {
             std::env::temp_dir().join(format!("agentos-raft-config-{}", uuid::Uuid::new_v4()));
         ClusterRaftConfig {
             enabled: true,
+            authority_genesis_principals: vec![crate::cluster_principal::fixture_operator()],
             bootstrap: true,
             node_id: 1,
             authority_cluster_id: "00000000-0000-0000-0000-000000000100".into(),

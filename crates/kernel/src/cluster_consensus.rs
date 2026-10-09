@@ -128,6 +128,8 @@ pub struct AuthorityGenesisMember {
 pub struct AuthorityGenesis {
     pub cluster_id: String,
     pub members: Vec<AuthorityGenesisMember>,
+    #[serde(default)]
+    pub operator_principals: Vec<crate::cluster_principal::AuthorityPrincipal>,
 }
 
 /// Deterministic commands for the replicated membership and ownership
@@ -136,6 +138,27 @@ pub struct AuthorityGenesis {
 /// a monotonic replicated authority clock before evaluating expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityCommand {
+    /// One independently signed caller envelope; nested/internal commands reject.
+    Authorized {
+        command: Box<AuthorityCommand>,
+        principal_proof: crate::cluster_principal::AuthorityPrincipalProof,
+    },
+    EnrollPrincipal {
+        operation_id: String,
+        principal: crate::cluster_principal::AuthorityPrincipal,
+        expected_generation: Option<u64>,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    RevokePrincipal {
+        operation_id: String,
+        principal_id: String,
+        expected_generation: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
     Initialize {
         operation_id: String,
         genesis: AuthorityGenesis,
@@ -242,9 +265,12 @@ pub enum AuthorityCommand {
 }
 
 impl AuthorityCommand {
-    pub(crate) fn operation_id(&self) -> &str {
+    pub fn operation_id(&self) -> &str {
         match self {
+            Self::Authorized { command, .. } => command.operation_id(),
             Self::Initialize { operation_id, .. }
+            | Self::EnrollPrincipal { operation_id, .. }
+            | Self::RevokePrincipal { operation_id, .. }
             | Self::Barrier { operation_id, .. }
             | Self::AdvanceTime { operation_id, .. }
             | Self::IssueJoinChallenge { operation_id, .. }
@@ -265,6 +291,7 @@ impl AuthorityCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityRejection {
+    PrincipalAuthentication(crate::cluster_principal::PrincipalProofError),
     InvalidOperationId,
     OperationIdConflict,
     SequenceMismatch,
@@ -279,6 +306,13 @@ pub enum AuthorityRejection {
 /// Response returned when an authority log entry is applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityResponse {
+    PrincipalUpdated {
+        operation_id: String,
+        principal: crate::cluster_principal::AuthorityPrincipal,
+        sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+        replayed: bool,
+    },
     /// Blank and membership entries advance OpenRaft metadata only.
     MetadataApplied {
         sequence: u64,
@@ -383,6 +417,12 @@ struct ReplicatedJoinChallenge {
 struct ReplicatedControlPlaneState {
     genesis: AuthorityGenesis,
     cluster_id: String,
+    #[serde(default)]
+    principals: BTreeMap<String, crate::cluster_principal::AuthorityPrincipal>,
+    #[serde(default)]
+    principal_audit: Vec<AuthorityPrincipalAudit>,
+    #[serde(default)]
+    ownership_tenant_scopes: BTreeMap<String, String>,
     membership_generation: u64,
     members: BTreeMap<String, ClusterMember>,
     membership_audit: Vec<ClusterMembershipAudit>,
@@ -413,6 +453,9 @@ type CertificateRolloutAuditHead = (
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicatedAuthorityView {
     pub genesis: AuthorityGenesis,
+    pub principals: BTreeMap<String, crate::cluster_principal::AuthorityPrincipal>,
+    pub principal_audit: Vec<AuthorityPrincipalAudit>,
+    pub ownership_tenant_scopes: BTreeMap<String, String>,
     pub membership: ClusterMembershipSnapshot,
     pub membership_audit: Vec<ClusterMembershipAudit>,
     pub certificate_rollout_audit: Vec<ClusterCertificateRolloutAudit>,
@@ -422,9 +465,18 @@ pub struct ReplicatedAuthorityView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityPrincipalAudit {
+    pub principal: crate::cluster_principal::AuthorityPrincipal,
+    pub authorized_by: String,
+    pub changed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredAuthorityReceipt {
     command: AuthorityCommand,
     response: AuthorityResponse,
+    #[serde(default)]
+    applied_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -463,6 +515,7 @@ pub struct ClusterRaftLogStore {
 #[derive(Clone)]
 pub struct ClusterRaftStateMachine {
     context: Arc<SqliteContextManager>,
+    expected_genesis: Option<AuthorityGenesis>,
 }
 
 /// A frozen state-machine view used to create a consistent snapshot even if
@@ -485,8 +538,45 @@ pub fn open_cluster_raft_storage(
         ClusterRaftLogStore {
             context: context.clone(),
         },
-        ClusterRaftStateMachine { context },
+        ClusterRaftStateMachine {
+            context,
+            expected_genesis: None,
+        },
     ))
+}
+
+pub(crate) fn open_cluster_raft_storage_pinned(
+    context: Arc<SqliteContextManager>,
+    genesis: &AuthorityGenesis,
+) -> ClusterStorageResult<(ClusterRaftLogStore, ClusterRaftStateMachine)> {
+    let (logs, mut state) = open_cluster_raft_storage(context.clone())?;
+    if let Some(view) = read_replicated_authority_view(&context)
+        .map_err(|error| StorageIOError::read_state_machine(read_io(error.to_string())))?
+    {
+        if !same_immutable_genesis(&view.genesis, genesis) {
+            return Err(StorageIOError::read_state_machine(read_io(
+                "durable principal genesis differs from the configured immutable seed",
+            ))
+            .into());
+        }
+    }
+    state.expected_genesis = Some(genesis.clone());
+    Ok((logs, state))
+}
+
+fn same_immutable_genesis(left: &AuthorityGenesis, right: &AuthorityGenesis) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.operator_principals == right.operator_principals
+        && left.members.len() == right.members.len()
+        && left
+            .members
+            .iter()
+            .zip(&right.members)
+            .all(|(left, right)| {
+                left.node_id == right.node_id
+                    && left.public_key == right.public_key
+                    && left.fingerprint == right.fingerprint
+            })
 }
 
 /// Read the locally applied durable Raft membership before the network factory
@@ -523,6 +613,9 @@ pub fn read_replicated_authority_view(
     };
     Ok(Some(ReplicatedAuthorityView {
         genesis: control.genesis,
+        principals: control.principals,
+        principal_audit: control.principal_audit,
+        ownership_tenant_scopes: control.ownership_tenant_scopes,
         membership: ClusterMembershipSnapshot {
             cluster_id: control.cluster_id,
             generation: control.membership_generation,
@@ -712,6 +805,120 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
     }
     if let Some(control) = &state.control_plane {
         validate_control_plane_state(control)?;
+        for receipt in state.receipts.values() {
+            let AuthorityCommand::Authorized {
+                principal_proof, ..
+            } = &receipt.command
+            else {
+                continue;
+            };
+            let historical = control
+                .genesis
+                .operator_principals
+                .iter()
+                .chain(control.principal_audit.iter().map(|audit| &audit.principal))
+                .find(|principal| {
+                    principal.principal_id == principal_proof.principal_id
+                        && principal.generation == principal_proof.principal_generation
+                })
+                .ok_or_else(|| read_io("signed receipt has no historical enrolled principal"))?;
+            let inner = crate::cluster_principal::unsigned_authority_command(&receipt.command)
+                .map_err(|error| read_io(error.to_string()))?;
+            let committed_at = receipt
+                .applied_at
+                .ok_or_else(|| read_io("signed receipt has no committed clock evidence"))?;
+            if crate::cluster_principal::command_proposed_at(inner).is_none() {
+                return Err(read_io("signed receipt contains an internal command"));
+            }
+            crate::cluster_principal::verify_authority_principal(
+                &receipt.command,
+                &control.cluster_id,
+                &BTreeMap::from([(historical.principal_id.clone(), historical.clone())]),
+                committed_at,
+            )
+            .map_err(|error| {
+                read_io(format!(
+                    "signed receipt principal verification failed: {error}"
+                ))
+            })?;
+            let expected_actor = format!("principal:{}", principal_proof.principal_id);
+            let actor_matches = match &receipt.response {
+                AuthorityResponse::MemberUpdated { member, .. } => {
+                    control.membership_audit.iter().any(|audit| {
+                        audit.node_id == member.node_id
+                            && audit.member_generation == member.generation
+                            && audit.actor == expected_actor
+                    })
+                }
+                AuthorityResponse::OwnershipUpdated { ownership, .. } => {
+                    control.ownership_audit.iter().any(|audit| {
+                        audit.agent_id == ownership.agent_id
+                            && audit.generation == ownership.generation
+                            && audit.actor == expected_actor
+                    })
+                }
+                AuthorityResponse::PrincipalUpdated { principal, .. } => {
+                    control.principal_audit.iter().any(|audit| {
+                        audit.principal == *principal
+                            && audit.authorized_by == principal_proof.principal_id
+                    })
+                }
+                AuthorityResponse::CertificateRolloutUpdated { member, .. } => {
+                    control.certificate_rollout_audit.iter().any(|audit| {
+                        audit.node_id == member.node_id
+                            && audit.member_generation == member.generation
+                            && audit.actor == expected_actor
+                    })
+                }
+                AuthorityResponse::JoinChallengeIssued { .. } => true,
+                _ => false,
+            };
+            if !actor_matches {
+                return Err(read_io(
+                    "signed receipt lacks its verified-principal audit identity",
+                ));
+            }
+        }
+        if !control.genesis.operator_principals.is_empty() {
+            let mut replayed = AuthorityState::default();
+            let mut receipts = state.receipts.values().collect::<Vec<_>>();
+            receipts.sort_by_key(|receipt| {
+                successful_response_metadata(&receipt.response).map(|(_, sequence, _, _)| sequence)
+            });
+            for receipt in receipts {
+                let (_, _, log_id, _) = successful_response_metadata(&receipt.response)
+                    .ok_or_else(|| read_io("principal history contains an invalid receipt"))?;
+                let mut command = receipt.command.clone();
+                if matches!(command, AuthorityCommand::Authorized { .. }) {
+                    let at = receipt
+                        .applied_at
+                        .ok_or_else(|| read_io("signed receipt has no committed clock evidence"))?;
+                    crate::cluster_principal::set_committed_command_time(&mut command, at);
+                }
+                let actual = apply_authority_command(&mut replayed, command, log_id);
+                if actual != receipt.response {
+                    return Err(read_io(
+                        "principal history does not reproduce its committed response",
+                    ));
+                }
+            }
+            let Some(mut expected) = replayed.control_plane else {
+                return Err(read_io(
+                    "principal history has no initialized control plane",
+                ));
+            };
+            if expected.logical_time > control.logical_time {
+                return Err(read_io(
+                    "principal authority clock regressed behind its committed history",
+                ));
+            }
+            expected.logical_time = control.logical_time;
+            if expected != *control {
+                return Err(read_io(
+                    "principal authority state does not reproduce its signed history",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -759,6 +966,13 @@ fn successful_response_metadata(
             log_id,
             replayed,
             ..
+        }
+        | AuthorityResponse::PrincipalUpdated {
+            operation_id,
+            sequence,
+            log_id,
+            replayed,
+            ..
         } => Some((operation_id, *sequence, *log_id, *replayed)),
         AuthorityResponse::MetadataApplied { .. }
         | AuthorityResponse::AuthorityTimeAdvanced { .. }
@@ -767,9 +981,15 @@ fn successful_response_metadata(
 }
 
 fn response_matches_command(command: &AuthorityCommand, response: &AuthorityResponse) -> bool {
+    let Ok(command) = crate::cluster_principal::unsigned_authority_command(command) else {
+        return false;
+    };
     matches!(
         (command, response),
         (
+            AuthorityCommand::EnrollPrincipal { .. } | AuthorityCommand::RevokePrincipal { .. },
+            AuthorityResponse::PrincipalUpdated { .. }
+        ) | (
             AuthorityCommand::Initialize { .. },
             AuthorityResponse::ControlPlaneInitialized { .. }
         ) | (
@@ -806,6 +1026,102 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
         return Err(read_io(
             "immutable authority genesis cluster id differs from live authority state",
         ));
+    }
+    let mut expected = crate::cluster_principal::genesis_principal_registry(
+        &control.genesis.operator_principals,
+        control
+            .genesis
+            .members
+            .iter()
+            .map(|member| member.public_key.clone()),
+        false,
+    )
+    .map_err(|error| read_io(error.to_string()))?;
+    if control.principals.len() > crate::cluster_principal::MAX_AUTHORITY_PRINCIPALS
+        || control.principal_audit.len() > MAX_AUTHORITY_RECEIPTS
+        || control.ownership_tenant_scopes.len() > control.ownerships.len()
+    {
+        return Err(read_io(
+            "replicated principal state exceeds bounded capacity",
+        ));
+    }
+    for audit in &control.principal_audit {
+        audit
+            .principal
+            .validate()
+            .map_err(|error| read_io(error.to_string()))?;
+        let authorizer = expected
+            .get(&audit.authorized_by)
+            .ok_or_else(|| read_io("principal audit authorizer was not enrolled"))?;
+        if authorizer.revoked
+            || authorizer.kind != crate::cluster_principal::AuthorityPrincipalKind::Operator
+            || !authorizer
+                .allowed_command_classes
+                .contains(&crate::cluster_principal::AuthorityCommandClass::PrincipalAdmin)
+            || authorizer
+                .expires_at
+                .is_some_and(|expiry| expiry <= audit.changed_at)
+            || audit.changed_at > control.logical_time
+        {
+            return Err(read_io("principal audit authorizer was not authorized"));
+        }
+        let previous = expected.get(&audit.principal.principal_id);
+        let generation = previous.map_or(Some(1), |old| old.generation.checked_add(1));
+        if generation != Some(audit.principal.generation)
+            || previous.is_some_and(|old| {
+                old.kind != audit.principal.kind || old.tenant_id != audit.principal.tenant_id
+            })
+            || (audit.principal.revoked
+                && previous.is_none_or(|old| {
+                    old.revoked
+                        || old.public_key != audit.principal.public_key
+                        || old.kind != audit.principal.kind
+                        || old.tenant_id != audit.principal.tenant_id
+                        || old.allowed_command_classes != audit.principal.allowed_command_classes
+                        || old.expires_at != audit.principal.expires_at
+                }))
+        {
+            return Err(read_io(
+                "principal audit generation or revocation transition is invalid",
+            ));
+        }
+        expected.insert(
+            audit.principal.principal_id.clone(),
+            audit.principal.clone(),
+        );
+    }
+    if expected != control.principals {
+        return Err(read_io(
+            "principal registry disagrees with committed enrollment/revocation audit",
+        ));
+    }
+    let mut principal_keys = BTreeSet::new();
+    for (id, principal) in &control.principals {
+        principal
+            .validate()
+            .map_err(|error| read_io(error.to_string()))?;
+        if id != &principal.principal_id
+            || !principal_keys.insert(principal.public_key.clone())
+            || control
+                .members
+                .values()
+                .any(|member| member.public_key == principal.public_key)
+        {
+            return Err(read_io(
+                "principal identity aliases a node or another principal",
+            ));
+        }
+    }
+    for (agent, tenant) in &control.ownership_tenant_scopes {
+        if !control.ownerships.contains_key(agent)
+            || Uuid::parse_str(tenant).is_err()
+            || !control
+                .principals
+                .values()
+                .any(|principal| principal.tenant_id.as_deref() == Some(tenant.as_str()))
+        {
+            return Err(read_io("immutable ownership tenant scope is invalid"));
+        }
     }
     let cluster_id = Uuid::parse_str(&control.cluster_id)
         .map_err(|_| read_io("replicated authority cluster id is invalid"))?;
@@ -1440,6 +1756,8 @@ fn validate_store(context: &SqliteContextManager) -> ClusterStorageResult<()> {
         .conn
         .lock()
         .map_err(|error| StorageIOError::read(read_io(format!("lock Raft store: {error}"))))?;
+    crate::schema::verify(&connection)
+        .map_err(|error| StorageIOError::read_state_machine(read_io(error.to_string())))?;
     let state = load_persistent_state(&connection).map_err(StorageIOError::read_state_machine)?;
     let _: Option<Vote<ClusterRaftNodeId>> =
         read_meta(&connection, "vote").map_err(StorageIOError::read_vote)?;
@@ -1934,6 +2252,64 @@ fn apply_authority_command(
             log_id,
         };
     }
+    // Independent proof is rechecked at deterministic application, including
+    // receipt replay. A source possessing transport/node keys cannot bypass
+    // the leader admission path by submitting an unsigned Raft log entry.
+    let verified = if matches!(
+        &command,
+        AuthorityCommand::Initialize { .. } | AuthorityCommand::Barrier { .. }
+    ) {
+        None
+    } else {
+        let Some(control) = state.control_plane.as_ref() else {
+            return rejected(
+                canonical_id,
+                state.sequence,
+                log_id,
+                AuthorityRejection::NotInitialized,
+                "replicated authority is not initialized",
+            );
+        };
+        let verification = (|| {
+            let inner = crate::cluster_principal::unsigned_authority_command(&command)?;
+            let now = crate::cluster_principal::command_proposed_at(inner)
+                .ok_or(crate::cluster_principal::PrincipalProofError::WrongCommandClass)?
+                .max(
+                    control
+                        .logical_time
+                        .checked_add_signed(TimeDelta::microseconds(1))
+                        .ok_or(crate::cluster_principal::PrincipalProofError::InvalidProof)?,
+                );
+            let principal = crate::cluster_principal::verify_authority_principal(
+                &command,
+                &control.cluster_id,
+                &control.principals,
+                now,
+            )?;
+            let existing = crate::cluster_principal::ownership_agent(inner)
+                .is_some_and(|agent| control.ownerships.contains_key(agent));
+            crate::cluster_principal::verify_tenant_ownership_scope(
+                principal,
+                inner,
+                &control.ownership_tenant_scopes,
+                existing,
+            )?;
+            crate::cluster_principal::verify_member_key_separation(inner, &control.principals)?;
+            Ok::<_, crate::cluster_principal::PrincipalProofError>(principal.clone())
+        })();
+        match verification {
+            Ok(principal) => Some(principal),
+            Err(error) => {
+                return rejected(
+                    canonical_id,
+                    state.sequence,
+                    log_id,
+                    AuthorityRejection::PrincipalAuthentication(error),
+                    error.to_string(),
+                )
+            }
+        }
+    };
     if let Some(receipt) = state.receipts.get(&canonical_id) {
         if commands_are_same_retry(&receipt.command, &command) {
             return replay_response(&receipt.response);
@@ -1978,18 +2354,51 @@ fn apply_authority_command(
             "authority sequence is exhausted",
         );
     };
-    let response = match apply_new_authority_command(state, &command, sequence, log_id) {
+    let mut effective = match crate::cluster_principal::unsigned_authority_command(&command) {
+        Ok(command) => command.clone(),
+        Err(error) => {
+            return rejected(
+                canonical_id,
+                state.sequence,
+                log_id,
+                AuthorityRejection::PrincipalAuthentication(error),
+                error.to_string(),
+            )
+        }
+    };
+    if let Some(principal) = &verified {
+        crate::cluster_principal::set_verified_audit_actor(&mut effective, &principal.principal_id);
+    }
+    let response = match apply_new_authority_command(state, &effective, sequence, log_id) {
         Ok(response) => response,
         Err((reason, message)) => {
             return rejected(canonical_id, state.sequence, log_id, reason, message)
         }
     };
+    if let Some(principal) = verified {
+        if principal.kind == crate::cluster_principal::AuthorityPrincipalKind::Tenant {
+            if let (Some(agent), Some(tenant), Some(control)) = (
+                crate::cluster_principal::ownership_agent(&effective),
+                principal.tenant_id,
+                state.control_plane.as_mut(),
+            ) {
+                control
+                    .ownership_tenant_scopes
+                    .entry(agent.into())
+                    .or_insert(tenant);
+            }
+        }
+    }
     state.sequence = sequence;
     state.receipts.insert(
         canonical_id,
         StoredAuthorityReceipt {
             command,
             response: response.clone(),
+            applied_at: state
+                .control_plane
+                .as_ref()
+                .map(|control| control.logical_time),
         },
     );
     response
@@ -2013,20 +2422,41 @@ fn rejected(
 
 fn commands_are_same_retry(previous: &AuthorityCommand, current: &AuthorityCommand) -> bool {
     fn semantic_value(command: &AuthorityCommand) -> Option<serde_json::Value> {
-        let mut value = serde_json::to_value(command).ok()?;
+        let inner = crate::cluster_principal::unsigned_authority_command(command).ok()?;
+        let mut value = serde_json::to_value(inner).ok()?;
         let variant = value.as_object_mut()?.values_mut().next()?;
         if let Some(fields) = variant.as_object_mut() {
             fields.remove("proposed_at");
         }
         Some(value)
     }
+    let identity = |command: &AuthorityCommand| match command {
+        AuthorityCommand::Authorized {
+            principal_proof, ..
+        } => Some(principal_proof.principal_id.clone()),
+        _ => None,
+    };
     previous.operation_id() == current.operation_id()
+        && identity(previous) == identity(current)
         && semantic_value(previous)
             .is_some_and(|previous| Some(previous) == semantic_value(current))
 }
 
 fn replay_response(response: &AuthorityResponse) -> AuthorityResponse {
     match response {
+        AuthorityResponse::PrincipalUpdated {
+            operation_id,
+            principal,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::PrincipalUpdated {
+            operation_id: operation_id.clone(),
+            principal: principal.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
         AuthorityResponse::BarrierCommitted {
             operation_id,
             sequence,
@@ -2120,6 +2550,136 @@ fn apply_new_authority_command(
     let operation_id = command.operation_id().to_owned();
     let authority_term = log_id.leader_id.term;
     match command {
+        AuthorityCommand::Authorized { .. } => Err((
+            AuthorityRejection::InvalidCommand,
+            "nested principal envelope is invalid".into(),
+        )),
+        AuthorityCommand::EnrollPrincipal {
+            principal,
+            expected_generation,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            validate_text(actor, "principal audit actor").map_err(invalid_command)?;
+            validate_reason(reason).map_err(invalid_command)?;
+            principal.validate().map_err(|error| {
+                (
+                    AuthorityRejection::PrincipalAuthentication(error),
+                    error.to_string(),
+                )
+            })?;
+            let control = control_plane_mut(state)?;
+            let prior = control.principals.get(&principal.principal_id);
+            let next = prior
+                .map_or(Some(1), |old| old.generation.checked_add(1))
+                .ok_or((
+                    AuthorityRejection::SequenceExhausted,
+                    "principal generation is exhausted".into(),
+                ))?;
+            if principal.revoked
+                || principal.generation != next
+                || *expected_generation != prior.map(|old| old.generation)
+                || prior.is_some_and(|old| {
+                    old.kind != principal.kind || old.tenant_id != principal.tenant_id
+                })
+            {
+                return Err((
+                    AuthorityRejection::Conflict,
+                    "principal enrollment generation does not match".into(),
+                ));
+            }
+            if prior.is_none()
+                && control.principals.len() >= crate::cluster_principal::MAX_AUTHORITY_PRINCIPALS
+            {
+                return Err((
+                    AuthorityRejection::CapacityReached,
+                    "principal registry capacity is exhausted".into(),
+                ));
+            }
+            if control.principals.values().any(|old| {
+                old.principal_id != principal.principal_id && old.public_key == principal.public_key
+            }) || control
+                .members
+                .values()
+                .any(|member| member.public_key == principal.public_key)
+            {
+                return Err((
+                    AuthorityRejection::Conflict,
+                    "principal public key is already enrolled".into(),
+                ));
+            }
+            let changed_at = advance_authority_time(control, *proposed_at)?;
+            if principal
+                .expires_at
+                .is_some_and(|expiry| expiry <= changed_at)
+            {
+                return Err((
+                    AuthorityRejection::InvalidCommand,
+                    "principal enrollment is already expired".into(),
+                ));
+            }
+            control
+                .principals
+                .insert(principal.principal_id.clone(), principal.clone());
+            control.principal_audit.push(AuthorityPrincipalAudit {
+                principal: principal.clone(),
+                authorized_by: actor.strip_prefix("principal:").unwrap_or(actor).into(),
+                changed_at,
+            });
+            Ok(AuthorityResponse::PrincipalUpdated {
+                operation_id,
+                principal: principal.clone(),
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::RevokePrincipal {
+            principal_id,
+            expected_generation,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            validate_text(actor, "principal audit actor").map_err(invalid_command)?;
+            validate_reason(reason).map_err(invalid_command)?;
+            let control = control_plane_mut(state)?;
+            let current = control.principals.get(principal_id).ok_or((
+                AuthorityRejection::InvalidCommand,
+                "principal is not enrolled".into(),
+            ))?;
+            if current.revoked || current.generation != *expected_generation {
+                return Err((
+                    AuthorityRejection::Conflict,
+                    "principal revocation generation does not match".into(),
+                ));
+            }
+            let mut principal = current.clone();
+            principal.generation = principal.generation.checked_add(1).ok_or((
+                AuthorityRejection::SequenceExhausted,
+                "principal generation is exhausted".into(),
+            ))?;
+            principal.revoked = true;
+            let changed_at = advance_authority_time(control, *proposed_at)?;
+            control
+                .principals
+                .insert(principal_id.clone(), principal.clone());
+            control.principal_audit.push(AuthorityPrincipalAudit {
+                principal: principal.clone(),
+                authorized_by: actor.strip_prefix("principal:").unwrap_or(actor).into(),
+                changed_at,
+            });
+            Ok(AuthorityResponse::PrincipalUpdated {
+                operation_id,
+                principal,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
         AuthorityCommand::Initialize {
             genesis,
             proposed_at,
@@ -2528,6 +3088,20 @@ fn validate_and_build_genesis(
             "authority genesis must contain 1 to 31 members".into(),
         ));
     }
+    let principals = crate::cluster_principal::genesis_principal_registry(
+        &genesis.operator_principals,
+        genesis
+            .members
+            .iter()
+            .map(|member| member.public_key.clone()),
+        false,
+    )
+    .map_err(|error| {
+        (
+            AuthorityRejection::PrincipalAuthentication(error),
+            error.to_string(),
+        )
+    })?;
     let mut members = BTreeMap::new();
     let mut fingerprints = BTreeSet::new();
     let mut endpoints = BTreeSet::new();
@@ -2600,6 +3174,9 @@ fn validate_and_build_genesis(
     Ok(ReplicatedControlPlaneState {
         genesis: genesis.clone(),
         cluster_id: genesis.cluster_id.clone(),
+        principals,
+        principal_audit: Vec::new(),
+        ownership_tenant_scopes: BTreeMap::new(),
         membership_generation,
         members,
         membership_audit,
@@ -3674,6 +4251,8 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
             .map_err(|error| StorageIOError::write_state_machine(read_io(error.to_string())))?;
         let mut state =
             load_persistent_state(&transaction).map_err(StorageIOError::read_state_machine)?;
+        crate::schema::verify(&transaction)
+            .map_err(|error| StorageIOError::write_state_machine(read_io(error.to_string())))?;
         if let (Some(previous), Some(first)) = (state.last_applied, entries.first()) {
             if first.log_id.index <= previous.index {
                 return Err(StorageIOError::write_state_machine(read_io(format!(
@@ -3699,7 +4278,18 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
                     }
                 }
                 EntryPayload::Normal(command) => {
-                    apply_authority_command(&mut state.authority, command, entry.log_id)
+                    if matches!(&command, AuthorityCommand::Initialize { genesis, .. } if self.expected_genesis.as_ref().is_some_and(|expected| !same_immutable_genesis(genesis, expected)))
+                    {
+                        rejected(
+                            command.operation_id().into(),
+                            state.authority.sequence,
+                            entry.log_id,
+                            AuthorityRejection::InvalidCommand,
+                            "initial principal genesis differs from the configured immutable seed",
+                        )
+                    } else {
+                        apply_authority_command(&mut state.authority, command, entry.log_id)
+                    }
                 }
             };
             responses.push(response);
@@ -3749,8 +4339,62 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
         let transaction = connection.transaction().map_err(|error| {
             StorageIOError::write_snapshot(Some(meta.signature()), read_io(error.to_string()))
         })?;
+        crate::schema::verify(&transaction).map_err(|error| {
+            StorageIOError::write_snapshot(Some(meta.signature()), read_io(error.to_string()))
+        })?;
         let current =
             load_persistent_state(&transaction).map_err(StorageIOError::read_state_machine)?;
+        let continuity = (|| {
+            if let Some(control) = &installed.authority.control_plane {
+                if self
+                    .expected_genesis
+                    .as_ref()
+                    .is_some_and(|expected| !same_immutable_genesis(&control.genesis, expected))
+                {
+                    return Err(read_io(
+                        "snapshot principal genesis differs from the configured immutable seed",
+                    ));
+                }
+            }
+            if current
+                .authority
+                .receipts
+                .iter()
+                .any(|(id, receipt)| installed.authority.receipts.get(id) != Some(receipt))
+            {
+                return Err(read_io(
+                    "snapshot replaces or omits already committed authority history",
+                ));
+            }
+            if let Some(previous) = &current.authority.control_plane {
+                let incoming =
+                    installed.authority.control_plane.as_ref().ok_or_else(|| {
+                        read_io("snapshot removes initialized principal authority")
+                    })?;
+                if !same_immutable_genesis(&previous.genesis, &incoming.genesis)
+                    || incoming.logical_time < previous.logical_time
+                {
+                    return Err(read_io(
+                        "snapshot replaces principal genesis or regresses authority time",
+                    ));
+                }
+                for receipt in installed.authority.receipts.values() {
+                    if successful_response_metadata(&receipt.response)
+                        .is_some_and(|(_, sequence, _, _)| sequence > current.authority.sequence)
+                        && receipt
+                            .applied_at
+                            .is_none_or(|at| at < previous.logical_time)
+                    {
+                        return Err(read_io(
+                            "snapshot extends authority history before the known clock floor",
+                        ));
+                    }
+                }
+            }
+            Ok::<_, AnyError>(())
+        })();
+        continuity
+            .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), error))?;
         match (current.last_applied, installed.last_applied) {
             (Some(current_log_id), Some(installed_log_id))
                 if installed_log_id.index < current_log_id.index
@@ -3940,10 +4584,148 @@ mod tests {
         log_id: LogId<ClusterRaftNodeId>,
         command: AuthorityCommand,
     ) -> Entry<ClusterRaftTypeConfig> {
+        let command = if !matches!(command, AuthorityCommand::Authorized { .. })
+            && crate::cluster_principal::authority_command_class(&command).is_ok()
+        {
+            crate::cluster_principal::fixture_signed(
+                command,
+                crate::cluster_principal::FIXTURE_CLUSTER_ID,
+            )
+        } else {
+            command
+        };
         Entry {
             log_id,
             payload: EntryPayload::Normal(command),
         }
+    }
+
+    fn apply_authority_command(
+        state: &mut AuthorityState,
+        command: AuthorityCommand,
+        log_id: LogId<ClusterRaftNodeId>,
+    ) -> AuthorityResponse {
+        let command = if !matches!(command, AuthorityCommand::Authorized { .. })
+            && crate::cluster_principal::authority_command_class(&command).is_ok()
+        {
+            crate::cluster_principal::fixture_signed(
+                command,
+                &state
+                    .control_plane
+                    .as_ref()
+                    .expect("initialized fixture")
+                    .cluster_id,
+            )
+        } else {
+            command
+        };
+        super::apply_authority_command(state, command, log_id)
+    }
+
+    #[tokio::test]
+    async fn principal_snapshot_cannot_replace_genesis_on_a_pristine_pinned_receiver() {
+        let (_, node_public, fingerprint) = test_identity();
+        let expected = AuthorityGenesis {
+            cluster_id: crate::cluster_principal::FIXTURE_CLUSTER_ID.into(),
+            operator_principals: vec![crate::cluster_principal::fixture_operator()],
+            members: vec![AuthorityGenesisMember {
+                node_id: Uuid::new_v4().to_string(),
+                fingerprint,
+                public_key: node_public,
+                tls_server_certificate_fingerprint: None,
+                endpoint: "127.0.0.1:7001".into(),
+                server_version: "0.4.0-rc.1".into(),
+                min_protocol_version: 1,
+                protocol_version: 2,
+            }],
+        };
+        let source_context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let (_, mut source) = open_cluster_raft_storage(source_context.clone()).unwrap();
+        let mut substituted = expected.clone();
+        substituted.operator_principals[0].public_key = test_identity().1;
+        source
+            .apply([normal_entry(
+                log_id(1, 1),
+                AuthorityCommand::Initialize {
+                    operation_id: expected.cluster_id.clone(),
+                    genesis: substituted,
+                    proposed_at: Utc::now(),
+                },
+            )])
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let destination_context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let (_, mut destination) =
+            open_cluster_raft_storage_pinned(destination_context.clone(), &expected).unwrap();
+        let error = destination
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("configured immutable seed"));
+        assert!(read_replicated_authority_view(&destination_context)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn principal_state_rejects_a_validly_shaped_but_unsigned_extra_ownership_projection() {
+        let (_, public_key, fingerprint) = test_identity();
+        let node_id = Uuid::new_v4().to_string();
+        let mut state = AuthorityState::default();
+        let genesis = AuthorityGenesis {
+            cluster_id: crate::cluster_principal::FIXTURE_CLUSTER_ID.into(),
+            operator_principals: vec![crate::cluster_principal::fixture_operator()],
+            members: vec![AuthorityGenesisMember {
+                node_id: node_id.clone(),
+                public_key,
+                fingerprint,
+                tls_server_certificate_fingerprint: None,
+                endpoint: "127.0.0.1:7001".into(),
+                server_version: "0.4.0-rc.1".into(),
+                min_protocol_version: 1,
+                protocol_version: 2,
+            }],
+        };
+        apply_authority_command(
+            &mut state,
+            AuthorityCommand::Initialize {
+                operation_id: genesis.cluster_id.clone(),
+                genesis,
+                proposed_at: Utc::now(),
+            },
+            log_id(1, 1),
+        );
+        let signed = crate::cluster_principal::fixture_signed(
+            AuthorityCommand::ClaimOwnership {
+                operation_id: Uuid::new_v4().to_string(),
+                agent_id: Uuid::new_v4().to_string(),
+                owner_node_id: node_id,
+                ttl_seconds: 60,
+                expected_fencing_token: None,
+                actor: "fixture machine".into(),
+                reason: "signed projection fixture".into(),
+                proposed_at: Utc::now(),
+            },
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
+        super::apply_authority_command(&mut state, signed, log_id(1, 2));
+        validate_authority_state(&state).unwrap();
+        let control = state.control_plane.as_mut().unwrap();
+        let mut forged = control.ownerships.values().next().unwrap().clone();
+        forged.agent_id = Uuid::new_v4().to_string();
+        let mut forged_audit = control.ownership_audit[0].clone();
+        forged_audit.agent_id = forged.agent_id.clone();
+        control.ownerships.insert(forged.agent_id.clone(), forged);
+        control.ownership_audit.push(forged_audit);
+        validate_control_plane_state(control).expect(
+            "shape alone is valid; it is the missing independent signed command that must fail",
+        );
+        assert!(validate_authority_state(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("signed history"));
     }
 
     #[tokio::test]
@@ -4040,6 +4822,7 @@ mod tests {
             }
         };
         let genesis = AuthorityGenesis {
+            operator_principals: vec![crate::cluster_principal::fixture_operator()],
             cluster_id: Uuid::new_v4().to_string(),
             members: vec![
                 member(
@@ -4064,7 +4847,7 @@ mod tests {
     #[test]
     fn expired_join_challenges_are_reclaimed_before_capacity_is_enforced() {
         let (_, public_key, fingerprint) = test_identity();
-        let cluster_id = Uuid::new_v4().to_string();
+        let cluster_id = crate::cluster_principal::FIXTURE_CLUSTER_ID.to_owned();
         let started_at = Utc::now();
         let mut state = AuthorityState::default();
         let initialized = apply_authority_command(
@@ -4072,6 +4855,7 @@ mod tests {
             AuthorityCommand::Initialize {
                 operation_id: cluster_id.clone(),
                 genesis: AuthorityGenesis {
+                    operator_principals: vec![crate::cluster_principal::fixture_operator()],
                     cluster_id,
                     members: vec![AuthorityGenesisMember {
                         node_id: Uuid::new_v4().to_string(),
@@ -4137,9 +4921,10 @@ mod tests {
         let (_, mut state) = open_cluster_raft_storage(context.clone()).unwrap();
         let (_, seed_public_key, seed_fingerprint) = test_identity();
         let seed_node_id = Uuid::new_v4().to_string();
-        let cluster_id = Uuid::new_v4().to_string();
+        let cluster_id = crate::cluster_principal::FIXTURE_CLUSTER_ID.to_owned();
         let started_at = Utc::now();
         let genesis = AuthorityGenesis {
+            operator_principals: vec![crate::cluster_principal::fixture_operator()],
             cluster_id: cluster_id.clone(),
             members: vec![AuthorityGenesisMember {
                 node_id: seed_node_id.clone(),
@@ -4384,12 +5169,13 @@ mod tests {
         let context = Arc::new(SqliteContextManager::in_memory().unwrap());
         let (_, mut state) = open_cluster_raft_storage(context.clone()).unwrap();
         let started_at = Utc::now();
-        let cluster_id = Uuid::new_v4().to_string();
+        let cluster_id = crate::cluster_principal::FIXTURE_CLUSTER_ID.to_owned();
         let node_id = Uuid::new_v4().to_string();
         let (pair, public_key, fingerprint) = test_identity();
         let old_tls = "a".repeat(64);
         let new_tls = "b".repeat(64);
         let genesis = AuthorityGenesis {
+            operator_principals: vec![crate::cluster_principal::fixture_operator()],
             cluster_id: cluster_id.clone(),
             members: vec![AuthorityGenesisMember {
                 node_id: node_id.clone(),
@@ -4718,13 +5504,14 @@ mod tests {
         let context = Arc::new(SqliteContextManager::in_memory().unwrap());
         let (_, mut state) = open_cluster_raft_storage(context.clone()).unwrap();
         let (_, public_key, fingerprint) = test_identity();
-        let cluster_id = Uuid::new_v4().to_string();
+        let cluster_id = crate::cluster_principal::FIXTURE_CLUSTER_ID.to_owned();
         state
             .apply([normal_entry(
                 log_id(1, 1),
                 AuthorityCommand::Initialize {
                     operation_id: cluster_id.clone(),
                     genesis: AuthorityGenesis {
+                        operator_principals: vec![crate::cluster_principal::fixture_operator()],
                         cluster_id,
                         members: vec![AuthorityGenesisMember {
                             node_id: Uuid::new_v4().to_string(),

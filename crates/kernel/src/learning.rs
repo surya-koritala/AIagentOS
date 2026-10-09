@@ -428,7 +428,9 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
         .write(create)
         .create(create)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // Regular private files are required below. A replaced FIFO must not
+        // block this open before the descriptor type can be checked.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file()

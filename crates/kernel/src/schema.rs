@@ -12,11 +12,13 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 15;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 // Older readers flatten native stream boundaries and cannot retain ordered
-// multipart user content. Refuse them before they can mutate this history.
-pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 13;
+// multipart user content, durable cluster-operation receipts, or independent
+// principal genesis/proofs and their committed clock evidence. Refuse them
+// before mutation or snapshot replay can discard required authorization.
+pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 15;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
@@ -32,6 +34,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (11, "preserve-native-provider-history-metadata"),
     (12, "preserve-streamed-native-content-boundaries"),
     (13, "preserve-ordered-multipart-message-content"),
+    (14, "retain-actor-bound-cluster-operation-receipts"),
+    (15, "require-independent-principal-authority-history"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +92,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "cluster_node_identity",
     "cluster_node_control",
     "cluster_node_control_audit",
+    "cluster_operation_receipts",
     "cluster_membership_authority",
     "cluster_join_challenges",
     "cluster_members",

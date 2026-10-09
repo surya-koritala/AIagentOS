@@ -44,12 +44,17 @@ use tokio::net::ToSocketAddrs;
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::auth::{ApiKeyDescriptor, IssuedApiKey, Role, Tenant, User};
 pub use kernel::cloning::CloneResult;
+pub use kernel::cluster_consensus::{AuthorityCommand, AuthorityResponse};
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
     ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,
     ClusterCertificateRolloutPhase, ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration,
     ClusterMemberState, ClusterMembershipAudit, ClusterMembershipSnapshot, ClusterOwnershipState,
     NodeAvailability, NodeControlAudit, NodeControlStatus, NodeIdentity, NodeProfile,
+};
+pub use kernel::cluster_principal::{
+    sign_authority_principal, AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind,
+    AuthorityPrincipalProof, PrincipalProofError,
 };
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
@@ -133,9 +138,9 @@ pub mod cluster;
 pub mod patterns;
 
 pub use cluster::{
-    ClusterClient, ClusterMaintenanceConfig, ClusterMaintenanceStatus, ClusterReconciliationReport,
-    NodeHandle, PlacedAgent, Placement, PlacementConstraints, DEFAULT_OWNERSHIP_LEASE_SECONDS,
-    DEFAULT_OWNERSHIP_RENEW_INTERVAL,
+    ClusterAdmissionOperationIds, ClusterClient, ClusterMaintenanceConfig,
+    ClusterMaintenanceStatus, ClusterReconciliationReport, NodeHandle, PlacedAgent, Placement,
+    PlacementConstraints, DEFAULT_OWNERSHIP_LEASE_SECONDS, DEFAULT_OWNERSHIP_RENEW_INTERVAL,
 };
 pub use patterns::{
     Decision, DirectiveReasoner, FnPlanner, PlanRun, Planner, PlannerExecutor, ReActLoop,
@@ -2103,6 +2108,7 @@ impl KernelClient {
     ) -> Result<NodeControlStatus, SdkError> {
         match self
             .call(Syscall::SetNodeAvailability {
+                operation_id: None,
                 availability,
                 expected_generation,
                 reason: reason.into(),
@@ -2122,6 +2128,7 @@ impl KernelClient {
     ) -> Result<NodeControlStatus, SdkError> {
         match self
             .call(Syscall::SetNodeProfile {
+                operation_id: None,
                 profile,
                 expected_generation,
                 reason: reason.into(),
@@ -2140,6 +2147,50 @@ impl KernelClient {
         match self.call(Syscall::ListNodeControlAudit { limit }).await? {
             SyscallReply::NodeControlAudit { entries } => Ok(entries),
             other => Err(unexpected("NodeControlAudit", &other)),
+        }
+    }
+
+    /// Replace availability with a caller-retained durable operation UUID.
+    pub async fn set_node_availability_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        availability: NodeAvailability,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<NodeControlStatus, SdkError> {
+        match self
+            .call(Syscall::SetNodeAvailability {
+                operation_id: Some(operation_id.into()),
+                availability,
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::NodeControlUpdated { control } => Ok(control),
+            other => Err(unexpected("NodeControlUpdated", &other)),
+        }
+    }
+
+    /// Replace placement metadata with a caller-retained durable operation UUID.
+    pub async fn set_node_profile_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        profile: NodeProfile,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<NodeControlStatus, SdkError> {
+        match self
+            .call(Syscall::SetNodeProfile {
+                operation_id: Some(operation_id.into()),
+                profile,
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::NodeControlUpdated { control } => Ok(control),
+            other => Err(unexpected("NodeControlUpdated", &other)),
         }
     }
 
@@ -2404,6 +2455,68 @@ impl KernelClient {
         }
     }
 
+    /// Submit a caller-signed command. The caller retains its own private key;
+    /// this method never creates a proof from a transport/API credential.
+    pub async fn submit_authority_command_with_signer(
+        &mut self,
+        command: AuthorityCommand,
+        cluster_id: &str,
+        principal_id: &str,
+        principal_generation: u64,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, PrincipalProofError>,
+    ) -> Result<AuthorityResponse, SdkError> {
+        let signed = sign_authority_principal(
+            command,
+            cluster_id,
+            principal_id,
+            principal_generation,
+            chrono::Utc::now(),
+            sign,
+        )
+        .map_err(|error| SdkError::Configuration(error.to_string()))?;
+        self.submit_signed_authority_command(signed).await
+    }
+
+    /// Submit an independently signed envelope without a token-only fallback.
+    pub async fn submit_signed_authority_command(
+        &mut self,
+        command: AuthorityCommand,
+    ) -> Result<AuthorityResponse, SdkError> {
+        if !matches!(command, AuthorityCommand::Authorized { .. }) {
+            return Err(SdkError::Configuration(
+                PrincipalProofError::Missing.to_string(),
+            ));
+        }
+        let protocol = self.hello().await?;
+        if !protocol
+            .features
+            .iter()
+            .any(|feature| feature == "cluster_principal_auth")
+        {
+            return Err(SdkError::Configuration(
+                "server does not support independent cluster principal proof".into(),
+            ));
+        }
+        match self
+            .call(Syscall::SubmitSignedAuthorityCommand {
+                command: Box::new(command),
+            })
+            .await?
+        {
+            SyscallReply::AuthorityCommandCommitted { response } => Ok(response),
+            other => Err(unexpected("AuthorityCommandCommitted", &other)),
+        }
+    }
+
+    pub async fn authority_principal_registry(
+        &mut self,
+    ) -> Result<Vec<AuthorityPrincipal>, SdkError> {
+        match self.call(Syscall::GetAuthorityPrincipalRegistry).await? {
+            SyscallReply::AuthorityPrincipalRegistry { principals } => Ok(principals),
+            other => Err(unexpected("AuthorityPrincipalRegistry", &other)),
+        }
+    }
+
     pub async fn cluster_membership_audit(
         &mut self,
         limit: usize,
@@ -2651,6 +2764,7 @@ impl KernelClient {
     ) -> Result<AgentMutationFence, SdkError> {
         match self
             .call(Syscall::InstallAgentMutationFence {
+                operation_id: None,
                 agent_id: agent_id.into(),
                 cluster_id: cluster_id.into(),
                 owner_node_id: owner_node_id.into(),
@@ -2681,6 +2795,7 @@ impl KernelClient {
     ) -> Result<AgentMutationFence, SdkError> {
         match self
             .call(Syscall::RetireAgentMutationFence {
+                operation_id: None,
                 agent_id: agent_id.into(),
                 cluster_id: cluster_id.into(),
                 owner_node_id: owner_node_id.into(),
@@ -2708,6 +2823,60 @@ impl KernelClient {
             .await?
         {
             SyscallReply::AgentMutationFence { fence } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    /// Install an exact destination proof with a durable local operation UUID.
+    pub async fn install_agent_mutation_fence_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        reason: impl Into<String>,
+    ) -> Result<AgentMutationFence, SdkError> {
+        match self
+            .call(Syscall::InstallAgentMutationFence {
+                operation_id: Some(operation_id.into()),
+                agent_id: agent_id.into(),
+                cluster_id: proof.cluster_id,
+                owner_node_id: proof.owner_node_id,
+                authority_term: proof.authority_term,
+                authority_generation: proof.authority_generation,
+                fencing_token: proof.fencing_token,
+                proof_expires_at: proof.proof_expires_at,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    /// Retire an exact destination proof with a durable local operation UUID.
+    pub async fn retire_agent_mutation_fence_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        reason: impl Into<String>,
+    ) -> Result<AgentMutationFence, SdkError> {
+        match self
+            .call(Syscall::RetireAgentMutationFence {
+                operation_id: Some(operation_id.into()),
+                agent_id: agent_id.into(),
+                cluster_id: proof.cluster_id,
+                owner_node_id: proof.owner_node_id,
+                authority_term: proof.authority_term,
+                authority_generation: proof.authority_generation,
+                fencing_token: proof.fencing_token,
+                proof_expires_at: proof.proof_expires_at,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
             other => Err(unexpected("AgentMutationFence", &other)),
         }
     }

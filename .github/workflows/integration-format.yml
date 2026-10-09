@@ -2,6 +2,22 @@ name: Combined feature formatting evidence
 
 on:
   workflow_dispatch:
+    inputs:
+      principal_compiler:
+        description: Compile and lint principal source only; no tests or qualification
+        type: boolean
+        required: false
+        default: false
+      principal_daemon:
+        description: Isolated daemon regression only; other gates remain required
+        type: boolean
+        required: false
+        default: false
+      principal_focused:
+        description: Actual keyless principal schema and quorum fixtures
+        type: boolean
+        required: false
+        default: false
   pull_request:
     branches: [main]
     paths:
@@ -36,6 +52,10 @@ jobs:
             cargo fmt --all
             git diff --binary > target/qualification/format/rustfmt.patch
           fi
+          if test -f crates/kernel/src/cluster_principal_tests.rs && ! rustfmt --edition 2021 --check crates/kernel/src/cluster_principal_tests.rs; then
+            rustfmt --edition 2021 crates/kernel/src/cluster_principal_tests.rs
+            git diff --binary > target/qualification/format/rustfmt.patch
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -44,3 +64,162 @@ jobs:
           retention-days: 30
       - name: Require formatted source
         run: test ! -s target/qualification/format/rustfmt.patch
+  principal-compiler:
+    name: Principal compiler diagnostics only
+    needs: formatting
+    if: github.event_name == 'workflow_dispatch' && inputs.principal_compiler
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: cluster-principal-compiler
+      - name: Retain compiler-only source identity
+        run: |
+          mkdir -p target/qualification/principal-compiler
+          git rev-parse HEAD > target/qualification/principal-compiler/source-commit.txt
+          printf '%s\n' 'Compiler diagnostics only. No tests, storage/schema acceptance, models, or production qualification.' > target/qualification/principal-compiler/scope.txt
+      - name: Compile all owned targets and deny warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p kernel -p agent-sdk --all-targets 2>&1 | tee target/qualification/principal-compiler/check.txt
+          cargo clippy -p kernel -p agent-sdk --all-targets -- -D warnings 2>&1 | tee target/qualification/principal-compiler/clippy.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: principal-compiler-${{ github.sha }}
+          path: target/qualification/principal-compiler
+          retention-days: 30
+  principal-focused:
+    name: Principal protocol and quorum security
+    needs: formatting
+    if: github.event_name == 'workflow_dispatch' && inputs.principal_focused
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: cluster-principal-proof
+      - name: Retain source identity
+        id: principal_source
+        run: |
+          mkdir -p target/qualification/principal
+          git rev-parse HEAD > target/qualification/principal/source-commit.txt
+      - name: Independent proof, corrupted history and named compromise regressions
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p kernel principal --lib -- --nocapture 2>&1 | tee target/qualification/principal/principal.txt
+          cargo test -p kernel cluster_consensus::tests --lib -- --nocapture 2>&1 | tee target/qualification/principal/consensus.txt
+      - name: Actual three-node mTLS majority, forwarding, revocation and restart
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p kernel cluster_runtime::tests --lib -- --test-threads=1 --nocapture 2>&1 | tee target/qualification/principal/runtime.txt
+      - name: Public authorization and exact versioned wire fixtures
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p kernel authorization_policy_classifies_every_syscall_and_agent_resource --lib 2>&1 | tee target/qualification/principal/authorization.txt
+          cargo test -p kernel wire_contract --lib 2>&1 | tee target/qualification/principal/wire-rust.txt
+          python3 -m unittest discover -s scripts/tests -p test_verify_wire_fixtures.py 2>&1 | tee target/qualification/principal/wire-python.txt
+      - name: Independent caller SDK
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p agent-sdk --test cluster_principal 2>&1 | tee target/qualification/principal/sdk.txt
+      - name: Capability inventory
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p integration-tests capability_registry --lib 2>&1 | tee target/qualification/principal/capabilities.txt
+      - name: Existing signed provider history
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p integration-tests gemini_history --lib 2>&1 | tee target/qualification/principal/gemini-history.txt
+      - name: Actual shipped CLI independent signing and certificate replay
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p agent-cli principal --lib 2>&1 | tee target/qualification/principal/cli-principal.txt
+          cargo test -p agent-cli --test cluster_commands -- --test-threads=1 2>&1 | tee target/qualification/principal/cli-commands.txt
+      - name: Actual daemon independent ownership and shutdown
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p agent-cli --test cluster_server_lifecycle 2>&1 | tee target/qualification/principal/cli-daemon.txt
+      - name: Warnings are errors
+        if: ${{ !cancelled() && steps.principal_source.outcome == 'success' }}
+        run: cargo clippy -p kernel -p agent-sdk -p agent-cli --all-targets -- -D warnings
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: principal-proof-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/qualification/principal
+          retention-days: 30
+
+  principal-daemon:
+    name: Isolated principal daemon regression
+    needs: formatting
+    if: github.event_name == 'workflow_dispatch' && inputs.principal_daemon
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: cluster-principal-proof
+      - name: Retain isolated regression source and scope
+        run: |
+          mkdir -p target/qualification/principal-daemon
+          git rev-parse HEAD > target/qualification/principal-daemon/source-commit.txt
+          printf '%s\n' 'Isolated daemon regression only; quorum, full and platform gates remain required.' > target/qualification/principal-daemon/scope.txt
+      - name: Real daemon startup, current own-key proof, replay and SIGTERM
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p agent-cli --test cluster_server_lifecycle 2>&1 | tee target/qualification/principal-daemon/daemon.txt
+      - name: Deny CLI warnings
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy -p agent-cli --all-targets -- -D warnings 2>&1 | tee target/qualification/principal-daemon/clippy.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: principal-daemon-${{ github.sha }}
+          path: target/qualification/principal-daemon
+          retention-days: 30

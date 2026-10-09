@@ -348,6 +348,7 @@ pub struct ClusterRaftTls {
     client_config: Arc<rustls::ClientConfig>,
     server_certificate_sha256: String,
     client_certificate_sha256: String,
+    provisioned_peer_ca_sha256: Option<Vec<String>>,
 }
 
 impl fmt::Debug for ClusterRaftTls {
@@ -386,6 +387,7 @@ impl ClusterRaftTls {
             client_config: Arc::new(client_config),
             server_certificate_sha256,
             client_certificate_sha256,
+            provisioned_peer_ca_sha256: Some(certificate_fingerprints_from_pem(peer_ca_pem)?),
         })
     }
 
@@ -406,6 +408,9 @@ impl ClusterRaftTls {
             client_config: Arc::new(client_config),
             server_certificate_sha256,
             client_certificate_sha256,
+            // An opaque rustls config does not expose its root certificate
+            // bytes. Live root constraints require the PEM-backed constructor.
+            provisioned_peer_ca_sha256: None,
         })
     }
 

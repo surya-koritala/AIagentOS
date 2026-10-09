@@ -125,6 +125,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p kernel immutable_identity --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/identity.txt
+          cargo test -p agent-sdk immutable_identity --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/sdk-identity.txt
           cargo test -p kernel cluster_consensus::tests --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/consensus.txt
           cargo test -p kernel data_inventory --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/inventory.txt
           cargo test -p kernel accounting_integrity::tests --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/integrity.txt

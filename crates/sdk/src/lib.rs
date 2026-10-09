@@ -4633,6 +4633,81 @@ mod protocol_tests {
         assert_eq!(client.kill_agent(paused_kill).await.unwrap(), "Stopped");
     }
 
+    fn immutable_sdk_fixture(node: &str) -> (AgentIdentityReservation, Syscall) {
+        let now = chrono::Utc::now();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let lease = now + chrono::TimeDelta::seconds(60);
+        let creation = Syscall::CreateAgent {
+            agent_id: Some(agent_id.clone()), ownership_proof: Some(AgentMutationFenceProof {
+                cluster_id: cluster_id.clone(), owner_node_id: node.into(), authority_term: 1,
+                authority_generation: 1, fencing_token: 1, proof_expires_at: lease,
+            }), name: "immutable SDK creation".into(), task: "retain exact receipt".into(),
+            provider: "stub".into(), profile: "standard".into(), priority: 3,
+        };
+        let identity = AgentIdentityReservation {
+            version: kernel::cluster_agent_identity::IDENTITY_VERSION, cluster_id, agent_id,
+            scope: AgentIdentityScope::System, creator_principal_id: uuid::Uuid::new_v4().to_string(),
+            creation_operation_id: uuid::Uuid::new_v4().to_string(),
+            creation_sha256: kernel::cluster_agent_identity::creation_command_sha256(&creation).unwrap(),
+            initial_owner_node_id: node.into(), initial_authority_term: 1, initial_authority_generation: 1,
+            initial_fencing_token: 1, initial_lease_expires_at: lease, prepared_at: now, reservation_revision: 1,
+        };
+        (identity, creation)
+    }
+
+    #[tokio::test]
+    async fn immutable_identity_sdk_refuses_unmanaged_creation_before_any_effect() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let (identity, creation) = immutable_sdk_fixture(&kernel.cluster_control.identity().node_id);
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.serve());
+        let mut client = KernelClient::connect(address).await.unwrap();
+        let error = client.create_reserved_agent(&identity, creation, &kernel.cluster_control.identity().public_key).await.unwrap_err();
+        assert!(matches!(error, SdkError::Configuration(message) if message.contains("signed online quorum identity destination")));
+        let id = identity.agent_id.parse().unwrap();
+        assert!(kernel.get_agent_status(id).is_err());
+        assert!(kernel.context_manager.agent_tenant(id).unwrap().is_none());
+        client.close().await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        kernel.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn immutable_identity_sdk_retains_exact_attested_result_and_rejects_substitutions() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let node = kernel.cluster_control.identity();
+        let (identity, creation) = immutable_sdk_fixture(&node.node_id);
+        let proof = match &creation { Syscall::CreateAgent { ownership_proof: Some(proof), .. } => proof, _ => unreachable!() };
+        validate_reserved_creation(&identity, &identity.agent_id, proof, &creation).unwrap();
+        let schema = kernel::data_inventory::storage_data_inventory().database_schema_version;
+        let mut receipt = DestinationCreationReceipt {
+            version: kernel::cluster_agent_identity::IDENTITY_VERSION, cluster_id: identity.cluster_id.clone(),
+            agent_id: identity.agent_id.clone(), scope: identity.scope.clone(), creator_principal_id: identity.creator_principal_id.clone(),
+            creation_operation_id: identity.creation_operation_id.clone(), creation_sha256: identity.creation_sha256.clone(),
+            reservation_revision: identity.reservation_revision, reservation_sha256: identity.sha256().unwrap(),
+            destination_node_id: node.node_id.clone(), destination_installation_id: uuid::Uuid::new_v4().to_string(),
+            local_receipt_id: uuid::Uuid::new_v4().to_string(), created_agent_id: identity.agent_id.clone(),
+            created_row_sha256: "42".repeat(32), schema_version: schema, min_reader_schema_version: schema,
+            protocol_version: PROTOCOL_VERSION, created_at: chrono::Utc::now(), signature_hex: String::new(),
+        };
+        let signature = kernel.cluster_control.sign_challenge(&receipt.signing_payload().unwrap()).unwrap();
+        receipt.signature_hex = signature.iter().map(|byte| format!("{byte:02x}")).collect();
+        let reply = SyscallReply::ReservedAgentCreated { id: identity.agent_id.clone(), receipt: Box::new(receipt.clone()) };
+        assert_eq!(exact_reserved_creation_reply(&identity, &node.public_key, reply).unwrap(), receipt);
+        assert!(exact_reserved_creation_reply(&identity, &node.public_key, SyscallReply::AgentCreated { id: identity.agent_id.clone() }).is_err());
+        let mut tampered = receipt.clone();
+        tampered.created_row_sha256 = "43".repeat(32);
+        assert!(exact_reserved_creation_reply(&identity, &node.public_key,
+            SyscallReply::ReservedAgentCreated { id: identity.agent_id.clone(), receipt: Box::new(tampered) }).is_err());
+        let mut changed = creation;
+        if let Syscall::CreateAgent { task, .. } = &mut changed { *task = "different operation payload".into(); }
+        let proof = match &changed { Syscall::CreateAgent { ownership_proof: Some(proof), .. } => proof, _ => unreachable!() };
+        assert!(validate_reserved_creation(&identity, &identity.agent_id, proof, &changed).is_err());
+    }
+
     /// `hello()` negotiates against a current server and returns its window.
     #[tokio::test]
     async fn sdk_hello_negotiates_current_server() {

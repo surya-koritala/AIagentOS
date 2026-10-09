@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_sdk::{
-    AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind, ClusterClient,
-    KernelClient, Placement, SdkError, WireErrorCode,
+    AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind, ClusterClient, KernelClient,
+    Placement, SdkError, WireErrorCode,
 };
 use kernel::cluster_runtime::{ClusterRaftRuntime, ClusterRaftRuntimeConfig, ClusterRaftTls};
 use kernel::config::{ClusterRaftConfig, ClusterRaftMemberConfig};
@@ -162,7 +162,14 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
                 .unwrap();
         }
         for (kernel, runtime) in kernels.iter().zip(&runtimes) {
-            assert!(matches!(runtime.authority_handle().publish_kernel_capacity(kernel).await.unwrap(), kernel::cluster_consensus::AuthorityResponse::NodeCapacityReported { .. }));
+            assert!(matches!(
+                runtime
+                    .authority_handle()
+                    .publish_kernel_capacity(kernel)
+                    .await
+                    .unwrap(),
+                kernel::cluster_consensus::AuthorityResponse::NodeCapacityReported { .. }
+            ));
         }
         let mut clients = Vec::new();
         for address in &addresses {
@@ -170,21 +177,56 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
             client.authenticate(TOKEN).await.unwrap();
             let snapshot = client.cluster_capacity().await.unwrap();
             assert_eq!(snapshot.cluster_id, cluster_id);
-            assert_eq!(snapshot.reports.len(), 3, "a client connected to any member reads every quorum sample");
+            assert_eq!(
+                snapshot.reports.len(),
+                3,
+                "a client connected to any member reads every quorum sample"
+            );
             for capacity in &snapshot.reports {
-                let member = snapshot.members.iter().find(|member| member.node_id == capacity.report.node_id).unwrap();
-                capacity.report.verify_current(member, &snapshot.cluster_id, snapshot.authority_time).unwrap();
+                let member = snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.node_id == capacity.report.node_id)
+                    .unwrap();
+                capacity
+                    .report
+                    .verify_current(member, &snapshot.cluster_id, snapshot.authority_time)
+                    .unwrap();
                 assert_eq!(capacity.report.counters.agent_count, 0);
                 assert_eq!(capacity.report.counters.active_turns, 0);
                 assert!(capacity.report.counters.turn_capacity > 0);
             }
             let info = client.node_info().await.unwrap();
-            assert!(info.observed_at.is_some() && info.signature_hex.is_some() && info.signed_capacity.is_some());
+            assert!(
+                info.observed_at.is_some()
+                    && info.signature_hex.is_some()
+                    && info.signed_capacity.is_some()
+            );
             clients.push(client);
         }
-        let mut placement = ClusterClient::connect_authenticated(&addresses.iter().map(ToString::to_string).collect::<Vec<_>>(), TOKEN).await.unwrap();
-        let fresh = placement.create_agent("fresh signed placement", "capacity fixture", None, None, None, Placement::LeastLoaded).await.unwrap();
-        assert!(kernels.iter().any(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id));
+        let mut placement = ClusterClient::connect_authenticated(
+            &addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        let fresh = placement
+            .create_agent(
+                "fresh signed placement",
+                "capacity fixture",
+                None,
+                None,
+                None,
+                Placement::LeastLoaded,
+            )
+            .await
+            .unwrap();
+        assert!(kernels
+            .iter()
+            .any(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id));
         let owner = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id).unwrap();
         clients[owner].pause_agent(&fresh.agent_id).await.unwrap();
         // No reporters run here. A new any-member quorum barrier must advance time
@@ -192,24 +234,85 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         tokio::time::sleep(Duration::from_secs(16)).await;
         let snapshot = clients[2].cluster_capacity().await.unwrap();
         for capacity in &snapshot.reports {
-            let member = snapshot.members.iter().find(|member| member.node_id == capacity.report.node_id).unwrap();
-            assert_eq!(capacity.report.verify_current(member, &snapshot.cluster_id, snapshot.authority_time), Err(kernel::cluster_capacity::CapacityRejection::Stale));
+            let member = snapshot
+                .members
+                .iter()
+                .find(|member| member.node_id == capacity.report.node_id)
+                .unwrap();
+            assert_eq!(
+                capacity.report.verify_current(
+                    member,
+                    &snapshot.cluster_id,
+                    snapshot.authority_time
+                ),
+                Err(kernel::cluster_capacity::CapacityRejection::Stale)
+            );
         }
-        let error = placement.create_agent("stale must fail", "capacity fixture", None, None, None, Placement::RoundRobin).await.unwrap_err();
-        assert!(matches!(error, SdkError::Wire { code: WireErrorCode::Unavailable, retryable: true, .. }));
+        let error = placement
+            .create_agent(
+                "stale must fail",
+                "capacity fixture",
+                None,
+                None,
+                None,
+                Placement::RoundRobin,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SdkError::Wire {
+                code: WireErrorCode::Unavailable,
+                retryable: true,
+                ..
+            }
+        ));
         // The actual bounded automatic publisher restores current samples.
-        let publishers = kernels.iter().zip(&runtimes).map(|(kernel, runtime)| runtime.authority_handle().start_capacity_publisher(kernel)).collect::<Vec<_>>();
+        let publishers = kernels
+            .iter()
+            .zip(&runtimes)
+            .map(|(kernel, runtime)| runtime.authority_handle().start_capacity_publisher(kernel))
+            .collect::<Vec<_>>();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let snapshot = clients[1].cluster_capacity().await.unwrap();
-            if snapshot.reports.iter().all(|capacity| snapshot.members.iter().find(|member| member.node_id == capacity.report.node_id)
-                .is_some_and(|member| capacity.report.verify_current(member, &snapshot.cluster_id, snapshot.authority_time).is_ok())) { break; }
-            assert!(std::time::Instant::now() < deadline, "automatic publishers never restored current quorum samples");
+            if snapshot.reports.iter().all(|capacity| {
+                snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.node_id == capacity.report.node_id)
+                    .is_some_and(|member| {
+                        capacity
+                            .report
+                            .verify_current(member, &snapshot.cluster_id, snapshot.authority_time)
+                            .is_ok()
+                    })
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "automatic publishers never restored current quorum samples"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let active = placement.create_agent("automatic capacity", "capacity fixture", None, None, None, Placement::LeastLoaded).await.unwrap();
-        assert!(kernels.iter().any(|kernel| kernel.cluster_control.identity().node_id == active.node_id));
-        for publisher in publishers { publisher.shutdown().await; }
+        let active = placement
+            .create_agent(
+                "automatic capacity",
+                "capacity fixture",
+                None,
+                None,
+                None,
+                Placement::LeastLoaded,
+            )
+            .await
+            .unwrap();
+        assert!(kernels
+            .iter()
+            .any(|kernel| kernel.cluster_control.identity().node_id == active.node_id));
+        for publisher in publishers {
+            publisher.shutdown().await;
+        }
         // A later exact sample includes actual lifecycle changes and every
         // production counter, rather than accepting only the zero-load shape.
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -228,22 +331,37 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         }
         assert!(loaded.reports.iter().any(|capacity| capacity.report.counters.paused_agents > 0));
         for agent in [&fresh, &active] {
-            let owner = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == agent.node_id).unwrap();
+            let owner = kernels
+                .iter()
+                .position(|kernel| kernel.cluster_control.identity().node_id == agent.node_id)
+                .unwrap();
             clients[owner].stop_agent(&agent.agent_id).await.unwrap();
         }
-        for client in &mut clients { client.close().await.unwrap(); }
-        drop(clients); drop(placement);
-        for runtime in runtimes { runtime.shutdown().await.unwrap(); }
+        for client in &mut clients {
+            client.close().await.unwrap();
+        }
+        drop(clients);
+        drop(placement);
+        for runtime in runtimes {
+            runtime.shutdown().await.unwrap();
+        }
         let weak = kernels.iter().map(Arc::downgrade).collect::<Vec<_>>();
-        for task in serving { task.abort(); let _ = task.await; }
+        for task in serving {
+            task.abort();
+            let _ = task.await;
+        }
         drop(kernels);
         tokio::time::timeout(Duration::from_secs(5), async {
             while weak.iter().any(|kernel| kernel.upgrade().is_some()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("public handlers release native database owners");
+        })
+        .await
+        .expect("public handlers release native database owners");
         root.close().unwrap();
-    }).await.expect("actual signed capacity and placement fixture is bounded");
+    })
+    .await
+    .expect("actual signed capacity and placement fixture is bounded");
 }
 
 fn hex(bytes: &[u8]) -> String {

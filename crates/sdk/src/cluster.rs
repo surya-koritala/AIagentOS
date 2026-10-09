@@ -859,7 +859,10 @@ impl ClusterClient {
                     .find(|member| member.node_id == node.id);
                 let verified = report.zip(member).filter(|(capacity, member)| {
                     node.fingerprint.as_deref() == Some(member.fingerprint.as_str())
-                        && self.authority.as_ref().is_none_or(|authority| authority.cluster_id == snapshot.cluster_id)
+                        && self
+                            .authority
+                            .as_ref()
+                            .is_none_or(|authority| authority.cluster_id == snapshot.cluster_id)
                         && snapshot.staleness_seconds
                             == kernel::cluster_capacity::CAPACITY_STALENESS_SECONDS
                         && capacity.committed_at <= snapshot.authority_time
@@ -2100,9 +2103,13 @@ fn node_accepts(load: &NodeLoad, requirements: Option<&PlacementConstraints>) ->
     let Some(control) = load.control.as_ref() else {
         return false;
     };
-    let Some(report) = load.signed_capacity.as_ref() else { return false; };
-    if &report.control != control || load.observed_at != Some(report.observed_at)
-        || load.signature_hex.as_deref() != Some(report.signature_hex.as_str()) {
+    let Some(report) = load.signed_capacity.as_ref() else {
+        return false;
+    };
+    if &report.control != control
+        || load.observed_at != Some(report.observed_at)
+        || load.signature_hex.as_deref() != Some(report.signature_hex.as_str())
+    {
         return false;
     }
     if control.availability != NodeAvailability::Active {
@@ -2162,8 +2169,15 @@ mod tests {
     #[test]
     fn unsigned_or_forged_capacity_is_never_used_for_placement() {
         assert!(!node_accepts(&NodeLoad::default(), None));
-        let load = NodeLoad { observed_at: Some(chrono::Utc::now()), signature_hex: Some("00".repeat(64)), ..Default::default() };
-        assert!(!node_accepts(&load, None), "optional observation and signature text alone cannot qualify counters");
+        let load = NodeLoad {
+            observed_at: Some(chrono::Utc::now()),
+            signature_hex: Some("00".repeat(64)),
+            ..Default::default()
+        };
+        assert!(
+            !node_accepts(&load, None),
+            "optional observation and signature text alone cannot qualify counters"
+        );
     }
 
     #[test]

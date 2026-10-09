@@ -1964,17 +1964,39 @@ impl ClusterAuthorityHandle {
         }
         let metrics = self.raft.metrics();
         let actual = metrics.borrow().clone();
-        let leader_id = actual.current_leader.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "capacity quorum has no leader"))?;
-        let leader = actual.membership_config.nodes().find(|(id, _)| **id == leader_id)
-            .map(|(_, node)| node.clone()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "capacity leader has no trusted transport identity"))?;
-        match self.forward(leader_id, &leader, RpcRequest::AuthorityRead).await? {
+        let leader_id = actual.current_leader.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "capacity quorum has no leader")
+        })?;
+        let leader = actual
+            .membership_config
+            .nodes()
+            .find(|(id, _)| **id == leader_id)
+            .map(|(_, node)| node.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "capacity leader has no trusted transport identity",
+                )
+            })?;
+        match self
+            .forward(leader_id, &leader, RpcRequest::AuthorityRead)
+            .await?
+        {
             RpcResponse::AuthorityRead(Ok(barrier)) => {
                 self.wait_for_local_apply(barrier.log_id).await?;
                 let view = read_initialized_authority_view(&self.context)?;
-                if view.logical_time < barrier.logical_time { return Err(io::Error::new(io::ErrorKind::InvalidData, "capacity projection did not apply the leader clock barrier")); }
+                if view.logical_time < barrier.logical_time {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "capacity projection did not apply the leader clock barrier",
+                    ));
+                }
                 Ok(view)
             }
-            _ => Err(io::Error::new(io::ErrorKind::ConnectionRefused, "capacity leader did not provide a quorum clock barrier")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "capacity leader did not provide a quorum clock barrier",
+            )),
         }
     }
 

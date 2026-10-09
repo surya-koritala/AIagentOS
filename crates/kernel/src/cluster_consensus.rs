@@ -2484,14 +2484,27 @@ fn apply_authority_command(
         }
     };
     if let Ok(inner) = crate::cluster_principal::unsigned_authority_command(&command) {
-        if matches!(inner, AuthorityCommand::PrepareAgentIdentity { .. }
-            | AuthorityCommand::RecordAgentCreation { .. } | AuthorityCommand::PublishAgentIdentity { .. })
-            && crate::cluster_agent_identity::identity_command_agent(inner).and_then(|agent| {
-                state.control_plane.as_ref()?.agent_identities.get(agent)
-            }).is_some_and(|identity| matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted))
+        if matches!(
+            inner,
+            AuthorityCommand::PrepareAgentIdentity { .. }
+                | AuthorityCommand::RecordAgentCreation { .. }
+                | AuthorityCommand::PublishAgentIdentity { .. }
+        ) && crate::cluster_agent_identity::identity_command_agent(inner)
+            .and_then(|agent| state.control_plane.as_ref()?.agent_identities.get(agent))
+            .is_some_and(|identity| {
+                matches!(
+                    identity.state,
+                    AgentIdentityState::Aborted | AgentIdentityState::Deleted
+                )
+            })
         {
-            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::Conflict,
-                "terminal immutable identity refuses historical creation or publication replay");
+            return rejected(
+                canonical_id,
+                state.sequence,
+                log_id,
+                AuthorityRejection::Conflict,
+                "terminal immutable identity refuses historical creation or publication replay",
+            );
         }
     }
     if let Some(receipt) = state.receipts.get(&canonical_id) {
@@ -3269,8 +3282,7 @@ fn apply_new_authority_command(
                 .members
                 .get(&receipt.destination_node_id)
                 .ok_or_else(|| conflict("creation receipt destination is unknown"))?;
-            if receipt.protocol_version > member.protocol_version
-            {
+            if receipt.protocol_version > member.protocol_version {
                 return Err(conflict("creation receipt protocol is incompatible"));
             }
             receipt
@@ -5037,7 +5049,10 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
 }
 
 #[cfg(test)]
-fn crash_identity_authority_after_step_for_test(response: Option<&AuthorityResponse>, boundary: &str) {
+fn crash_identity_authority_after_step_for_test(
+    response: Option<&AuthorityResponse>,
+    boundary: &str,
+) {
     if let Some(AuthorityResponse::AgentIdentityUpdated { identity, .. }) = response {
         let phase = match identity.state {
             AgentIdentityState::Prepared => "prepared",
@@ -5046,13 +5061,19 @@ fn crash_identity_authority_after_step_for_test(response: Option<&AuthorityRespo
             AgentIdentityState::Aborted => "aborted",
             AgentIdentityState::Deleted => "deleted",
         };
-        crate::cluster_agent_identity::crash_identity_after_step_for_test(&format!("authority_{phase}_{boundary}"));
+        crate::cluster_agent_identity::crash_identity_after_step_for_test(&format!(
+            "authority_{phase}_{boundary}"
+        ));
     }
 }
 
 #[cfg(not(test))]
 #[inline]
-fn crash_identity_authority_after_step_for_test(_response: Option<&AuthorityResponse>, _boundary: &str) {}
+fn crash_identity_authority_after_step_for_test(
+    _response: Option<&AuthorityResponse>,
+    _boundary: &str,
+) {
+}
 
 impl RaftSnapshotBuilder<ClusterRaftTypeConfig> for ClusterRaftSnapshotBuilder {
     async fn build_snapshot(&mut self) -> ClusterStorageResult<Snapshot<ClusterRaftTypeConfig>> {

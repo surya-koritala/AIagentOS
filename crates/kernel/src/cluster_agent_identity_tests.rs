@@ -1,6 +1,6 @@
 use super::*;
-use ring::signature::KeyPair;
 use openraft::storage::RaftStateMachine;
+use ring::signature::KeyPair;
 
 struct IdentityFixture {
     state: AuthorityState,
@@ -202,7 +202,13 @@ fn immutable_identity_allocation_retry_conflicts_and_tombstones_are_permanent() 
         AuthorityResponse::AgentIdentityUpdated { replayed: true, .. }
     ));
     assert_eq!(fixture.record(&agent).reservation, reservation);
-    assert!(matches!(fixture.apply(command), AuthorityResponse::Rejected { reason: AuthorityRejection::Conflict, .. }));
+    assert!(matches!(
+        fixture.apply(command),
+        AuthorityResponse::Rejected {
+            reason: AuthorityRejection::Conflict,
+            ..
+        }
+    ));
     let replacement = fixture.prepare(&agent, &Uuid::new_v4().to_string());
     assert!(matches!(
         fixture.apply(replacement),
@@ -507,46 +513,150 @@ fn immutable_identity_reserved_nil_uuid_cannot_allocate_an_unerasable_agent() {
     let mut fixture = IdentityFixture::new();
     let nil = Uuid::nil().to_string();
     let command = fixture.prepare(&nil, &Uuid::new_v4().to_string());
-    assert!(matches!(fixture.apply(command), AuthorityResponse::Rejected { reason: AuthorityRejection::InvalidCommand, .. }));
-    assert!(fixture.state.control_plane.as_ref().unwrap().agent_identities.is_empty());
-    assert!(fixture.state.control_plane.as_ref().unwrap().ownerships.is_empty());
+    assert!(matches!(
+        fixture.apply(command),
+        AuthorityResponse::Rejected {
+            reason: AuthorityRejection::InvalidCommand,
+            ..
+        }
+    ));
+    assert!(fixture
+        .state
+        .control_plane
+        .as_ref()
+        .unwrap()
+        .agent_identities
+        .is_empty());
+    assert!(fixture
+        .state
+        .control_plane
+        .as_ref()
+        .unwrap()
+        .ownerships
+        .is_empty());
 }
 
 #[tokio::test]
 async fn immutable_identity_authority_crash_child() {
-    let Ok(path) = std::env::var("AIOS_IDENTITY_AUTHORITY_DATABASE") else { return; };
+    let Ok(path) = std::env::var("AIOS_IDENTITY_AUTHORITY_DATABASE") else {
+        return;
+    };
     let phase = std::env::var("AIOS_IDENTITY_AUTHORITY_PHASE").unwrap();
     let agent = std::env::var("AIOS_IDENTITY_CRASH_AGENT").unwrap();
     let mut fixture = IdentityFixture::new();
     let context = Arc::new(SqliteContextManager::new(std::path::Path::new(&path)).unwrap());
     let (_, mut store) = open_cluster_raft_storage(context).unwrap();
-    let initialization = fixture.state.receipts.values().next().unwrap().command.clone();
-    store.apply([Entry { log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1), payload: EntryPayload::Normal(initialization) }]).await.unwrap();
+    let initialization = fixture
+        .state
+        .receipts
+        .values()
+        .next()
+        .unwrap()
+        .command
+        .clone();
+    store
+        .apply([Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal(initialization),
+        }])
+        .await
+        .unwrap();
     let prepare = fixture.prepare(&agent, &Uuid::new_v4().to_string());
     let response = fixture.apply(prepare);
-    let AuthorityResponse::AgentIdentityUpdated { identity, .. } = response else { panic!("fixture preparation failed") };
-    let command = fixture.state.receipts.get(&identity.reservation.creation_operation_id).unwrap().command.clone();
-    store.apply([Entry { log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 2), payload: EntryPayload::Normal(command) }]).await.unwrap();
+    let AuthorityResponse::AgentIdentityUpdated { identity, .. } = response else {
+        panic!("fixture preparation failed")
+    };
+    let command = fixture
+        .state
+        .receipts
+        .get(&identity.reservation.creation_operation_id)
+        .unwrap()
+        .command
+        .clone();
+    store
+        .apply([Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 2),
+            payload: EntryPayload::Normal(command),
+        }])
+        .await
+        .unwrap();
     if phase == "aborted" {
-        let command = AuthorityCommand::AbortAgentIdentity { operation_id: Uuid::new_v4().to_string(), agent_id: agent,
-            expected_revision: 1, actor: "fixture".into(), reason: "exact authority crash abort".into(), proposed_at: Utc::now() };
-        store.apply([Entry { log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
-            payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(command, crate::cluster_principal::FIXTURE_CLUSTER_ID)) }]).await.unwrap();
+        let command = AuthorityCommand::AbortAgentIdentity {
+            operation_id: Uuid::new_v4().to_string(),
+            agent_id: agent,
+            expected_revision: 1,
+            actor: "fixture".into(),
+            reason: "exact authority crash abort".into(),
+            proposed_at: Utc::now(),
+        };
+        store
+            .apply([Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
+                payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(
+                    command,
+                    crate::cluster_principal::FIXTURE_CLUSTER_ID,
+                )),
+            }])
+            .await
+            .unwrap();
     } else {
         let receipt = fixture.receipt(&identity);
-        let record = AuthorityCommand::RecordAgentCreation { operation_id: Uuid::new_v4().to_string(), agent_id: agent.clone(),
-            expected_revision: 1, receipt: receipt.clone(), actor: "fixture".into(), reason: "exact authority crash receipt".into(), proposed_at: Utc::now() };
-        store.apply([Entry { log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
-            payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(record, crate::cluster_principal::FIXTURE_CLUSTER_ID)) }]).await.unwrap();
-        let publish = AuthorityCommand::PublishAgentIdentity { operation_id: Uuid::new_v4().to_string(), agent_id: agent.clone(),
-            expected_revision: 2, receipt_sha256: receipt.sha256().unwrap(), actor: "fixture".into(),
-            reason: "exact authority crash publication".into(), proposed_at: Utc::now() };
-        store.apply([Entry { log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 4),
-            payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(publish, crate::cluster_principal::FIXTURE_CLUSTER_ID)) }]).await.unwrap();
-        let delete = AuthorityCommand::DeleteAgentIdentity { operation_id: Uuid::new_v4().to_string(), agent_id: agent,
-            expected_revision: 3, actor: "fixture".into(), reason: "exact authority crash deletion".into(), proposed_at: Utc::now() };
-        store.apply([Entry { log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 5),
-            payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(delete, crate::cluster_principal::FIXTURE_CLUSTER_ID)) }]).await.unwrap();
+        let record = AuthorityCommand::RecordAgentCreation {
+            operation_id: Uuid::new_v4().to_string(),
+            agent_id: agent.clone(),
+            expected_revision: 1,
+            receipt: receipt.clone(),
+            actor: "fixture".into(),
+            reason: "exact authority crash receipt".into(),
+            proposed_at: Utc::now(),
+        };
+        store
+            .apply([Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
+                payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(
+                    record,
+                    crate::cluster_principal::FIXTURE_CLUSTER_ID,
+                )),
+            }])
+            .await
+            .unwrap();
+        let publish = AuthorityCommand::PublishAgentIdentity {
+            operation_id: Uuid::new_v4().to_string(),
+            agent_id: agent.clone(),
+            expected_revision: 2,
+            receipt_sha256: receipt.sha256().unwrap(),
+            actor: "fixture".into(),
+            reason: "exact authority crash publication".into(),
+            proposed_at: Utc::now(),
+        };
+        store
+            .apply([Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 4),
+                payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(
+                    publish,
+                    crate::cluster_principal::FIXTURE_CLUSTER_ID,
+                )),
+            }])
+            .await
+            .unwrap();
+        let delete = AuthorityCommand::DeleteAgentIdentity {
+            operation_id: Uuid::new_v4().to_string(),
+            agent_id: agent,
+            expected_revision: 3,
+            actor: "fixture".into(),
+            reason: "exact authority crash deletion".into(),
+            proposed_at: Utc::now(),
+        };
+        store
+            .apply([Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 5),
+                payload: EntryPayload::Normal(crate::cluster_principal::fixture_signed(
+                    delete,
+                    crate::cluster_principal::FIXTURE_CLUSTER_ID,
+                )),
+            }])
+            .await
+            .unwrap();
     }
     panic!("the named authority crash boundary was not reached");
 }
@@ -555,10 +665,26 @@ async fn immutable_identity_authority_crash_child() {
 fn immutable_identity_every_authority_transition_process_crash_retains_one_recoverable_identity() {
     for (phase, previous, committed) in [
         ("prepared", None, AgentIdentityState::Prepared),
-        ("created", Some(AgentIdentityState::Prepared), AgentIdentityState::Created),
-        ("published", Some(AgentIdentityState::Created), AgentIdentityState::Published),
-        ("aborted", Some(AgentIdentityState::Prepared), AgentIdentityState::Aborted),
-        ("deleted", Some(AgentIdentityState::Published), AgentIdentityState::Deleted),
+        (
+            "created",
+            Some(AgentIdentityState::Prepared),
+            AgentIdentityState::Created,
+        ),
+        (
+            "published",
+            Some(AgentIdentityState::Created),
+            AgentIdentityState::Published,
+        ),
+        (
+            "aborted",
+            Some(AgentIdentityState::Prepared),
+            AgentIdentityState::Aborted,
+        ),
+        (
+            "deleted",
+            Some(AgentIdentityState::Published),
+            AgentIdentityState::Deleted,
+        ),
     ] {
         for boundary in ["before_commit", "after_commit"] {
             let directory = tempfile::tempdir().unwrap();
@@ -569,13 +695,24 @@ fn immutable_identity_every_authority_transition_process_crash_retains_one_recov
                 .env("AIOS_IDENTITY_AUTHORITY_DATABASE", &path).env("AIOS_IDENTITY_AUTHORITY_PHASE", phase)
                 .env("AIOS_IDENTITY_CRASH_AGENT", &agent).env("AIOS_IDENTITY_CRASH_STEP", format!("authority_{phase}_{boundary}"))
                 .status().unwrap();
-            assert_eq!(status.code(), Some(86), "{phase}/{boundary}: exact process boundary was not reached");
+            assert_eq!(
+                status.code(),
+                Some(86),
+                "{phase}/{boundary}: exact process boundary was not reached"
+            );
             let context = Arc::new(SqliteContextManager::new(&path).unwrap());
             let (_, state) = open_cluster_raft_storage(context.clone()).unwrap();
             let view = read_replicated_authority_view(&context).unwrap().unwrap();
-            let expected = if boundary == "before_commit" { previous } else { Some(committed) };
+            let expected = if boundary == "before_commit" {
+                previous
+            } else {
+                Some(committed)
+            };
             match expected {
-                None => { assert!(view.agent_identities.is_empty()); assert!(view.ownerships.is_empty()); },
+                None => {
+                    assert!(view.agent_identities.is_empty());
+                    assert!(view.ownerships.is_empty());
+                }
                 Some(expected) => {
                     assert_eq!(view.agent_identities.len(), 1);
                     let identity = &view.agent_identities[&agent];
@@ -583,11 +720,15 @@ fn immutable_identity_every_authority_transition_process_crash_retains_one_recov
                     assert_eq!(identity.reservation.agent_id, agent);
                     assert_eq!(identity.reservation.scope, AgentIdentityScope::System);
                     assert_eq!(identity.reservation.initial_fencing_token, 1);
-                    assert_eq!(identity.reservation.creator_principal_id, crate::cluster_principal::fixture_operator().principal_id);
+                    assert_eq!(
+                        identity.reservation.creator_principal_id,
+                        crate::cluster_principal::fixture_operator().principal_id
+                    );
                     identity.validate().unwrap();
                 }
             }
-            drop(state); drop(context);
+            drop(state);
+            drop(context);
             directory.close().unwrap();
         }
     }

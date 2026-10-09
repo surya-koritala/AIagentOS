@@ -2,6 +2,12 @@ name: Combined feature formatting evidence
 
 on:
   workflow_dispatch:
+    inputs:
+      principal_compiler:
+        description: Compile and lint principal source only; no tests or qualification
+        type: boolean
+        required: false
+        default: false
   pull_request:
     branches: [main]
     paths:
@@ -48,3 +54,38 @@ jobs:
           retention-days: 30
       - name: Require formatted source
         run: test ! -s target/qualification/format/rustfmt.patch
+  principal-compiler:
+    name: Principal compiler diagnostics only
+    needs: formatting
+    if: github.event_name == 'workflow_dispatch' && inputs.principal_compiler
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: cluster-principal-compiler
+      - name: Retain compiler-only source identity
+        run: |
+          mkdir -p target/qualification/principal-compiler
+          git rev-parse HEAD > target/qualification/principal-compiler/source-commit.txt
+          printf '%s\n' 'Compiler diagnostics only. No tests, storage/schema acceptance, models, or production qualification.' > target/qualification/principal-compiler/scope.txt
+      - name: Compile all owned targets and deny warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p kernel -p agent-sdk --all-targets 2>&1 | tee target/qualification/principal-compiler/check.txt
+          cargo clippy -p kernel -p agent-sdk --all-targets -- -D warnings 2>&1 | tee target/qualification/principal-compiler/clippy.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: principal-compiler-${{ github.sha }}
+          path: target/qualification/principal-compiler
+          retention-days: 30

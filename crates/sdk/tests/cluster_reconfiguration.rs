@@ -278,18 +278,19 @@ async fn public_sdk_live_voter_proposal_replays_and_denies_token_only_authority(
         client.close().await.unwrap();
         first.shutdown().await.unwrap();
         let weak = kernels.iter().map(Arc::downgrade).collect::<Vec<_>>();
+        let stores = kernels.iter().map(|kernel| Arc::downgrade(&kernel.context_manager)).collect::<Vec<_>>();
         for task in serving {
             task.abort();
             let _ = task.await;
         }
         drop(kernels);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while weak.iter().any(|kernel| kernel.upgrade().is_some()) {
+            while weak.iter().any(|kernel| kernel.upgrade().is_some()) || stores.iter().any(|store| store.upgrade().is_some()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("public handlers release their kernel references");
+        .expect("public handlers and Raft storage tasks release all kernel and durable context references");
         root.close().unwrap();
     })
     .await

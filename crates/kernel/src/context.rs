@@ -1022,6 +1022,31 @@ pub struct SqliteContextManager {
 }
 
 impl SqliteContextManager {
+    /// Store ownership is read only after schema initialization under the
+    /// Context or kernel's existing exclusive database lease.
+    pub(crate) fn workspace_store_identity(
+        &self,
+        external_lease: bool,
+    ) -> Result<Option<(std::path::PathBuf, uuid::Uuid)>, ContextError> {
+        let connection = self.locked_conn();
+        let Some(path) = connection.path().filter(|path| !path.is_empty()) else {
+            if self._storage_lease.is_some() || external_lease {
+                return Err(ContextError::StorageError("durable workspace datastore path is unavailable; refusing an ephemeral ownership namespace".into()));
+            }
+            return Ok(None);
+        };
+        if self._storage_lease.is_none() && !external_lease {
+            return Err(ContextError::StorageError(
+                "durable workspace namespace requires the database lease".into(),
+            ));
+        }
+        let metadata = crate::schema::read_storage_metadata(&connection)?;
+        let id = uuid::Uuid::parse_str(&metadata.installation_id).map_err(|_| {
+            ContextError::StorageError("workspace store identity is not an immutable UUID".into())
+        })?;
+        Ok(Some((std::path::PathBuf::from(path), id)))
+    }
+
     /// Lock the shared SQLite connection, recovering from a poisoned mutex.
     ///
     /// A panic while the guard is held poisons the mutex. Without recovery the

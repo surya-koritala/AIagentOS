@@ -10,6 +10,9 @@ mod agent_lifecycle_props;
 mod lifecycle_coordinator;
 
 #[cfg(test)]
+mod managed_workspace_ownership;
+
+#[cfg(test)]
 mod durable_checkpoints;
 
 #[cfg(test)]

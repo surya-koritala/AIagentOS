@@ -196,6 +196,7 @@ struct SandboxState {
 
 /// Concrete sandbox manager implementation.
 pub struct SandboxManagerImpl {
+    managed_namespace: Option<crate::managed_workspace::ManagedWorkspaceNamespace>,
     sandboxes: DashMap<SandboxId, SandboxState>,
     agent_sandboxes: DashMap<AgentId, SandboxId>,
     #[cfg(test)]
@@ -230,6 +231,7 @@ impl SandboxManagerImpl {
             ORPHAN_CLEANUP.call_once(crate::docker_sandbox::cleanup_orphans_best_effort);
         }
         Self {
+            managed_namespace: None,
             sandboxes: DashMap::new(),
             agent_sandboxes: DashMap::new(),
             #[cfg(test)]
@@ -242,6 +244,80 @@ impl SandboxManagerImpl {
     #[cfg(test)]
     pub(crate) fn fail_next_destroy_for_test(&self) {
         self.fail_next_destroy.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn for_datastore(
+        database: Option<(&Path, uuid::Uuid)>,
+    ) -> Result<Self, SandboxError> {
+        let mut manager = Self::new();
+        manager.managed_namespace = Some(crate::managed_workspace::ManagedWorkspaceNamespace::new(
+            database,
+        )?);
+        Ok(manager)
+    }
+
+    pub(crate) fn default_managed_config(&self) -> SandboxConfig {
+        let mut config = Self::default_config();
+        if let Some(namespace) = &self.managed_namespace {
+            config.workspace_dir = namespace.data().join(uuid::Uuid::new_v4().to_string());
+        }
+        config
+    }
+
+    pub(crate) fn restored_workspace_is_managed(
+        &self,
+        config: &SandboxConfig,
+        agent: AgentId,
+    ) -> Result<bool, SandboxError> {
+        let Some(namespace) = &self.managed_namespace else {
+            return Ok(false);
+        };
+        if config.workspace_dir.parent() == Some(namespace.data()) {
+            namespace.verify(&config.workspace_dir, Some(agent))?;
+            return Ok(true);
+        }
+        let legacy_root = std::fs::canonicalize(Self::managed_root()).ok();
+        let legacy = config.workspace_dir.parent().is_some_and(|parent| {
+            parent
+                .file_name()
+                .is_some_and(|name| name == "aiagentos-workspaces")
+                || parent == Self::managed_root()
+                || legacy_root
+                    .as_ref()
+                    .is_some_and(|root| std::fs::canonicalize(parent).ok().as_ref() == Some(root))
+        }) && config
+            .workspace_dir
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .is_some_and(|leaf| uuid::Uuid::parse_str(leaf).is_ok());
+        let other_store = config.workspace_dir.parent().is_some_and(|parent| {
+            parent.file_name().is_some_and(|name| name == "data")
+                && parent.ancestors().any(|ancestor| {
+                    ancestor
+                        .file_name()
+                        .is_some_and(|name| name == ".aiagentos-workspace-stores")
+                })
+        });
+        if legacy || other_store {
+            if namespace.legacy_retained(&config.workspace_dir, agent)? {
+                return Ok(false);
+            }
+            return Err(SandboxError::BoundaryViolation("legacy or restored workspace ownership is unresolved; preserve the bytes and explicitly retain it as an operator workspace before admission".into()));
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn retain_legacy_workspace(
+        &self,
+        path: &Path,
+        agent: AgentId,
+    ) -> Result<(), SandboxError> {
+        self.managed_namespace
+            .as_ref()
+            .ok_or_else(|| {
+                SandboxError::BoundaryViolation("workspace namespace is unavailable".into())
+            })?
+            .retain_legacy(path, agent)
     }
 
     #[cfg(test)]
@@ -284,9 +360,9 @@ impl SandboxManagerImpl {
         (entered, release, cancellation_observed)
     }
 
-    /// Secure default used by all production agent-creation paths that do not
-    /// carry an explicit operator sandbox. Network and host process access are
-    /// denied; the workspace is unique and owned by the sandbox manager.
+    /// Secure policy template for compatibility callers. Kernel-managed
+    /// creation replaces its path with the leased datastore namespace.
+    /// Network and host process access are denied.
     pub fn default_config() -> SandboxConfig {
         SandboxConfig {
             workspace_dir: Self::managed_root().join(uuid::Uuid::new_v4().to_string()),
@@ -364,12 +440,19 @@ impl SandboxManagerImpl {
         std::fs::canonicalize(root).map_err(|error| SandboxError::CreationFailed(error.to_string()))
     }
 
-    /// Remove UUID-scoped managed workspaces that have no live persisted
-    /// agent. A crash may occur before the marker is written, so ownership by
-    /// the private managed root plus a UUID leaf is the cleanup authority.
+    /// Retire only attested current-store workspaces without a live persisted
+    /// agent. UUID names and legacy markers never authorize reconciliation.
     pub fn reconcile_managed_workspaces(
         &self,
         active_workspaces: &HashSet<PathBuf>,
+    ) -> Result<usize, SandboxError> {
+        self.reconcile_recorded_managed_workspaces(active_workspaces, &HashSet::new())
+    }
+
+    pub(crate) fn reconcile_recorded_managed_workspaces(
+        &self,
+        active_workspaces: &HashSet<PathBuf>,
+        protected_agents: &HashSet<AgentId>,
     ) -> Result<usize, SandboxError> {
         // Keep discovery and deletion atomic with managed-workspace creation
         // and destruction. Without this guard, reconciliation can observe a
@@ -377,23 +460,20 @@ impl SandboxManagerImpl {
         let live = Self::live_managed_workspaces().lock().map_err(|_| {
             SandboxError::DestructionFailed("managed workspace registry unavailable".into())
         })?;
-        let root = Self::ensure_managed_root()?;
+        // A UUID name and empty legacy marker cannot attest datastore ownership.
+        // Unbound managers never sweep the shared legacy temporary root.
+        let Some(namespace) = &self.managed_namespace else {
+            return Ok(0);
+        };
         let mut active = active_workspaces
             .iter()
             .filter_map(|path| std::fs::canonicalize(path).ok())
             .collect::<HashSet<_>>();
         active.extend(live.iter().cloned());
-        let mut removed = 0;
-        for entry in std::fs::read_dir(&root)
-            .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?
-        {
-            let entry =
-                entry.map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
-            removed += usize::from(Self::reconcile_managed_entry(&root, &active, entry)?);
-        }
-        Ok(removed)
+        namespace.reconcile(&active, protected_agents)
     }
 
+    #[cfg(test)]
     fn reconcile_managed_entry(
         root: &Path,
         active: &HashSet<PathBuf>,
@@ -482,7 +562,10 @@ impl SandboxManagerImpl {
             None
         };
         let managed_root = if managed_workspace {
-            let root = Self::ensure_managed_root()?;
+            let root = match &self.managed_namespace {
+                Some(namespace) => namespace.data().to_path_buf(),
+                None => Self::ensure_managed_root()?,
+            };
             let parent = config.workspace_dir.parent().ok_or_else(|| {
                 SandboxError::CreationFailed("managed workspace path is invalid".into())
             })?;
@@ -497,6 +580,17 @@ impl SandboxManagerImpl {
                 return Err(SandboxError::CreationFailed(
                     "managed workspace must be a UUID leaf of the private managed root".into(),
                 ));
+            }
+            if let Some(namespace) = &self.managed_namespace {
+                if config
+                    .workspace_dir
+                    .try_exists()
+                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?
+                {
+                    namespace.verify(&config.workspace_dir, Some(agent_id))?;
+                } else {
+                    namespace.publish(&config.workspace_dir, agent_id)?;
+                }
             }
             Some(root)
         } else {
@@ -560,7 +654,10 @@ impl SandboxManagerImpl {
             }
             workspace
         };
-        if managed_root.is_some() {
+        if managed_workspace && self.managed_namespace.is_some() {
+            crate::managed_workspace::allocation_cutpoint("directory_created");
+        }
+        if managed_root.is_some() && self.managed_namespace.is_none() {
             let marker = workspace_dir.join(Self::MANAGED_MARKER);
             std::fs::write(&marker, [])
                 .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
@@ -2102,7 +2199,13 @@ impl SandboxManager for SandboxManagerImpl {
             .take();
         drop(workspace);
         if state.managed_workspace {
-            if let Err(error) = std::fs::remove_dir_all(&state.workspace_dir) {
+            let retired = match &self.managed_namespace {
+                Some(namespace) => namespace
+                    .retire(&state.workspace_dir, Some(state.agent_id))
+                    .map_err(std::io::Error::other),
+                None => std::fs::remove_dir_all(&state.workspace_dir),
+            };
+            if let Err(error) = retired {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     let reopened = Dir::open_ambient_dir(&state.workspace_dir, ambient_authority())
                         .map_err(|reopen_error| {
@@ -3763,14 +3866,15 @@ mod tests {
         mgr.reconcile_managed_workspaces(&active).unwrap();
         assert!(workspace.exists());
         assert!(
-            !orphan.exists(),
-            "the injected orphan must be absent after reconciliation"
+            orphan.exists(),
+            "an unverified legacy UUID directory must remain untouched"
         );
         assert!(unrelated.exists());
 
         mgr.destroy_sandbox(sid).unwrap();
         assert!(!workspace.exists());
         std::fs::remove_dir_all(unrelated).unwrap();
+        std::fs::remove_dir_all(orphan).unwrap();
     }
 
     #[test]

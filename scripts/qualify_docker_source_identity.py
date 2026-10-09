@@ -82,12 +82,12 @@ def main():
                 if time.monotonic() >= deadline:
                     raise RuntimeError("actual image did not expose metrics before bounded deadline")
                 time.sleep(0.1)
-        actual = identity(text)
-        if actual != expected:
-            raise ValueError("actual image source identity differs from native compiled source")
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.with_suffix(".prom").write_text(text)
         arguments.output.with_suffix(".node.json").write_text(json.dumps(node, sort_keys=True, indent=2) + "\n")
+        actual = identity(text)
+        if actual != expected:
+            raise ValueError("actual image source identity differs from native compiled source")
         arguments.output.write_text(json.dumps({
             "schema_version": 1, "source_commit": actual,
             "image_id": image, "native_and_image_identity_equal": True,

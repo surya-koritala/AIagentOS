@@ -28,6 +28,16 @@ config.toml
 .idea/
 .vscode/
 .kiro/
+!.kiro/
+.kiro/*
+!.kiro/specs/
+.kiro/specs/*
+!.kiro/specs/ai-agent-os/
+.kiro/specs/ai-agent-os/*
+!.kiro/specs/ai-agent-os/.config.kiro
+!.kiro/specs/ai-agent-os/design.md
+!.kiro/specs/ai-agent-os/requirements.md
+!.kiro/specs/ai-agent-os/tasks.md
 .claude/
 *.swp
 *.swo

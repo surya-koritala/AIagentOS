@@ -27,7 +27,7 @@
 ############################
 # The builder supplies Rust; rust-toolchain.toml selects the workspace's pinned
 # compiler. Bookworm supplies OpenSSL 3, matching the runtime image.
-FROM rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e AS builder
+FROM rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e AS source-context
 
 # Build-time system deps:
 #   build-essential -> C toolchain (cc) for openssl-sys / wasmtime / ring etc.
@@ -50,6 +50,10 @@ COPY . .
 # A prepared context never contains prior Cargo output. Prevent stale binaries
 # or cached source claims from being reused across changed proof contexts.
 RUN test ! -e target
+
+# CI verifies the actual Docker-filtered bytes in source-context before paying
+# for compilation. This image stage contains public source, never .git/secrets.
+FROM source-context AS builder
 
 # Build exactly the binaries we ship — never `--workspace` (that would drag in
 # tauri-app and its GTK/WebKit deps). Cargo.lock is committed, so --locked is

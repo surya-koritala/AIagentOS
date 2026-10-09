@@ -90,6 +90,21 @@ jobs:
           python3 scripts/prepare_source_context.py --output "$RUNNER_TEMP/source-context" | tee source-proof-context.json
           test ! -e "$RUNNER_TEMP/source-context/.git"
           test ! -e "$RUNNER_TEMP/source-context/.env"
+      - name: Verify actual Docker COPY before expensive compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target source-context --iidfile "$RUNNER_TEMP/source-context-image-id.txt" "$RUNNER_TEMP/source-context" 2>&1 | tee source-proof-copy-build.log
+          context_image=$(cat "$RUNNER_TEMP/source-context-image-id.txt")
+          [[ "$context_image" =~ ^sha256:[0-9a-f]{64}$ ]]
+          context_container=$(docker create --network=none "$context_image")
+          [[ "$context_container" =~ ^[0-9a-f]{64}$ ]]
+          trap 'docker rm -f -v "$context_container" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$RUNNER_TEMP/docker-copied-source"
+          docker cp "$context_container:/build/." "$RUNNER_TEMP/docker-copied-source"
+          AGENTOS_SOURCE_PROOF_DOCKER_CONTEXT="$RUNNER_TEMP/docker-copied-source" \
+            cargo test -p kernel --test source_proof --locked actual_docker_copy_validates_every_authenticated_blob_before_compilation \
+              -- --ignored --exact --nocapture 2>&1 | tee source-proof-copy-test.log
       - name: Build actual image without Git metadata or unchecked source arguments
         shell: bash
         run: |
@@ -112,6 +127,8 @@ jobs:
             source-proof-tests.log
             source-proof-clippy.log
             source-proof-context.json
+            source-proof-copy-build.log
+            source-proof-copy-test.log
             source-proof-image-build.log
             source-proof-image.log
             source-proof-image.json

@@ -43,8 +43,15 @@ fn prepare(repository: &Path, context: &Path) -> std::process::Output {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let repository = root.path().join("repo");
-        let context = root.path().join("context");
+        // Unix temporary roots can contain system symlinks, including macOS
+        // /var. The generator intentionally rejects every output ancestor
+        // symlink, so positive fixtures pass the actual owned directory.
+        #[cfg(unix)]
+        let actual_root = fs::canonicalize(root.path()).unwrap();
+        #[cfg(not(unix))]
+        let actual_root = root.path().to_path_buf();
+        let repository = actual_root.join("repo");
+        let context = actual_root.join("context");
         fs::create_dir(&repository).unwrap();
         git(&repository, &["init"]);
         fs::create_dir(repository.join("nested")).unwrap();
@@ -417,9 +424,24 @@ fn symlink_replacement_does_not_validate_or_follow_external_source() {
 #[test]
 fn context_generator_refuses_output_alias_into_checkout() {
     let fixture = Fixture::new();
-    let alias = fixture._root.path().join("output-alias");
+    let alias = fixture.repository.parent().unwrap().join("output-alias");
     std::os::unix::fs::symlink(&fixture.repository, &alias).unwrap();
     let output = prepare(&fixture.repository, &alias.join("generated-context"));
     assert!(!output.status.success());
     assert!(!fixture.repository.join("generated-context").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn context_generator_refuses_output_alias_outside_checkout() {
+    let fixture = Fixture::new();
+    let root = fixture.repository.parent().unwrap();
+    let outside = root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let alias = root.join("outside-alias");
+    std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    let output = prepare(&fixture.repository, &alias.join("generated-context"));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rejects symlink ancestors"));
+    assert!(!outside.join("generated-context").exists());
 }

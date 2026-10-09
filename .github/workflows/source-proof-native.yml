@@ -1,0 +1,86 @@
+name: Native source proof paths
+
+on:
+  push:
+    branches: [codex/source-proof-native-path]
+  pull_request:
+    paths:
+      - 'crates/kernel/tests/source_proof.rs'
+      - 'crates/kernel/source_proof.rs'
+      - 'crates/kernel/build.rs'
+      - 'scripts/prepare_source_context.py'
+      - '.github/workflows/source-proof-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-proof-native-${{ github.event_name }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  formatting:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Retain hosted formatting patch
+        run: |
+          git rev-parse HEAD > source-proof-native-format-source.txt
+          cargo fmt --all
+          git diff --binary > source-proof-native-format.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: source-proof-native-format-${{ github.run_id }}
+          path: |
+            source-proof-native-format-source.txt
+            source-proof-native-format.patch
+          retention-days: 30
+      - name: Require committed formatting
+        run: git diff --exit-code
+  native:
+    name: Source proof and strict output paths (${{ matrix.os }})
+    needs: formatting
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+      AGENTOS_SOURCE_PROOF_NATIVE_RECEIPT_FILE: ${{ runner.temp }}/source-proof-native.prom
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Actual Git proofs and output-alias refusal
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > source-proof-native-source.txt
+          cargo test -p kernel --test source_proof --locked -- --nocapture 2>&1 | tee source-proof-native-tests.log
+          cargo clippy -p kernel --test source_proof --locked -- -D warnings 2>&1 | tee source-proof-native-clippy.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: source-proof-native-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            source-proof-native-source.txt
+            source-proof-native-tests.log
+            source-proof-native-clippy.log
+            ${{ runner.temp }}/source-proof-native.prom
+          if-no-files-found: error
+          retention-days: 30

@@ -6058,7 +6058,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("reuses a durable trust generation"),
+                .contains("durable principal genesis differs from the configured immutable seed"),
             "{error}"
         );
     }

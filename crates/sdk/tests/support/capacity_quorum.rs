@@ -244,14 +244,32 @@ impl CapacityQuorum {
             let _ = server.await;
         }
         let weak = self.kernels.iter().map(Arc::downgrade).collect::<Vec<_>>();
+        let contexts = self
+            .kernels
+            .iter()
+            .map(|kernel| Arc::downgrade(&kernel.context_manager))
+            .collect::<Vec<_>>();
         self.kernels.clear();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while weak.iter().any(|kernel| kernel.upgrade().is_some()) {
+            while weak.iter().any(|kernel| kernel.strong_count() != 0)
+                || contexts.iter().any(|context| context.strong_count() != 0)
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            panic!(
+                "shutdown retained kernel owners {:?} or Context owners {:?}",
+                weak.iter()
+                    .map(std::sync::Weak::strong_count)
+                    .collect::<Vec<_>>(),
+                contexts
+                    .iter()
+                    .map(std::sync::Weak::strong_count)
+                    .collect::<Vec<_>>()
+            )
+        });
         self.root.close().unwrap();
     }
 }

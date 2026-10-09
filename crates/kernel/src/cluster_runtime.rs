@@ -5216,7 +5216,12 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "cluster did not converge on a leader"
+                "cluster did not converge on a leader: {:?}",
+                runtimes
+                    .iter()
+                    .flatten()
+                    .map(|runtime| runtime.metrics().borrow().clone())
+                    .collect::<Vec<_>>()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -5545,9 +5550,13 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), cut.reached.notified())
                     .await
                     .unwrap();
+                // A live leader renews its peers' lease, which rejects an
+                // immediate election. Stop renewal while keeping its RPC alive.
+                old.raft.runtime_config().heartbeat(false);
                 new.raft.trigger().elect().await.unwrap();
                 let elected = wait_for_leader(&runtimes, Some(prior_leader)).await;
                 assert_ne!(elected, prior_leader);
+                old.raft.runtime_config().heartbeat(true);
                 cut.release.notify_one();
                 runtimes[(elected - 1) as usize]
                     .as_ref()

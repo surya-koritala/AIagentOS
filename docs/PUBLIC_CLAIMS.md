@@ -25,6 +25,6 @@ than inferring support from every ordinary use of words such as live or supporte
 Crate descriptions identify the user-space runtime/client/helper role without
 claiming whole-product qualification. Public installer, real-model, target
 filesystem and independent review evidence remain separate. GitHub description
-and topics are an external surface; the proposed change is reviewable in
-[Repository metadata proposal](REPOSITORY_METADATA_PROPOSAL.md) and is not applied
-by this gate or its CI token.
+and topics are an external surface. The applied values are recorded in
+[Repository framing](REPOSITORY_METADATA_PROPOSAL.md); CI reads GitHub metadata
+and verifies an exact match without changing it.

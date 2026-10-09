@@ -1366,7 +1366,10 @@ mod tests {
         assert_eq!(normalize_filesystem_target(target).unwrap(), expected);
         let registry = crate::tools::ToolRegistry::new();
         let (_, resource) = registry
-            .security_context("write_file", &serde_json::json!({"path":target,"content":"proof"}))
+            .security_context(
+                "write_file",
+                &serde_json::json!({"path":target,"content":"proof"}),
+            )
             .unwrap();
         assert_eq!(resource, expected);
     }

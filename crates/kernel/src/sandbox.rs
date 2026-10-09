@@ -766,11 +766,15 @@ impl SandboxManagerImpl {
         let normalized = {
             let normalize = |path: &Path| {
                 path.to_str()
-                    .ok_or_else(|| SandboxError::BoundaryViolation("filesystem target denied".into()))
+                    .ok_or_else(|| {
+                        SandboxError::BoundaryViolation("filesystem target denied".into())
+                    })
                     .and_then(|path| {
                         crate::resources::normalize_filesystem_target(path)
                             .map(PathBuf::from)
-                            .map_err(|_| SandboxError::BoundaryViolation("filesystem target denied".into()))
+                            .map_err(|_| {
+                                SandboxError::BoundaryViolation("filesystem target denied".into())
+                            })
                     })
             };
             (

@@ -16,6 +16,15 @@ use crate::cluster_consensus::{ClusterRaftNode, ClusterRaftNodeId};
 pub(crate) const MAX_RECONFIGURATION_PLANS: usize = 64;
 pub(crate) const MAX_RECONFIGURATION_PLAN_BYTES: usize = 512 * 1024;
 
+/// Derived from fully validated state, published only after transaction commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedReconfigurationProjection {
+    pub membership: StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
+    pub plan: Option<ClusterReconfigurationPlan>,
+}
+
+pub(crate) type ReconfigurationProjectionPublisher = tokio::sync::watch::Sender<Option<std::sync::Arc<CommittedReconfigurationProjection>>>;
+
 pub(crate) fn retained_plan_bytes(plans: &[ClusterReconfigurationPlan]) -> io::Result<usize> {
     plans.iter().try_fold(0usize, |total, plan| {
         let bytes = serde_json::to_vec(plan).map_err(io::Error::other)?.len();

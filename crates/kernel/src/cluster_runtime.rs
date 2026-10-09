@@ -2454,6 +2454,7 @@ impl ClusterRaftRuntime {
                 catalog_sha256: config.transport_catalog_sha256.clone(), overlap_not_after: config.transport_trust_overlap_not_after,
             },
         });
+        live_catalog.latest()?;
         let network = ClusterNetworkFactory {
             source: config.node_id,
             cluster_name: Arc::from(config.raft.cluster_name.as_str()),
@@ -2820,14 +2821,18 @@ async fn serve_reconfiguration(
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut metrics = raft.metrics();
+    let mut projections = context.cluster_reconfiguration_projection.subscribe();
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
+        drop(projections.borrow_and_update());
         let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&context)?;
+        let unresolved = plan.as_ref().is_some_and(|plan| plan.is_unresolved(&membership));
+        let current_leader = { metrics.borrow().current_leader };
         if let Some(plan) = plan {
             if plan.is_unresolved(&membership)
-                && metrics.borrow().current_leader == Some(node_id)
+                && current_leader == Some(node_id)
             {
                 if plan.target.trust_generation > 0 {
                     live.check_target(&plan.target)?;
@@ -2846,10 +2851,20 @@ async fn serve_reconfiguration(
                 }
             }
         }
-        tokio::select! {
-            changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return Ok(()); },
-            changed = metrics.changed() => if changed.is_err() { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "live reconfiguration metrics closed")); },
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        if unresolved {
+            tokio::select! {
+                changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return Ok(()); },
+                changed = projections.changed() => if changed.is_err() { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "live projection channel closed")); },
+                changed = metrics.changed() => if changed.is_err() { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "live reconfiguration metrics closed")); },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        } else {
+            // Idle nodes do no periodic SQL/history work. Unchanged clock and
+            // ownership entries do not notify this projection channel.
+            tokio::select! {
+                changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return Ok(()); },
+                changed = projections.changed() => if changed.is_err() { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "live projection channel closed")); },
+            }
         }
     }
 }
@@ -2865,8 +2880,9 @@ async fn converge_membership_target(
     let mut last_failure = None;
     let mut bootstrap_attempted = false;
     loop {
+        let observed = { metrics.borrow().clone() };
         let progress = inspect_durable_membership(
-            &metrics.borrow(),
+            &observed,
             &target.catalog,
             &target.catalog_sha256,
             target.trust_generation,
@@ -2928,7 +2944,7 @@ async fn converge_membership_target(
                 }
             }
             DurableMembershipProgress::NeedsCatalog
-                if metrics.borrow().current_leader == Some(node_id) =>
+                if observed.current_leader == Some(node_id) =>
             {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
@@ -2946,7 +2962,7 @@ async fn converge_membership_target(
                 }
             }
             DurableMembershipProgress::NeedsTransportTrust
-                if metrics.borrow().current_leader == Some(node_id) =>
+                if observed.current_leader == Some(node_id) =>
             {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
@@ -2967,7 +2983,7 @@ async fn converge_membership_target(
                 }
             }
             DurableMembershipProgress::NeedsIntent
-                if metrics.borrow().current_leader == Some(node_id) =>
+                if observed.current_leader == Some(node_id) =>
             {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
@@ -2986,7 +3002,7 @@ async fn converge_membership_target(
                 }
             }
             DurableMembershipProgress::IntentCommitted
-                if metrics.borrow().current_leader == Some(node_id) =>
+                if observed.current_leader == Some(node_id) =>
             {
                 let mut failed = false;
                 for voter_id in &target.voter_ids {
@@ -3036,7 +3052,7 @@ async fn converge_membership_target(
                 }
             }
             DurableMembershipProgress::Joint
-                if metrics.borrow().current_leader == Some(node_id) =>
+                if observed.current_leader == Some(node_id) =>
             {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
@@ -3731,6 +3747,11 @@ fn validate_new_live_proposal(
 ) -> io::Result<()> {
     let inner =
         crate::cluster_principal::unsigned_authority_command(command).map_err(invalid_input)?;
+    if let AuthorityCommand::ProposeClusterVoterChange { prior, .. } = inner {
+        if prior.trust_generation > 0 {
+            live.ok_or_else(|| invalid_input("live trust runtime is unavailable"))?.check_target(prior)?;
+        }
+    }
     if let AuthorityCommand::ProposeClusterTrustChange {
         prior,
         target_catalog,

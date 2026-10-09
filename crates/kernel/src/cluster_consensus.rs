@@ -633,16 +633,30 @@ pub(crate) fn read_cluster_reconfiguration(
     StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
     Option<crate::cluster_reconfiguration::ClusterReconfigurationPlan>,
 )> {
+    let cached = { context.cluster_reconfiguration_projection.borrow().clone() };
+    if let Some(projection) = cached {
+        return Ok((projection.membership.clone(), projection.plan.clone()));
+    }
     let connection = context.conn.lock().map_err(|error| {
         io::Error::other(format!("lock live reconfiguration projection: {error}"))
     })?;
     let state = load_persistent_state(&connection)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let plan = state
-        .authority
-        .control_plane
-        .and_then(|control| control.reconfiguration_plans.last().cloned());
+    // The connection lock serializes this cold fill with every apply/snapshot
+    // publisher. A cached admission cannot outrun acknowledged committed state.
+    publish_reconfiguration_projection(context, &state);
+    let plan = state.authority.control_plane.and_then(|control| control.reconfiguration_plans.last().cloned());
     Ok((state.membership, plan))
+}
+
+fn publish_reconfiguration_projection(context: &SqliteContextManager, state: &PersistentState) {
+    let plan = state.authority.control_plane.as_ref().and_then(|control| control.reconfiguration_plans.last().cloned());
+    let projection = Arc::new(crate::cluster_reconfiguration::CommittedReconfigurationProjection { membership: state.membership.clone(), plan });
+    context.cluster_reconfiguration_projection.send_if_modified(|current| {
+        if current.as_deref() == Some(projection.as_ref()) { return false; }
+        *current = Some(projection);
+        true
+    });
 }
 
 pub(crate) fn has_committed_reconfiguration(
@@ -4614,6 +4628,7 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
         transaction
             .commit()
             .map_err(|error| StorageIOError::write_state_machine(read_io(error.to_string())))?;
+        publish_reconfiguration_projection(&self.context, &state);
         Ok(responses)
     }
 
@@ -4758,6 +4773,7 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
         transaction.commit().map_err(|error| {
             StorageIOError::write_snapshot(Some(meta.signature()), read_io(error.to_string()))
         })?;
+        publish_reconfiguration_projection(&self.context, &state);
         Ok(())
     }
 

@@ -999,6 +999,7 @@ pub struct SqliteContextManager {
     /// crate-visible so transactional modules such as the package supply chain
     /// can participate in the same backup, restore, and durability boundary.
     pub(crate) conn: Mutex<Connection>,
+    pub(crate) cluster_reconfiguration_projection: crate::cluster_reconfiguration::ReconfigurationProjectionPublisher,
     /// Process-lifetime exclusive lease for the database path. Offline restore
     /// acquires the same lease and therefore cannot race a running kernel.
     _storage_lease: Option<crate::storage::StorageLease>,
@@ -1263,6 +1264,7 @@ impl SqliteContextManager {
         }
         let mgr = Self {
             conn: Mutex::new(conn),
+            cluster_reconfiguration_projection: tokio::sync::watch::channel(None).0,
             _storage_lease: storage_lease,
             encryption_key,
             retired_encryption_keys,
@@ -1303,6 +1305,7 @@ impl SqliteContextManager {
         let schema_version = crate::schema::preflight(&conn)?;
         let mgr = Self {
             conn: Mutex::new(conn),
+            cluster_reconfiguration_projection: tokio::sync::watch::channel(None).0,
             _storage_lease: None,
             encryption_key: None,
             retired_encryption_keys: Vec::new(),
@@ -10076,6 +10079,7 @@ mod tests {
         .unwrap();
         let mgr = SqliteContextManager {
             conn: Mutex::new(conn),
+            cluster_reconfiguration_projection: tokio::sync::watch::channel(None).0,
             _storage_lease: None,
             encryption_key: None,
             retired_encryption_keys: Vec::new(),

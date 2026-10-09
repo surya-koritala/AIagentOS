@@ -2467,210 +2467,15 @@ impl ClusterRaftRuntime {
     /// OpenRaft joint consensus. A restarted leader resumes only that exact
     /// persisted intent or joint configuration.
     pub async fn ensure_configured_membership(&self, bootstrap: bool) -> io::Result<()> {
-        let mut metrics = self.metrics();
-        let deadline = Instant::now() + MEMBERSHIP_SETTLE_TIMEOUT;
-        let mut last_failure = None;
-        let mut bootstrap_attempted = false;
-        loop {
-            let progress = inspect_durable_membership(
-                &metrics.borrow(),
-                &self.members,
-                &self.transport_catalog_sha256,
-                self.transport_trust_generation,
-                &self.voter_ids,
-                self.voter_set_generation,
-                &self.voter_set_sha256,
-            )?;
-            match progress {
-                DurableMembershipProgress::Settled => return Ok(()),
-                DurableMembershipProgress::Pristine => {
-                    if !bootstrap {
-                        if self.voter_ids.contains(&self.node_id) {
-                            return Err(invalid_input(
-                                "Raft voter storage is pristine; set cluster_raft.bootstrap = true only for the initial generation-zero cluster start",
-                            ));
-                        }
-                        // A newly trusted non-voter waits for the existing
-                        // leader to commit the target catalog and replicate it
-                        // as a learner. It must never initialize a second
-                        // cluster from its empty local store.
-                    } else {
-                        if self.voter_set_generation != 0 || self.transport_trust_generation != 0 {
-                            return Err(invalid_input(
-                                "a pristine Raft cluster must bootstrap voter and transport-trust generation 0",
-                            ));
-                        }
-                        if !bootstrap_attempted {
-                            bootstrap_attempted = true;
-                            match tokio::time::timeout(
-                                deadline.saturating_duration_since(Instant::now()),
-                                self.initialize(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => {
-                                    last_failure = Some(format!(
-                                        "Raft bootstrap failed and no configured membership appeared: {error}"
-                                    ));
-                                }
-                                Err(_) => last_failure = Some("Raft bootstrap timed out".into()),
-                            }
-                        }
-                    }
-                }
-                DurableMembershipProgress::NeedsCatalog
-                    if metrics.borrow().current_leader == Some(self.node_id) =>
-                {
-                    match tokio::time::timeout(
-                        deadline.saturating_duration_since(Instant::now()),
-                        self.raft
-                            .change_membership(ChangeMembers::SetNodes(self.members.clone()), true),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            last_failure =
-                                Some(format!("commit trusted transport catalog: {error}"));
-                        }
-                        Err(_) => {
-                            last_failure =
-                                Some("commit trusted transport catalog timed out".into());
-                        }
-                    }
-                }
-                DurableMembershipProgress::NeedsTransportTrust
-                    if metrics.borrow().current_leader == Some(self.node_id) =>
-                {
-                    match tokio::time::timeout(
-                        deadline.saturating_duration_since(Instant::now()),
-                        self.raft.change_membership(
-                            ChangeMembers::ReplaceAllNodes(self.members.clone()),
-                            false,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            last_failure =
-                                Some(format!("commit Raft transport-trust epoch: {error}"));
-                        }
-                        Err(_) => {
-                            last_failure =
-                                Some("commit Raft transport-trust epoch timed out".into());
-                        }
-                    }
-                }
-                DurableMembershipProgress::NeedsIntent
-                    if metrics.borrow().current_leader == Some(self.node_id) =>
-                {
-                    match tokio::time::timeout(
-                        deadline.saturating_duration_since(Instant::now()),
-                        self.raft
-                            .change_membership(ChangeMembers::SetNodes(self.members.clone()), true),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            last_failure =
-                                Some(format!("commit voter reconfiguration intent: {error}"));
-                        }
-                        Err(_) => {
-                            last_failure =
-                                Some("commit voter reconfiguration intent timed out".into());
-                        }
-                    }
-                }
-                DurableMembershipProgress::IntentCommitted
-                    if metrics.borrow().current_leader == Some(self.node_id) =>
-                {
-                    let mut failed = false;
-                    for voter_id in &self.voter_ids {
-                        let node = self
-                            .members
-                            .get(voter_id)
-                            .expect("validated voter is in trusted catalog")
-                            .clone();
-                        match tokio::time::timeout(
-                            deadline.saturating_duration_since(Instant::now()),
-                            self.raft.add_learner(*voter_id, node, true),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => {
-                                last_failure =
-                                    Some(format!("catch up incoming voter {voter_id}: {error}"));
-                                failed = true;
-                                break;
-                            }
-                            Err(_) => {
-                                last_failure =
-                                    Some(format!("catch up incoming voter {voter_id} timed out"));
-                                failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !failed {
-                        match tokio::time::timeout(
-                            deadline.saturating_duration_since(Instant::now()),
-                            self.raft.change_membership(self.voter_ids.clone(), true),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => {
-                                last_failure =
-                                    Some(format!("commit joint voter reconfiguration: {error}"));
-                            }
-                            Err(_) => {
-                                last_failure =
-                                    Some("commit joint voter reconfiguration timed out".into());
-                            }
-                        }
-                    }
-                }
-                DurableMembershipProgress::Joint
-                    if metrics.borrow().current_leader == Some(self.node_id) =>
-                {
-                    match tokio::time::timeout(
-                        deadline.saturating_duration_since(Instant::now()),
-                        self.raft.change_membership(self.voter_ids.clone(), true),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            last_failure =
-                                Some(format!("finish joint voter reconfiguration: {error}"));
-                        }
-                        Err(_) => {
-                            last_failure =
-                                Some("finish joint voter reconfiguration timed out".into());
-                        }
-                    }
-                }
-                DurableMembershipProgress::NeedsCatalog
-                | DurableMembershipProgress::NeedsTransportTrust
-                | DurableMembershipProgress::NeedsIntent
-                | DurableMembershipProgress::IntentCommitted
-                | DurableMembershipProgress::Joint => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    last_failure.unwrap_or_else(|| {
-                        "configured voter set was not committed before the startup deadline".into()
-                    }),
-                ));
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let wait = remaining.min(Duration::from_millis(100));
-            let _ = tokio::time::timeout(wait, metrics.changed()).await;
+        converge_membership_target(&self.raft, self.node_id, &self.configured_target(), bootstrap).await
+    }
+
+    fn configured_target(&self) -> crate::cluster_reconfiguration::ClusterReconfigurationTarget {
+        crate::cluster_reconfiguration::ClusterReconfigurationTarget {
+            catalog: self.members.clone(), voter_ids: self.voter_ids.clone(),
+            voter_generation: self.voter_set_generation, voter_set_sha256: self.voter_set_sha256.clone(),
+            trust_generation: self.transport_trust_generation, catalog_sha256: self.transport_catalog_sha256.clone(),
+            overlap_not_after: self.transport_trust_overlap_not_after,
         }
     }
 
@@ -2784,6 +2589,219 @@ impl ClusterRaftRuntime {
             .shutdown()
             .await
             .map_err(|error| io::Error::other(format!("Raft shutdown failed: {error}")))
+    }
+}
+
+async fn converge_membership_target(
+    raft: &Raft<ClusterRaftTypeConfig>,
+    node_id: ClusterRaftNodeId,
+    target: &crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+    bootstrap: bool,
+) -> io::Result<()> {
+    let mut metrics = raft.metrics();
+    let deadline = Instant::now() + MEMBERSHIP_SETTLE_TIMEOUT;
+    let mut last_failure = None;
+    let mut bootstrap_attempted = false;
+    loop {
+        let progress = inspect_durable_membership(
+            &metrics.borrow(),
+            &target.catalog,
+            &target.catalog_sha256,
+            target.trust_generation,
+            &target.voter_ids,
+            target.voter_generation,
+            &target.voter_set_sha256,
+        )?;
+        match progress {
+            DurableMembershipProgress::Settled => return Ok(()),
+            DurableMembershipProgress::Pristine => {
+                if !bootstrap {
+                    if target.voter_ids.contains(&node_id) {
+                        return Err(invalid_input(
+                            "Raft voter storage is pristine; set cluster_raft.bootstrap = true only for the initial generation-zero cluster start",
+                        ));
+                    }
+                    // A newly trusted non-voter waits for the existing
+                    // leader to commit the target catalog and replicate it
+                    // as a learner. It must never initialize a second
+                    // cluster from its empty local store.
+                } else {
+                    if target.voter_generation != 0 || target.trust_generation != 0 {
+                        return Err(invalid_input(
+                            "a pristine Raft cluster must bootstrap voter and transport-trust generation 0",
+                        ));
+                    }
+                    if !bootstrap_attempted {
+                        bootstrap_attempted = true;
+                        match tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()),
+                            raft.initialize(target.voter_ids.iter().map(|id| (*id, target.catalog.get(id).expect("validated voter is in trusted catalog").clone())).collect::<BTreeMap<_, _>>()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                last_failure = Some(format!(
+                                    "Raft bootstrap failed and no configured membership appeared: {error}"
+                                ));
+                            }
+                            Err(_) => last_failure = Some("Raft bootstrap timed out".into()),
+                        }
+                    }
+                }
+            }
+            DurableMembershipProgress::NeedsCatalog
+                if metrics.borrow().current_leader == Some(node_id) =>
+            {
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    raft
+                        .change_membership(ChangeMembers::SetNodes(target.catalog.clone()), true),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        last_failure =
+                            Some(format!("commit trusted transport catalog: {error}"));
+                    }
+                    Err(_) => {
+                        last_failure =
+                            Some("commit trusted transport catalog timed out".into());
+                    }
+                }
+            }
+            DurableMembershipProgress::NeedsTransportTrust
+                if metrics.borrow().current_leader == Some(node_id) =>
+            {
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    raft.change_membership(
+                        ChangeMembers::ReplaceAllNodes(target.catalog.clone()),
+                        false,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        last_failure =
+                            Some(format!("commit Raft transport-trust epoch: {error}"));
+                    }
+                    Err(_) => {
+                        last_failure =
+                            Some("commit Raft transport-trust epoch timed out".into());
+                    }
+                }
+            }
+            DurableMembershipProgress::NeedsIntent
+                if metrics.borrow().current_leader == Some(node_id) =>
+            {
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    raft
+                        .change_membership(ChangeMembers::SetNodes(target.catalog.clone()), true),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        last_failure =
+                            Some(format!("commit voter reconfiguration intent: {error}"));
+                    }
+                    Err(_) => {
+                        last_failure =
+                            Some("commit voter reconfiguration intent timed out".into());
+                    }
+                }
+            }
+            DurableMembershipProgress::IntentCommitted
+                if metrics.borrow().current_leader == Some(node_id) =>
+            {
+                let mut failed = false;
+                for voter_id in &target.voter_ids {
+                    let node = target
+                        .catalog
+                        .get(voter_id)
+                        .expect("validated voter is in trusted catalog")
+                        .clone();
+                    match tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        raft.add_learner(*voter_id, node, true),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            last_failure =
+                                Some(format!("catch up incoming voter {voter_id}: {error}"));
+                            failed = true;
+                            break;
+                        }
+                        Err(_) => {
+                            last_failure =
+                                Some(format!("catch up incoming voter {voter_id} timed out"));
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if !failed {
+                    match tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        raft.change_membership(target.voter_ids.clone(), true),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            last_failure =
+                                Some(format!("commit joint voter reconfiguration: {error}"));
+                        }
+                        Err(_) => {
+                            last_failure =
+                                Some("commit joint voter reconfiguration timed out".into());
+                        }
+                    }
+                }
+            }
+            DurableMembershipProgress::Joint
+                if metrics.borrow().current_leader == Some(node_id) =>
+            {
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    raft.change_membership(target.voter_ids.clone(), true),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        last_failure =
+                            Some(format!("finish joint voter reconfiguration: {error}"));
+                    }
+                    Err(_) => {
+                        last_failure =
+                            Some("finish joint voter reconfiguration timed out".into());
+                    }
+                }
+            }
+            DurableMembershipProgress::NeedsCatalog
+            | DurableMembershipProgress::NeedsTransportTrust
+            | DurableMembershipProgress::NeedsIntent
+            | DurableMembershipProgress::IntentCommitted
+            | DurableMembershipProgress::Joint => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                last_failure.unwrap_or_else(|| {
+                    "configured voter set was not committed before the startup deadline".into()
+                }),
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(Duration::from_millis(100));
+        let _ = tokio::time::timeout(wait, metrics.changed()).await;
     }
 }
 

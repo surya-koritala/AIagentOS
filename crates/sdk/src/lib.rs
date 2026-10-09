@@ -2033,18 +2033,28 @@ impl KernelClient {
         &mut self,
     ) -> Result<kernel::destination_authority::DestinationContractDescription, SdkError> {
         let protocol = self.hello().await?;
-        if !protocol.features.iter().any(|feature|
-            feature == kernel::destination_authority::DISCOVERY_FEATURE) {
+        if !protocol
+            .features
+            .iter()
+            .any(|feature| feature == kernel::destination_authority::DISCOVERY_FEATURE)
+        {
             return Err(SdkError::Wire {
                 code: WireErrorCode::Unsupported,
-                message: "destination contract discovery is unsupported".into(), retryable: false,
+                message: "destination contract discovery is unsupported".into(),
+                retryable: false,
             });
         }
         match self.call(Syscall::GetDestinationContract).await? {
-            SyscallReply::DestinationContract { description } if description.version == 1
-                && description.required_mode.is_some() == description.cluster_id.is_some()
-                && (!description.admission_supported || (description.installation_bound
-                    && description.quorum_configured && description.required_mode.is_some())) => Ok(description),
+            SyscallReply::DestinationContract { description }
+                if description.version == 1
+                    && description.required_mode.is_some() == description.cluster_id.is_some()
+                    && (!description.admission_supported
+                        || (description.installation_bound
+                            && description.quorum_configured
+                            && description.required_mode.is_some())) =>
+            {
+                Ok(description)
+            }
             other => Err(unexpected("DestinationContract", &other)),
         }
     }

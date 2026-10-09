@@ -147,12 +147,21 @@ pub struct DestinationContractDescription {
 pub(crate) fn describe_contract(
     kernel: &crate::AgentKernelImpl,
 ) -> Result<DestinationContractDescription, crate::ContextError> {
-    let connection = kernel.context_manager.conn.lock()
+    let connection = kernel
+        .context_manager
+        .conn
+        .lock()
         .map_err(|_| storage_failure("destination contract store is unavailable"))?;
     let saved = stored_contract(&connection)?;
     let prior = legacy_quorum_cluster(&connection)?;
-    if saved.as_ref().zip(prior.as_ref()).is_some_and(|(saved, prior)| saved != prior) {
-        return Err(storage_failure("destination contract differs from durable authority"));
+    if saved
+        .as_ref()
+        .zip(prior.as_ref())
+        .is_some_and(|(saved, prior)| saved != prior)
+    {
+        return Err(storage_failure(
+            "destination contract differs from durable authority",
+        ));
     }
     let installation_bound = saved.is_some();
     let cluster_id = saved.or(prior);
@@ -160,11 +169,15 @@ pub(crate) fn describe_contract(
     Ok(DestinationContractDescription {
         version: 1,
         supported_mode: DestinationAuthorityMode::OnlineQuorumV1,
-        required_mode: cluster_id.as_ref().map(|_| DestinationAuthorityMode::OnlineQuorumV1),
+        required_mode: cluster_id
+            .as_ref()
+            .map(|_| DestinationAuthorityMode::OnlineQuorumV1),
         cluster_id,
         installation_bound,
-        quorum_configured: kernel.cluster_authority()
-            .map_err(|_| storage_failure("destination authority handle is unavailable"))?.is_some(),
+        quorum_configured: kernel
+            .cluster_authority()
+            .map_err(|_| storage_failure("destination authority handle is unavailable"))?
+            .is_some(),
         // The signed dispatcher must replace this while implementing the full
         // admission contract. A client must not treat discovery as enforcement.
         admission_supported: false,

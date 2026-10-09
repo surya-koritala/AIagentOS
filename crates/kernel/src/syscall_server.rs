@@ -1994,7 +1994,9 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::Hello { .. } => (AccessLevel::ReadOnly, "protocol.hello", None),
         Syscall::DescribeProtocol => (AccessLevel::ReadOnly, "protocol.describe", None),
-        Syscall::GetDestinationContract => (AccessLevel::ReadOnly, "protocol.destination_contract", None),
+        Syscall::GetDestinationContract => {
+            (AccessLevel::ReadOnly, "protocol.destination_contract", None)
+        }
         Syscall::Ping => (AccessLevel::ReadOnly, "protocol.ping", None),
         Syscall::Authenticate { .. } => (AccessLevel::ReadOnly, "auth.authenticate", None),
         Syscall::LoadPackage { .. } => (AccessLevel::Admin, "package.load", None),
@@ -7376,13 +7378,16 @@ impl SyscallServer {
                 Ok(Syscall::DescribeProtocol) => SyscallReply::ProtocolDescription {
                     description: crate::wire_contract::protocol_description(),
                 },
-                Ok(Syscall::GetDestinationContract) if negotiated_version >= 2 => match crate::destination_authority::describe_contract(&kernel) {
-                    Ok(description) => SyscallReply::DestinationContract { description },
-                    Err(_) => SyscallReply::TypedError {
-                        code: WireErrorCode::Unavailable,
-                        message: "destination contract is unavailable".into(), retryable: true,
-                    },
-                },
+                Ok(Syscall::GetDestinationContract) if negotiated_version >= 2 => {
+                    match crate::destination_authority::describe_contract(&kernel) {
+                        Ok(description) => SyscallReply::DestinationContract { description },
+                        Err(_) => SyscallReply::TypedError {
+                            code: WireErrorCode::Unavailable,
+                            message: "destination contract is unavailable".into(),
+                            retryable: true,
+                        },
+                    }
+                }
                 Ok(Syscall::GetDestinationContract) => SyscallReply::Error {
                     message: "destination contract discovery requires protocol v2".into(),
                 },

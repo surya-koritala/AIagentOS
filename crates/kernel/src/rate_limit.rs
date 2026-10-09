@@ -38,27 +38,42 @@ impl Default for LedgerHealth {
 
 impl LedgerHealth {
     fn at(started: std::time::Instant) -> Self {
-        Self { started, failed_at_nanoseconds: AtomicU64::new(u64::MAX) }
+        Self {
+            started,
+            failed_at_nanoseconds: AtomicU64::new(u64::MAX),
+        }
     }
 
     fn elapsed_nanoseconds(&self, now: std::time::Instant) -> u64 {
-        u64::try_from(now.saturating_duration_since(self.started).as_nanos()).unwrap_or(u64::MAX - 1).min(u64::MAX - 1)
+        u64::try_from(now.saturating_duration_since(self.started).as_nanos())
+            .unwrap_or(u64::MAX - 1)
+            .min(u64::MAX - 1)
     }
 
     fn mark_unhealthy_at(&self, now: std::time::Instant) {
         let at = self.elapsed_nanoseconds(now);
-        let _ = self.failed_at_nanoseconds.compare_exchange(u64::MAX, at, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self.failed_at_nanoseconds.compare_exchange(
+            u64::MAX,
+            at,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn mark_unhealthy(&self) {
         self.mark_unhealthy_at(std::time::Instant::now());
     }
 
-    fn is_healthy(&self) -> bool { self.failed_at_nanoseconds.load(Ordering::Acquire) == u64::MAX }
+    fn is_healthy(&self) -> bool {
+        self.failed_at_nanoseconds.load(Ordering::Acquire) == u64::MAX
+    }
 
     fn snapshot_at(&self, now: std::time::Instant) -> (u64, u64) {
         let elapsed = self.elapsed_nanoseconds(now);
-        let healthy = self.failed_at_nanoseconds.load(Ordering::Acquire).min(elapsed);
+        let healthy = self
+            .failed_at_nanoseconds
+            .load(Ordering::Acquire)
+            .min(elapsed);
         (healthy, elapsed.saturating_sub(healthy))
     }
 
@@ -847,11 +862,20 @@ mod tests {
     fn ledger_health_seconds_keep_fractional_intervals_and_never_reset_on_repeat_failure() {
         let start = std::time::Instant::now();
         let health = LedgerHealth::at(start);
-        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(250)), (250_000_000, 0));
+        assert_eq!(
+            health.snapshot_at(start + std::time::Duration::from_millis(250)),
+            (250_000_000, 0)
+        );
         health.mark_unhealthy_at(start + std::time::Duration::from_millis(350));
-        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(700)), (350_000_000, 350_000_000));
+        assert_eq!(
+            health.snapshot_at(start + std::time::Duration::from_millis(700)),
+            (350_000_000, 350_000_000)
+        );
         health.mark_unhealthy_at(start + std::time::Duration::from_millis(900));
-        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(1000)), (350_000_000, 650_000_000));
+        assert_eq!(
+            health.snapshot_at(start + std::time::Duration::from_millis(1000)),
+            (350_000_000, 650_000_000)
+        );
     }
 
     #[test]
@@ -875,12 +899,23 @@ mod tests {
         let before = health.snapshot_at(start + std::time::Duration::from_millis(20));
         std::thread::scope(|scope| {
             let health = health.clone();
-            scope.spawn(move || health.mark_unhealthy_at(start + std::time::Duration::from_millis(1))).join().unwrap();
+            scope
+                .spawn(move || {
+                    health.mark_unhealthy_at(start + std::time::Duration::from_millis(1))
+                })
+                .join()
+                .unwrap();
         });
         assert!(!health.is_healthy());
         assert_eq!(before, (10_000_000, 10_000_000));
-        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(20)), before);
-        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(25)), (10_000_000, 15_000_000));
+        assert_eq!(
+            health.snapshot_at(start + std::time::Duration::from_millis(20)),
+            before
+        );
+        assert_eq!(
+            health.snapshot_at(start + std::time::Duration::from_millis(25)),
+            (10_000_000, 15_000_000)
+        );
     }
     use crate::quota_clock::ManualQuotaClock;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};

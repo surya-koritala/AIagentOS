@@ -403,7 +403,10 @@ impl AgentExecutor {
         self.rate_limiter = Some(limiter);
     }
 
-    pub(crate) fn set_provider_outcomes(&mut self, counters: Arc<crate::telemetry::ProviderOutcomeCounters>) {
+    pub(crate) fn set_provider_outcomes(
+        &mut self,
+        counters: Arc<crate::telemetry::ProviderOutcomeCounters>,
+    ) {
         self.provider_outcomes = counters;
     }
 
@@ -3192,7 +3195,15 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
 
         let output = executor.run("test").await.unwrap();
         assert_eq!(output.content, "recovered!");
-        assert_eq!(executor.provider_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { success: 1, failed: 2, timed_out: 0, cancelled: 0 });
+        assert_eq!(
+            executor.provider_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                success: 1,
+                failed: 2,
+                timed_out: 0,
+                cancelled: 0
+            }
+        );
         assert_eq!(output.usage.llm_requests, 3);
         assert_eq!(output.usage.retries, 2);
         assert_eq!(output.usage.provider_reported_requests, 0);
@@ -3235,7 +3246,13 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
             1,
             "a permanent failure must burn exactly one durable request receipt"
         );
-        assert_eq!(executor.provider_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { failed: 1, ..Default::default() });
+        assert_eq!(
+            executor.provider_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                failed: 1,
+                ..Default::default()
+            }
+        );
     }
 
     struct ImageBoundSession {
@@ -4060,7 +4077,13 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
 
         assert_eq!(output.content, "Cancelled.");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(observed_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { cancelled: 1, ..Default::default() });
+        assert_eq!(
+            observed_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                cancelled: 1,
+                ..Default::default()
+            }
+        );
         let stats = limiter.try_stats().unwrap();
         assert_eq!(stats.requests_this_minute, 1);
         assert!(stats.tokens_this_minute > 0);
@@ -4127,11 +4150,25 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
         );
         executor.set_rate_limiter(execution_rate_limiter_with_tpm(100_000));
         executor.set_provider_request_timeout(std::time::Duration::from_millis(10));
-        let error = tokio::time::timeout(std::time::Duration::from_secs(5), executor.run("provider deadline"))
-            .await.unwrap().unwrap_err();
-        assert!(matches!(error, KernelError::Connector(ConnectorError::Timeout(_))));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            executor.run("provider deadline"),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            KernelError::Connector(ConnectorError::Timeout(_))
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), LLM_RETRIES);
-        assert_eq!(executor.provider_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { timed_out: u64::try_from(LLM_RETRIES).unwrap(), ..Default::default() });
+        assert_eq!(
+            executor.provider_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                timed_out: u64::try_from(LLM_RETRIES).unwrap(),
+                ..Default::default()
+            }
+        );
     }
 
     /// Mock session that calls a nonexistent tool — tests error recovery message to LLM.

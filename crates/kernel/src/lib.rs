@@ -5338,9 +5338,12 @@ impl AgentKernelImpl {
         };
 
         let mut recovery_observation = self.context_manager.checkpoint_recovery_observation();
-        let stored =
-            self.context_manager
-                .claim_generation_checkpoint_observed(checkpoint_id, agent_id, &tenant, &mut recovery_observation)?;
+        let stored = self.context_manager.claim_generation_checkpoint_observed(
+            checkpoint_id,
+            agent_id,
+            &tenant,
+            &mut recovery_observation,
+        )?;
         let executor = match self.ensure_executor(agent_id).await {
             Ok(executor) => executor,
             Err(error) => {

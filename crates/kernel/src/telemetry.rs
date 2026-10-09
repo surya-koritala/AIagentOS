@@ -94,8 +94,16 @@ impl RequestSubsystem {
     /// includes authentication, membership, packages, protocol and supervision.
     pub const fn request_class(self) -> RequestClass {
         match self {
-            Self::Agent | Self::Checkpoint | Self::Memory | Self::Storage | Self::Tool => RequestClass::Agent,
-            Self::Auth | Self::Cluster | Self::Operator | Self::Package | Self::Protocol | Self::Service | Self::System => RequestClass::Control,
+            Self::Agent | Self::Checkpoint | Self::Memory | Self::Storage | Self::Tool => {
+                RequestClass::Agent
+            }
+            Self::Auth
+            | Self::Cluster
+            | Self::Operator
+            | Self::Package
+            | Self::Protocol
+            | Self::Service
+            | Self::System => RequestClass::Control,
         }
     }
 
@@ -194,13 +202,22 @@ impl RequestTelemetrySnapshot {
             duration_bucket_counts: [0; BUCKET_COUNT],
         });
         for sample in &self.samples {
-            let Some(subsystem) = RequestSubsystem::ALL.into_iter().find(|subsystem| subsystem.as_str() == sample.subsystem) else {
+            let Some(subsystem) = RequestSubsystem::ALL
+                .into_iter()
+                .find(|subsystem| subsystem.as_str() == sample.subsystem)
+            else {
                 continue;
             };
             let aggregate = &mut classes[subsystem.request_class() as usize];
             aggregate.requests = aggregate.requests.saturating_add(sample.requests);
-            aggregate.duration_microseconds_total = aggregate.duration_microseconds_total.saturating_add(sample.duration_microseconds_total);
-            for (total, count) in aggregate.duration_bucket_counts.iter_mut().zip(&sample.duration_bucket_counts) {
+            aggregate.duration_microseconds_total = aggregate
+                .duration_microseconds_total
+                .saturating_add(sample.duration_microseconds_total);
+            for (total, count) in aggregate
+                .duration_bucket_counts
+                .iter_mut()
+                .zip(&sample.duration_bucket_counts)
+            {
                 *total = total.saturating_add(*count);
             }
         }
@@ -328,7 +345,10 @@ pub(crate) struct ProviderOutcomeCounters {
 
 impl ProviderOutcomeCounters {
     pub(crate) fn start(self: &std::sync::Arc<Self>) -> ProviderObservation {
-        ProviderObservation { counters: self.clone(), outcome: None }
+        ProviderObservation {
+            counters: self.clone(),
+            outcome: None,
+        }
     }
 
     pub(crate) fn snapshot(&self) -> ProviderOutcomeSnapshot {
@@ -355,7 +375,11 @@ impl ProviderObservation {
 impl Drop for ProviderObservation {
     fn drop(&mut self) {
         let outcome = self.outcome.unwrap_or(ProviderOutcome::Cancelled);
-        let _ = self.counters.outcomes[outcome as usize].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(1)));
+        let _ = self.counters.outcomes[outcome as usize].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(1)),
+        );
     }
 }
 
@@ -376,11 +400,18 @@ pub(crate) struct CheckpointRecoveryCounters {
 
 impl CheckpointRecoveryCounters {
     pub(crate) fn start(self: &std::sync::Arc<Self>) -> CheckpointRecoveryObservation {
-        CheckpointRecoveryObservation { counters: self.clone(), recovered: false, foreign: false }
+        CheckpointRecoveryObservation {
+            counters: self.clone(),
+            recovered: false,
+            foreign: false,
+        }
     }
 
     pub(crate) fn snapshot(&self) -> CheckpointRecoverySnapshot {
-        self.completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -391,19 +422,35 @@ pub(crate) struct CheckpointRecoveryObservation {
 }
 
 impl CheckpointRecoveryObservation {
-    pub(crate) fn observed_foreign_tenant(&mut self, foreign: bool) { self.foreign |= foreign; }
-    pub(crate) fn recovered(&mut self) { self.recovered = true; }
+    pub(crate) fn observed_foreign_tenant(&mut self, foreign: bool) {
+        self.foreign |= foreign;
+    }
+    pub(crate) fn recovered(&mut self) {
+        self.recovered = true;
+    }
 }
 
 impl Drop for CheckpointRecoveryObservation {
     fn drop(&mut self) {
-        let mut snapshot = self.counters.completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if snapshot.attempted == u64::MAX { return; }
+        let mut snapshot = self
+            .counters
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.attempted == u64::MAX {
+            return;
+        }
         snapshot.attempted += 1;
-        if self.recovered { snapshot.recovered += 1; } else { snapshot.safe_rejected += 1; }
+        if self.recovered {
+            snapshot.recovered += 1;
+        } else {
+            snapshot.safe_rejected += 1;
+        }
         if self.foreign {
             snapshot.cross_tenant_attempts += 1;
-            if self.recovered { snapshot.cross_tenant_recoveries += 1; }
+            if self.recovered {
+                snapshot.cross_tenant_recoveries += 1;
+            }
         }
     }
 }
@@ -418,7 +465,10 @@ pub struct DenialProbeSnapshot {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum DenialProbeKind { AuthorizationSandbox, TenantBoundary }
+pub(crate) enum DenialProbeKind {
+    AuthorizationSandbox,
+    TenantBoundary,
+}
 
 #[derive(Default)]
 pub(crate) struct DenialProbeCounters {
@@ -427,7 +477,10 @@ pub(crate) struct DenialProbeCounters {
 
 impl DenialProbeCounters {
     pub(crate) fn record(&self, kind: DenialProbeKind, allowed: bool) {
-        let mut snapshot = self.completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut snapshot = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match kind {
             DenialProbeKind::AuthorizationSandbox => {
                 if snapshot.adversarial_attempts != u64::MAX {
@@ -445,7 +498,10 @@ impl DenialProbeCounters {
     }
 
     pub(crate) fn snapshot(&self) -> DenialProbeSnapshot {
-        self.completed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -531,9 +587,29 @@ mod tests {
         assert_eq!(classes[1].class, RequestClass::Agent);
         assert_eq!(classes[1].requests, 3);
         assert_eq!(classes.iter().map(|sample| sample.requests).sum::<u64>(), 5);
-        assert_eq!(classes.iter().map(|sample| sample.duration_microseconds_total).sum::<u64>(), snapshot.samples.iter().map(|sample| sample.duration_microseconds_total).sum::<u64>());
+        assert_eq!(
+            classes
+                .iter()
+                .map(|sample| sample.duration_microseconds_total)
+                .sum::<u64>(),
+            snapshot
+                .samples
+                .iter()
+                .map(|sample| sample.duration_microseconds_total)
+                .sum::<u64>()
+        );
         for index in 0..BUCKET_COUNT {
-            assert_eq!(classes.iter().map(|sample| sample.duration_bucket_counts[index]).sum::<u64>(), snapshot.samples.iter().map(|sample| sample.duration_bucket_counts[index]).sum::<u64>());
+            assert_eq!(
+                classes
+                    .iter()
+                    .map(|sample| sample.duration_bucket_counts[index])
+                    .sum::<u64>(),
+                snapshot
+                    .samples
+                    .iter()
+                    .map(|sample| sample.duration_bucket_counts[index])
+                    .sum::<u64>()
+            );
         }
         snapshot.samples.push(RequestTelemetrySample {
             subsystem: "tenant/user/tool/dynamic".into(),
@@ -542,7 +618,11 @@ mod tests {
             duration_microseconds_total: u64::MAX,
             duration_bucket_counts: vec![999; BUCKET_COUNT],
         });
-        assert_eq!(snapshot.request_classes(), classes, "dynamic labels changed the fixed class projection");
+        assert_eq!(
+            snapshot.request_classes(),
+            classes,
+            "dynamic labels changed the fixed class projection"
+        );
     }
 
     #[tokio::test]
@@ -558,13 +638,27 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        for outcome in [ProviderOutcome::Success, ProviderOutcome::Failed, ProviderOutcome::TimedOut] {
+        for outcome in [
+            ProviderOutcome::Success,
+            ProviderOutcome::Failed,
+            ProviderOutcome::TimedOut,
+        ] {
             let mut observation = counters.start();
             observation.finish(outcome);
         }
-        assert_eq!(counters.snapshot(), ProviderOutcomeSnapshot { success: 1, failed: 1, timed_out: 1, cancelled: 1 });
+        assert_eq!(
+            counters.snapshot(),
+            ProviderOutcomeSnapshot {
+                success: 1,
+                failed: 1,
+                timed_out: 1,
+                cancelled: 1
+            }
+        );
     }
 }

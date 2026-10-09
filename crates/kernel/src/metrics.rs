@@ -321,7 +321,8 @@ impl MetricsSnapshot {
             .try_lock()
             .map(|init| init.metrics())
             .unwrap_or_default();
-        let (quota_healthy_nanoseconds, quota_unhealthy_nanoseconds) = kernel.rate_limiter.health_duration_nanoseconds();
+        let (quota_healthy_nanoseconds, quota_unhealthy_nanoseconds) =
+            kernel.rate_limiter.health_duration_nanoseconds();
         Self {
             telemetry_contract_version: TELEMETRY_CONTRACT_VERSION,
             requests: kernel.request_telemetry.snapshot(),
@@ -473,10 +474,22 @@ impl MetricsSnapshot {
         out.push_str("# TYPE agentos_request_class_duration_seconds histogram\n");
         for sample in self.requests.request_classes() {
             let class = sample.class.as_str();
-            out.push_str(&format!("agentos_request_class_total{{class=\"{class}\"}} {}\n", sample.requests));
-            out.push_str(&format!("agentos_request_class_duration_seconds_sum{{class=\"{class}\"}} {:.6}\n", sample.duration_microseconds_total as f64 / 1_000_000.0));
-            out.push_str(&format!("agentos_request_class_duration_seconds_count{{class=\"{class}\"}} {}\n", sample.requests));
-            for (boundary, count) in REQUEST_DURATION_BUCKETS_MICROSECONDS.iter().zip(sample.duration_bucket_counts) {
+            out.push_str(&format!(
+                "agentos_request_class_total{{class=\"{class}\"}} {}\n",
+                sample.requests
+            ));
+            out.push_str(&format!(
+                "agentos_request_class_duration_seconds_sum{{class=\"{class}\"}} {:.6}\n",
+                sample.duration_microseconds_total as f64 / 1_000_000.0
+            ));
+            out.push_str(&format!(
+                "agentos_request_class_duration_seconds_count{{class=\"{class}\"}} {}\n",
+                sample.requests
+            ));
+            for (boundary, count) in REQUEST_DURATION_BUCKETS_MICROSECONDS
+                .iter()
+                .zip(sample.duration_bucket_counts)
+            {
                 out.push_str(&format!("agentos_request_class_duration_seconds_bucket{{class=\"{class}\",le=\"{:.3}\"}} {count}\n", *boundary as f64 / 1_000_000.0));
             }
             out.push_str(&format!("agentos_request_class_duration_seconds_bucket{{class=\"{class}\",le=\"+Inf\"}} {}\n", sample.requests));
@@ -484,16 +497,34 @@ impl MetricsSnapshot {
 
         out.push_str("# HELP agentos_checkpoint_recovery_attempts_total Completed checkpoint restoration attempts.\n");
         out.push_str("# TYPE agentos_checkpoint_recovery_attempts_total counter\n");
-        out.push_str(&format!("agentos_checkpoint_recovery_attempts_total {}\n", self.checkpoint_recovery.attempted));
+        out.push_str(&format!(
+            "agentos_checkpoint_recovery_attempts_total {}\n",
+            self.checkpoint_recovery.attempted
+        ));
         out.push_str("# HELP agentos_checkpoint_recovery_total Completed checkpoint restorations by fixed outcome.\n");
         out.push_str("# TYPE agentos_checkpoint_recovery_total counter\n");
-        for (outcome, count) in [("recovered", self.checkpoint_recovery.recovered), ("safe_rejected", self.checkpoint_recovery.safe_rejected)] {
-            out.push_str(&format!("agentos_checkpoint_recovery_total{{outcome=\"{outcome}\"}} {count}\n"));
+        for (outcome, count) in [
+            ("recovered", self.checkpoint_recovery.recovered),
+            ("safe_rejected", self.checkpoint_recovery.safe_rejected),
+        ] {
+            out.push_str(&format!(
+                "agentos_checkpoint_recovery_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
         }
-        for (kind, count) in [("attempts", self.checkpoint_recovery.cross_tenant_attempts), ("recoveries", self.checkpoint_recovery.cross_tenant_recoveries)] {
+        for (kind, count) in [
+            ("attempts", self.checkpoint_recovery.cross_tenant_attempts),
+            (
+                "recoveries",
+                self.checkpoint_recovery.cross_tenant_recoveries,
+            ),
+        ] {
             out.push_str(&format!("# HELP agentos_checkpoint_cross_tenant_{kind}_total Observed foreign-tenant checkpoint {kind}.\n"));
-            out.push_str(&format!("# TYPE agentos_checkpoint_cross_tenant_{kind}_total counter\n"));
-            out.push_str(&format!("agentos_checkpoint_cross_tenant_{kind}_total {count}\n"));
+            out.push_str(&format!(
+                "# TYPE agentos_checkpoint_cross_tenant_{kind}_total counter\n"
+            ));
+            out.push_str(&format!(
+                "agentos_checkpoint_cross_tenant_{kind}_total {count}\n"
+            ));
         }
 
         // --- Syscall-gate enforcement: one counter family, labelled by result.
@@ -542,10 +573,19 @@ impl MetricsSnapshot {
         ));
 
         for (metric, count) in [
-            ("adversarial_attempts", self.denial_probes.adversarial_attempts),
+            (
+                "adversarial_attempts",
+                self.denial_probes.adversarial_attempts,
+            ),
             ("unexpected_allows", self.denial_probes.unexpected_allows),
-            ("tenant_boundary_attempts", self.denial_probes.tenant_boundary_attempts),
-            ("confirmed_violations", self.denial_probes.confirmed_violations),
+            (
+                "tenant_boundary_attempts",
+                self.denial_probes.tenant_boundary_attempts,
+            ),
+            (
+                "confirmed_violations",
+                self.denial_probes.confirmed_violations,
+            ),
         ] {
             out.push_str(&format!("# HELP agentos_{metric}_total Explicit completed expected-denial probe {metric}.\n"));
             out.push_str(&format!("# TYPE agentos_{metric}_total counter\n"));
@@ -701,7 +741,9 @@ impl MetricsSnapshot {
             ("timed_out", self.provider_outcomes.timed_out),
             ("cancelled", self.provider_outcomes.cancelled),
         ] {
-            out.push_str(&format!("agentos_llm_requests_total{{outcome=\"{outcome}\"}} {count}\n"));
+            out.push_str(&format!(
+                "agentos_llm_requests_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
         }
 
         out.push_str("# HELP agentos_llm_cores LLM request scheduler cores by state.\n");
@@ -764,8 +806,13 @@ impl MetricsSnapshot {
             ("unhealthy", self.quota_storage_unhealthy_nanoseconds_total),
         ] {
             out.push_str(&format!("# HELP agentos_quota_storage_{state}_seconds_total Monotonic time with quota ledger health in the {state} state since startup.\n"));
-            out.push_str(&format!("# TYPE agentos_quota_storage_{state}_seconds_total counter\n"));
-            out.push_str(&format!("agentos_quota_storage_{state}_seconds_total {:.9}\n", value as f64 / 1_000_000_000.0));
+            out.push_str(&format!(
+                "# TYPE agentos_quota_storage_{state}_seconds_total counter\n"
+            ));
+            out.push_str(&format!(
+                "agentos_quota_storage_{state}_seconds_total {:.9}\n",
+                value as f64 / 1_000_000_000.0
+            ));
         }
         out.push_str(&format!(
             "agentos_quota_storage_healthy {}\n",
@@ -1018,9 +1065,25 @@ mod tests {
         MetricsSnapshot {
             telemetry_contract_version: TELEMETRY_CONTRACT_VERSION,
             requests,
-            provider_outcomes: crate::telemetry::ProviderOutcomeSnapshot { success: 4, failed: 2, timed_out: 1, cancelled: 3 },
-            checkpoint_recovery: crate::telemetry::CheckpointRecoverySnapshot { attempted: 5, recovered: 3, safe_rejected: 2, cross_tenant_attempts: 1, cross_tenant_recoveries: 0 },
-            denial_probes: crate::telemetry::DenialProbeSnapshot { adversarial_attempts: 100, unexpected_allows: 0, tenant_boundary_attempts: 100, confirmed_violations: 0 },
+            provider_outcomes: crate::telemetry::ProviderOutcomeSnapshot {
+                success: 4,
+                failed: 2,
+                timed_out: 1,
+                cancelled: 3,
+            },
+            checkpoint_recovery: crate::telemetry::CheckpointRecoverySnapshot {
+                attempted: 5,
+                recovered: 3,
+                safe_rejected: 2,
+                cross_tenant_attempts: 1,
+                cross_tenant_recoveries: 0,
+            },
+            denial_probes: crate::telemetry::DenialProbeSnapshot {
+                adversarial_attempts: 100,
+                unexpected_allows: 0,
+                tenant_boundary_attempts: 100,
+                confirmed_violations: 0,
+            },
             gate: GateStats {
                 allowed: 5,
                 denied_capability: 2,
@@ -1247,8 +1310,14 @@ mod tests {
             "agentos_request_class_total",
             "agentos_request_class_duration_seconds",
         ] {
-            assert!(text.contains(&format!("# HELP {family} ")), "missing HELP for {family}");
-            assert!(text.contains(&format!("# TYPE {family} ")), "missing TYPE for {family}");
+            assert!(
+                text.contains(&format!("# HELP {family} ")),
+                "missing HELP for {family}"
+            );
+            assert!(
+                text.contains(&format!("# TYPE {family} ")),
+                "missing TYPE for {family}"
+            );
         }
         assert!(text.contains("agentos_llm_requests_total{outcome=\"success\"} 4"));
         assert!(text.contains("agentos_checkpoint_recovery_total{outcome=\"safe_rejected\"} 2"));

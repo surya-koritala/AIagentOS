@@ -5825,16 +5825,27 @@ impl SqliteContextManager {
         tenant_id: &str,
     ) -> Result<StoredGenerationCheckpoint, ContextError> {
         let mut observation = self.checkpoint_recovery_observation();
-        let result = self.claim_generation_checkpoint_observed(checkpoint_id, agent_id, tenant_id, &mut observation);
-        if result.is_ok() { observation.recovered(); }
+        let result = self.claim_generation_checkpoint_observed(
+            checkpoint_id,
+            agent_id,
+            tenant_id,
+            &mut observation,
+        );
+        if result.is_ok() {
+            observation.recovered();
+        }
         result
     }
 
-    pub(crate) fn checkpoint_recovery_observation(&self) -> crate::telemetry::CheckpointRecoveryObservation {
+    pub(crate) fn checkpoint_recovery_observation(
+        &self,
+    ) -> crate::telemetry::CheckpointRecoveryObservation {
         self.checkpoint_recovery.start()
     }
 
-    pub(crate) fn checkpoint_recovery_snapshot(&self) -> crate::telemetry::CheckpointRecoverySnapshot {
+    pub(crate) fn checkpoint_recovery_snapshot(
+        &self,
+    ) -> crate::telemetry::CheckpointRecoverySnapshot {
         self.checkpoint_recovery.snapshot()
     }
 
@@ -5846,9 +5857,19 @@ impl SqliteContextManager {
         observation: &mut crate::telemetry::CheckpointRecoveryObservation,
     ) -> Result<StoredGenerationCheckpoint, ContextError> {
         let conn = self.locked_conn();
-        let stored_tenant = conn.query_row("SELECT tenant_id FROM generation_checkpoints WHERE id=?1", [checkpoint_id.to_string()], |row| row.get::<_, String>(0))
-            .optional().map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
-        observation.observed_foreign_tenant(stored_tenant.as_deref().is_some_and(|stored| stored != tenant_id));
+        let stored_tenant = conn
+            .query_row(
+                "SELECT tenant_id FROM generation_checkpoints WHERE id=?1",
+                [checkpoint_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        observation.observed_foreign_tenant(
+            stored_tenant
+                .as_deref()
+                .is_some_and(|stored| stored != tenant_id),
+        );
         let changed = conn
             .execute(
                 "UPDATE generation_checkpoints SET status = 'resuming'
@@ -5895,7 +5916,8 @@ impl SqliteContextManager {
                 "checkpoint version {version} is incompatible with runtime version {GENERATION_CHECKPOINT_VERSION}"
             )));
         }
-        let checkpoint: crate::execution::GenerationCheckpoint = match serde_json::from_str(&row.3) {
+        let checkpoint: crate::execution::GenerationCheckpoint = match serde_json::from_str(&row.3)
+        {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 let _ = conn.execute(
@@ -5908,8 +5930,13 @@ impl SqliteContextManager {
             }
         };
         if checkpoint.agent_id != agent_id {
-            let _ = conn.execute("UPDATE generation_checkpoints SET status='corrupt' WHERE id=?1", [checkpoint_id.to_string()]);
-            return Err(ContextError::RestoreFailed("checkpoint payload identity disagrees with its scoped record".into()));
+            let _ = conn.execute(
+                "UPDATE generation_checkpoints SET status='corrupt' WHERE id=?1",
+                [checkpoint_id.to_string()],
+            );
+            return Err(ContextError::RestoreFailed(
+                "checkpoint payload identity disagrees with its scoped record".into(),
+            ));
         }
         Ok(StoredGenerationCheckpoint {
             metadata: GenerationCheckpointMetadata {
@@ -7975,26 +8002,71 @@ mod tests {
     fn checkpoint_recovery_sli_counts_foreign_rejections_and_refuses_payload_identity_corruption() {
         let manager = SqliteContextManager::in_memory().unwrap();
         let foreign_agent = uuid::Uuid::new_v4();
-        let foreign = manager.save_generation_checkpoint(DEFAULT_TENANT, "provider", "model", &sample_generation_checkpoint(foreign_agent), std::time::Duration::from_secs(60)).unwrap();
-        manager.locked_conn().execute("UPDATE generation_checkpoints SET tenant_id='foreign-fixture' WHERE id=?1", [foreign.to_string()]).unwrap();
+        let foreign = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(foreign_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        manager
+            .locked_conn()
+            .execute(
+                "UPDATE generation_checkpoints SET tenant_id='foreign-fixture' WHERE id=?1",
+                [foreign.to_string()],
+            )
+            .unwrap();
         for _ in 0..100 {
-            assert!(manager.claim_generation_checkpoint(foreign, foreign_agent, DEFAULT_TENANT).is_err());
+            assert!(manager
+                .claim_generation_checkpoint(foreign, foreign_agent, DEFAULT_TENANT)
+                .is_err());
         }
-        let restored = manager.claim_generation_checkpoint(foreign, foreign_agent, "foreign-fixture").unwrap();
+        let restored = manager
+            .claim_generation_checkpoint(foreign, foreign_agent, "foreign-fixture")
+            .unwrap();
         assert_eq!(restored.checkpoint.agent_id, foreign_agent);
         let owner = uuid::Uuid::new_v4();
-        let corrupt = manager.save_generation_checkpoint(DEFAULT_TENANT, "provider", "model", &sample_generation_checkpoint(owner), std::time::Duration::from_secs(60)).unwrap();
-        let mismatched_payload = serde_json::to_string(&sample_generation_checkpoint(foreign_agent)).unwrap();
-        manager.locked_conn().execute("UPDATE generation_checkpoints SET checkpoint_json=?1 WHERE id=?2", params![mismatched_payload, corrupt.to_string()]).unwrap();
-        let error = manager.claim_generation_checkpoint(corrupt, owner, DEFAULT_TENANT).unwrap_err();
+        let corrupt = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(owner),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let mismatched_payload =
+            serde_json::to_string(&sample_generation_checkpoint(foreign_agent)).unwrap();
+        manager
+            .locked_conn()
+            .execute(
+                "UPDATE generation_checkpoints SET checkpoint_json=?1 WHERE id=?2",
+                params![mismatched_payload, corrupt.to_string()],
+            )
+            .unwrap();
+        let error = manager
+            .claim_generation_checkpoint(corrupt, owner, DEFAULT_TENANT)
+            .unwrap_err();
         assert!(error.to_string().contains("payload identity"));
-        let status: String = manager.locked_conn().query_row("SELECT status FROM generation_checkpoints WHERE id=?1", [corrupt.to_string()], |row| row.get(0)).unwrap();
+        let status: String = manager
+            .locked_conn()
+            .query_row(
+                "SELECT status FROM generation_checkpoints WHERE id=?1",
+                [corrupt.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(status, "corrupt");
         let snapshot = manager.checkpoint_recovery_snapshot();
         assert_eq!(snapshot.attempted, 102);
         assert_eq!(snapshot.recovered, 1);
         assert_eq!(snapshot.safe_rejected, 101);
-        assert_eq!(snapshot.recovered + snapshot.safe_rejected, snapshot.attempted);
+        assert_eq!(
+            snapshot.recovered + snapshot.safe_rejected,
+            snapshot.attempted
+        );
         assert_eq!(snapshot.cross_tenant_attempts, 100);
         assert_eq!(snapshot.cross_tenant_recoveries, 0);
         let rendered = serde_json::to_string(&snapshot).unwrap();

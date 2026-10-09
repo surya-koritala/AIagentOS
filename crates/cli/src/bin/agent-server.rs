@@ -878,8 +878,14 @@ mod tests {
             "agentos_request_class_total",
             "agentos_request_class_duration_seconds",
         ] {
-            assert!(body.contains(&format!("# HELP {family} ")), "HTTP metrics omitted HELP for {family}");
-            assert!(body.contains(&format!("# TYPE {family} ")), "HTTP metrics omitted TYPE for {family}");
+            assert!(
+                body.contains(&format!("# HELP {family} ")),
+                "HTTP metrics omitted HELP for {family}"
+            );
+            assert!(
+                body.contains(&format!("# TYPE {family} ")),
+                "HTTP metrics omitted TYPE for {family}"
+            );
         }
 
         // A query string is tolerated and still routes to /metrics.

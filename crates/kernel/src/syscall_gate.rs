@@ -1459,8 +1459,13 @@ impl SyscallGate {
         resource: &str,
         est_tokens: u64,
     ) -> Result<Pid, GateDenial> {
-        let result = self.check_tool_call(kid, tool_name, resource, est_tokens).await;
-        self.denial_probes.record(crate::telemetry::DenialProbeKind::AuthorizationSandbox, result.is_ok());
+        let result = self
+            .check_tool_call(kid, tool_name, resource, est_tokens)
+            .await;
+        self.denial_probes.record(
+            crate::telemetry::DenialProbeKind::AuthorizationSandbox,
+            result.is_ok(),
+        );
         result
     }
 
@@ -2712,18 +2717,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_denial_probes_measure_an_unexpected_allow_and_leave_ordinary_traffic_unmarked() {
+    async fn explicit_denial_probes_measure_an_unexpected_allow_and_leave_ordinary_traffic_unmarked(
+    ) {
         let (gate, _) = fresh_gate();
         let kid = uuid::Uuid::new_v4();
         gate.register_agent(kid, CapabilitySet::none(), None);
-        assert!(gate.check_tool_call(kid, "read_file", "/scope", 1).await.is_ok());
-        assert!(gate.check_tool_call(kid, "write_file", "/scope", 1).await.is_err());
+        assert!(gate
+            .check_tool_call(kid, "read_file", "/scope", 1)
+            .await
+            .is_ok());
+        assert!(gate
+            .check_tool_call(kid, "write_file", "/scope", 1)
+            .await
+            .is_err());
         assert_eq!(gate.denial_probe_stats(), Default::default());
         for _ in 0..100 {
-            assert!(gate.probe_expected_tool_denial(kid, "write_file", "/scope", 1).await.is_err());
+            assert!(gate
+                .probe_expected_tool_denial(kid, "write_file", "/scope", 1)
+                .await
+                .is_err());
         }
-        assert!(gate.probe_expected_tool_denial(kid, "read_file", "/scope", 1).await.is_ok());
-        assert_eq!(gate.denial_probe_stats(), crate::telemetry::DenialProbeSnapshot { adversarial_attempts: 101, unexpected_allows: 1, ..Default::default() });
+        assert!(gate
+            .probe_expected_tool_denial(kid, "read_file", "/scope", 1)
+            .await
+            .is_ok());
+        assert_eq!(
+            gate.denial_probe_stats(),
+            crate::telemetry::DenialProbeSnapshot {
+                adversarial_attempts: 101,
+                unexpected_allows: 1,
+                ..Default::default()
+            }
+        );
     }
 
     #[tokio::test]

@@ -1365,6 +1365,13 @@ mod tests {
             rebuilt.push_str(&format!("{value:08x}"));
         }
         assert_eq!(rebuilt, source);
+        if let Ok(expected) = std::env::var("GITHUB_SHA") {
+            assert_eq!(
+                source, expected,
+                "compiled identity must match the actual CI checkout"
+            );
+            assert_eq!(env!("AGENTOS_COMPILED_SOURCE_VERIFIED"), "1");
+        }
         assert_eq!(
             text.lines()
                 .filter(|line| line.starts_with("agentos_build_source_sha1{"))

@@ -22,8 +22,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-changed=build.rs");
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let root = git(&manifest, &["rev-parse", "--show-toplevel"])
-        .map(|value| PathBuf::from(value.trim()));
+    let root =
+        git(&manifest, &["rev-parse", "--show-toplevel"]).map(|value| PathBuf::from(value.trim()));
     let mut commit = "0000000000000000000000000000000000000000".to_owned();
     let mut verified = false;
     if let Some(root) = root {

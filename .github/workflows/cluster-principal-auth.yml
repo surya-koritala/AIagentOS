@@ -1,103 +1,75 @@
-name: Combined feature formatting evidence
+name: Independent cluster principal proof
 
 on:
   workflow_dispatch:
     inputs:
-      principal_compiler:
-        description: Compile and lint principal source only; no tests or qualification
-        type: boolean
-        required: false
-        default: false
-      principal_focused:
-        description: Actual keyless principal schema and quorum fixtures
-        type: boolean
-        required: false
-        default: false
+      stage:
+        description: Formatter preflight or focused protocol/quorum evidence
+        required: true
+        default: format
+        type: choice
+        options: [format, focused]
   pull_request:
-    branches: [main]
+    branches: [main, 'codex/**']
     paths:
-      - '.github/workflows/integration-format.yml'
-      - 'crates/**'
-      - 'tests/**'
-      - 'benchmarks/**'
+      - '.github/workflows/cluster-principal-auth.yml'
+      - 'crates/kernel/src/cluster_*.rs'
+      - 'crates/kernel/src/config.rs'
+      - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/wire_contract.rs'
+      - 'crates/sdk/**'
+      - 'protocol/**'
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  group: principal-proof-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
-  formatting:
-    name: Retained integration formatting check
+  format:
+    name: Principal formatter preflight
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: 1.97.1
           components: rustfmt
-      - name: Retain source and any formatter repair
+      - name: Retain exact source and formatting repair
         run: |
-          mkdir -p target/qualification/format
-          git rev-parse HEAD > target/qualification/format/source-commit.txt
+          mkdir -p target/qualification/principal-format
+          git rev-parse HEAD > target/qualification/principal-format/source-commit.txt
           if ! cargo fmt --all -- --check; then
             cargo fmt --all
-            git diff --binary > target/qualification/format/rustfmt.patch
+            git diff --binary > target/qualification/principal-format/rustfmt.patch
           fi
-          if test -f crates/kernel/src/cluster_principal_tests.rs && ! rustfmt --edition 2021 --check crates/kernel/src/cluster_principal_tests.rs; then
+          if ! rustfmt --edition 2021 --check crates/kernel/src/cluster_principal_tests.rs; then
             rustfmt --edition 2021 crates/kernel/src/cluster_principal_tests.rs
-            git diff --binary > target/qualification/format/rustfmt.patch
+            git diff --binary > target/qualification/principal-format/rustfmt.patch
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: integration-format-${{ github.sha }}
-          path: target/qualification/format
+          name: principal-format-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/qualification/principal-format
           retention-days: 30
-      - name: Require formatted source
-        run: test ! -s target/qualification/format/rustfmt.patch
-  principal-compiler:
-    name: Principal compiler diagnostics only
-    needs: formatting
-    if: github.event_name == 'workflow_dispatch' && inputs.principal_compiler
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    env:
-      CARGO_INCREMENTAL: 0
-      CARGO_TERM_COLOR: always
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with:
-          toolchain: 1.97.1
-          components: clippy
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
-        with:
-          shared-key: cluster-principal-compiler
-      - name: Retain compiler-only source identity
-        run: |
-          mkdir -p target/qualification/principal-compiler
-          git rev-parse HEAD > target/qualification/principal-compiler/source-commit.txt
-          printf '%s\n' 'Compiler diagnostics only. No tests, storage/schema acceptance, models, or production qualification.' > target/qualification/principal-compiler/scope.txt
-      - name: Compile all owned targets and deny warnings
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo check -p kernel -p agent-sdk --all-targets 2>&1 | tee target/qualification/principal-compiler/check.txt
-          cargo clippy -p kernel -p agent-sdk --all-targets -- -D warnings 2>&1 | tee target/qualification/principal-compiler/clippy.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: principal-compiler-${{ github.sha }}
-          path: target/qualification/principal-compiler
-          retention-days: 30
-  principal-focused:
+      - name: Require formatted source before compilation
+        run: test ! -s target/qualification/principal-format/rustfmt.patch
+  focused:
     name: Principal protocol and quorum security
-    needs: formatting
-    if: github.event_name == 'workflow_dispatch' && inputs.principal_focused
+    needs: format
+    if: github.event_name == 'pull_request' || inputs.stage == 'focused'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

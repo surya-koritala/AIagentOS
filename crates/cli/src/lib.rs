@@ -8,6 +8,7 @@ use std::ops::{Deref, DerefMut};
 
 use agent_sdk::{ConnectionProfile, KernelClient, SdkError};
 
+pub mod cluster;
 pub mod policy;
 /// Provider registration shared by every first-party host surface.
 ///
@@ -43,6 +44,11 @@ impl OperatorClient {
     /// Rotate the authenticated credential without rebuilding the client.
     pub async fn rotate_auth(&mut self, token: impl Into<String>) -> Result<(), SdkError> {
         self.inner.authenticate(token).await
+    }
+
+    /// Close the owned SDK connection through its bounded graceful handshake.
+    pub async fn close(self) -> Result<(), SdkError> {
+        self.inner.close().await
     }
 }
 

@@ -510,6 +510,15 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "retain"
     ),
     sqlite_entry!(
+        "cluster_operation_receipts",
+        "system",
+        "hashed admitted actor and command; public node or agent-fence metadata in replies",
+        "bounded cluster operation UUIDs, unresolved admission tombstones and validated completed replies",
+        "installation lifetime; unresolved entries are never automatically evicted",
+        "owner-only database permissions and integrity; no raw credential or command payload",
+        "retain at-most-once admission tombstones; reconcile pending outcomes explicitly"
+    ),
+    sqlite_entry!(
         "cluster_join_challenges",
         "system",
         "none",

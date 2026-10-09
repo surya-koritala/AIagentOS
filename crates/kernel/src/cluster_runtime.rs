@@ -3125,8 +3125,12 @@ pub async fn start_configured_cluster_runtime(
     context: Arc<SqliteContextManager>,
     config: &ClusterRaftConfig,
 ) -> io::Result<Option<ClusterRaftRuntime>> {
-    crate::destination_authority::bind_runtime_configuration(&context, config)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "destination authority contract refused startup"))?;
+    crate::destination_authority::bind_runtime_configuration(&context, config).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "destination authority contract refused startup",
+        )
+    })?;
     let Some(runtime_config) = ClusterRaftRuntimeConfig::from_operator_config(config)? else {
         return Ok(None);
     };
@@ -3947,7 +3951,9 @@ mod tests {
         ClusterRaftConfig {
             authority_genesis_principals: vec![crate::cluster_principal::fixture_operator()],
             enabled: true,
-            destination_authority_mode: Some(crate::destination_authority::DestinationAuthorityMode::OnlineQuorumV1),
+            destination_authority_mode: Some(
+                crate::destination_authority::DestinationAuthorityMode::OnlineQuorumV1,
+            ),
             bootstrap,
             node_id: peer.node_id,
             authority_cluster_id: "00000000-0000-0000-0000-000000000100".into(),

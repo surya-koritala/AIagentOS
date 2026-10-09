@@ -104,7 +104,9 @@ fn write_cluster_config(
         data_dir,
         cluster_raft: ClusterRaftConfig {
             enabled: true,
-            destination_authority_mode: Some(kernel::destination_authority::DestinationAuthorityMode::OnlineQuorumV1),
+            destination_authority_mode: Some(
+                kernel::destination_authority::DestinationAuthorityMode::OnlineQuorumV1,
+            ),
             authority_genesis_principals: {
                 let operator = KeyPair::generate_for(&rcgen::PKCS_ED25519)
                     .expect("generate ephemeral operator public key");

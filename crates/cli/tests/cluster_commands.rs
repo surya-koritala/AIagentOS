@@ -484,7 +484,9 @@ async fn replicated_authority(
     let authority_cluster_id = Uuid::new_v4().to_string();
     let config = ClusterRaftConfig {
         enabled: true,
-        destination_authority_mode: Some(kernel::destination_authority::DestinationAuthorityMode::OnlineQuorumV1),
+        destination_authority_mode: Some(
+            kernel::destination_authority::DestinationAuthorityMode::OnlineQuorumV1,
+        ),
         bootstrap: true,
         node_id: 1,
         authority_cluster_id: authority_cluster_id.clone(),

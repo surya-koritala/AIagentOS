@@ -414,7 +414,10 @@ impl ClusterRaftConfig {
         if self.destination_authority_mode
             != Some(crate::destination_authority::DestinationAuthorityMode::OnlineQuorumV1)
         {
-            return Err("cluster_raft.destination_authority_mode must explicitly select online_quorum_v1".into());
+            return Err(
+                "cluster_raft.destination_authority_mode must explicitly select online_quorum_v1"
+                    .into(),
+            );
         }
         if self.node_id == 0 {
             return Err("cluster_raft.node_id 0 is reserved".into());
@@ -1917,7 +1920,9 @@ mod tests {
             std::env::temp_dir().join(format!("agentos-raft-config-{}", uuid::Uuid::new_v4()));
         ClusterRaftConfig {
             enabled: true,
-            destination_authority_mode: Some(crate::destination_authority::DestinationAuthorityMode::OnlineQuorumV1),
+            destination_authority_mode: Some(
+                crate::destination_authority::DestinationAuthorityMode::OnlineQuorumV1,
+            ),
             authority_genesis_principals: vec![crate::cluster_principal::fixture_operator()],
             bootstrap: true,
             node_id: 1,
@@ -1955,7 +1960,10 @@ mod tests {
         configured.validate().expect("valid cluster config");
         let mut missing_mode = configured.clone();
         missing_mode.destination_authority_mode = None;
-        assert!(missing_mode.validate().unwrap_err().contains("destination_authority_mode"));
+        assert!(missing_mode
+            .validate()
+            .unwrap_err()
+            .contains("destination_authority_mode"));
         let config = Config {
             cluster_raft: configured.clone(),
             ..Default::default()
@@ -1983,24 +1991,33 @@ mod tests {
             let store = crate::context::SqliteContextManager::new(&path).unwrap();
             crate::destination_authority::bind_runtime_configuration(&store, &configured).unwrap();
             assert!(crate::destination_authority::bind_runtime_configuration(
-                &store, &ClusterRaftConfig::default(),
-            ).is_err());
+                &store,
+                &ClusterRaftConfig::default(),
+            )
+            .is_err());
             let mut foreign = configured.clone();
             foreign.authority_cluster_id = uuid::Uuid::new_v4().to_string();
-            assert!(crate::destination_authority::bind_runtime_configuration(&store, &foreign).is_err());
+            assert!(
+                crate::destination_authority::bind_runtime_configuration(&store, &foreign).is_err()
+            );
             let connection = store.conn.lock().unwrap();
             assert!(crate::schema::preflight_for_reader(&connection, 15).is_err());
         }
         let reopened = crate::context::SqliteContextManager::new(&path).unwrap();
         crate::destination_authority::bind_runtime_configuration(&reopened, &configured).unwrap();
         assert!(crate::destination_authority::bind_runtime_configuration(
-            &reopened, &ClusterRaftConfig::default(),
-        ).is_err());
+            &reopened,
+            &ClusterRaftConfig::default(),
+        )
+        .is_err());
         let connection = reopened.conn.lock().unwrap();
-        let exact: String = connection.query_row(
-            "SELECT cluster_id FROM destination_authority_contract WHERE singleton = 1", [],
-            |row| row.get(0),
-        ).unwrap();
+        let exact: String = connection
+            .query_row(
+                "SELECT cluster_id FROM destination_authority_contract WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(exact, configured.authority_cluster_id);
         connection.execute(
             "UPDATE destination_authority_contract SET installation_id = ?1 WHERE singleton = 1",
@@ -2011,9 +2028,12 @@ mod tests {
 
     #[test]
     fn unknown_destination_mode_cannot_deserialize_as_a_legacy_default() {
-        assert!(serde_json::from_value::<ClusterRaftConfig>(serde_json::json!({
-            "enabled": false, "destination_authority_mode": "legacy_fallback",
-        })).is_err());
+        assert!(
+            serde_json::from_value::<ClusterRaftConfig>(serde_json::json!({
+                "enabled": false, "destination_authority_mode": "legacy_fallback",
+            }))
+            .is_err()
+        );
     }
 
     #[test]

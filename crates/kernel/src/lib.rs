@@ -1532,7 +1532,8 @@ impl AgentKernelImpl {
             crate::destination_authority::bind_runtime_configuration(
                 &context_manager,
                 &config.cluster_raft,
-            ).map_err(KernelError::Context)?;
+            )
+            .map_err(KernelError::Context)?;
         }
         tracing::info!(
             target: "agentos::storage",

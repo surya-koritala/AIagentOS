@@ -477,7 +477,10 @@ pub(crate) fn destination_contract_cluster(
     connection: &Connection,
 ) -> Result<Option<String>, AnyError> {
     let state = load_persistent_state(connection)?;
-    Ok(state.authority.control_plane.map(|control| control.cluster_id))
+    Ok(state
+        .authority
+        .control_plane
+        .map(|control| control.cluster_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

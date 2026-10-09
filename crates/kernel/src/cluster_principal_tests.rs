@@ -93,10 +93,19 @@ async fn principal_history_requires_current_reader_and_retains_real_receipt14_be
         assert_eq!(migration, "retain-actor-bound-cluster-operation-receipts");
         let receipt_table: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='cluster_operation_receipts'", [], |row| row.get(0)).unwrap();
         assert_eq!(receipt_table, 1);
+        let refusal15 = crate::schema::preflight_for_reader(&connection, 15).unwrap_err();
+        assert!(matches!(refusal15, crate::ContextError::DatabaseTooNew { found: 16, supported: 15 }));
+        let migration16: String = connection.query_row("SELECT name FROM schema_migrations WHERE version=16", [], |row| row.get(0)).unwrap();
+        assert_eq!(migration16, "retain-signed-live-transport-reconfiguration-plans");
         let refusal = crate::schema::preflight_for_reader(&connection, 14).unwrap_err();
         assert!(matches!(refusal, crate::ContextError::DatabaseTooNew { found, supported: 14 } if found == crate::schema::CURRENT_SCHEMA_VERSION));
         connection.pragma_update(None, "user_version", 14).unwrap();
-        connection.execute("UPDATE storage_meta SET schema_version=14,min_reader_schema_version=14", []).unwrap();
+        connection
+            .execute(
+                "UPDATE storage_meta SET schema_version=14,min_reader_schema_version=14",
+                [],
+            )
+            .unwrap();
     }
     let before = read_initialized_authority_view(&context).unwrap();
     let signed = fixture_signed(principal_claim(&peer), FIXTURE_CLUSTER_ID);

@@ -2589,7 +2589,7 @@ fn starts_new_work(call: &Syscall) -> bool {
     )
 }
 
-fn mutable_agent_target(call: &Syscall) -> Option<&str> {
+pub(crate) fn mutable_agent_target(call: &Syscall) -> Option<&str> {
     match call {
         Syscall::PauseAgent { agent_id }
         | Syscall::CloneAgent { agent_id, .. }

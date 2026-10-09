@@ -211,7 +211,7 @@ pub fn authority_command_semantic_sha256(
     Ok(crate::cluster_control::sha256_hex(&canonical))
 }
 
-fn encode_canonical_json(
+pub(crate) fn encode_canonical_json(
     value: &serde_json::Value,
     output: &mut Vec<u8>,
 ) -> Result<(), PrincipalProofError> {

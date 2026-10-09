@@ -309,6 +309,9 @@ pub struct ClusterAuthorityGenesisMemberConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterRaftConfig {
     pub enabled: bool,
+    /// Required explicit destination admission contract in enabled quorum mode.
+    /// Missing values never select the legacy designated-authority path.
+    pub destination_authority_mode: Option<crate::destination_authority::DestinationAuthorityMode>,
     pub bootstrap: bool,
     pub node_id: u64,
     /// Canonical UUID shared by every voter and returned by the replicated
@@ -368,6 +371,7 @@ impl Default for ClusterRaftConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            destination_authority_mode: None,
             bootstrap: false,
             node_id: 0,
             authority_cluster_id: String::new(),
@@ -406,6 +410,11 @@ impl ClusterRaftConfig {
         }
         if !self.enabled {
             return Ok(());
+        }
+        if self.destination_authority_mode
+            != Some(crate::destination_authority::DestinationAuthorityMode::OnlineQuorumV1)
+        {
+            return Err("cluster_raft.destination_authority_mode must explicitly select online_quorum_v1".into());
         }
         if self.node_id == 0 {
             return Err("cluster_raft.node_id 0 is reserved".into());
@@ -1908,6 +1917,7 @@ mod tests {
             std::env::temp_dir().join(format!("agentos-raft-config-{}", uuid::Uuid::new_v4()));
         ClusterRaftConfig {
             enabled: true,
+            destination_authority_mode: Some(crate::destination_authority::DestinationAuthorityMode::OnlineQuorumV1),
             authority_genesis_principals: vec![crate::cluster_principal::fixture_operator()],
             bootstrap: true,
             node_id: 1,
@@ -1943,6 +1953,9 @@ mod tests {
 
         let configured = valid_cluster_raft_config();
         configured.validate().expect("valid cluster config");
+        let mut missing_mode = configured.clone();
+        missing_mode.destination_authority_mode = None;
+        assert!(missing_mode.validate().unwrap_err().contains("destination_authority_mode"));
         let config = Config {
             cluster_raft: configured.clone(),
             ..Default::default()

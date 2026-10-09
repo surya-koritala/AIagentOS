@@ -39,6 +39,55 @@ pub struct DestinationRequestBinding {
     pub command_sha256: String,
 }
 
+/// Derive the signed request identity from the actual command, not proof fields.
+pub fn request_binding(
+    call: &crate::syscall_server::Syscall,
+    operation_id: &str,
+    tenant_id: &str,
+) -> Result<DestinationRequestBinding, DestinationAdmissionError> {
+    use crate::syscall_server::{AgentMutationFenceProof, Syscall};
+    let (agent_id, fence) = match call {
+        Syscall::InstallAgentMutationFence {
+            operation_id: Some(command_id), agent_id, cluster_id, owner_node_id,
+            authority_term, authority_generation, fencing_token, proof_expires_at, ..
+        } | Syscall::RetireAgentMutationFence {
+            operation_id: Some(command_id), agent_id, cluster_id, owner_node_id,
+            authority_term, authority_generation, fencing_token, proof_expires_at, ..
+        } if command_id == operation_id => (agent_id, AgentMutationFenceProof {
+            cluster_id: cluster_id.clone(), owner_node_id: owner_node_id.clone(),
+            authority_term: *authority_term, authority_generation: *authority_generation,
+            fencing_token: *fencing_token, proof_expires_at: *proof_expires_at,
+        }),
+        Syscall::FencedAgentMutation { agent_id, proof, mutation }
+            if crate::syscall_server::mutable_agent_target(mutation) == Some(agent_id.as_str())
+                => (agent_id, proof.clone()),
+        Syscall::CreateAgent { agent_id: Some(agent_id), ownership_proof: Some(proof), .. }
+            => (agent_id, proof.clone()),
+        Syscall::CloneAgent { child_agent_id, child_ownership_proof: Some(proof), .. }
+            => (child_agent_id, proof.clone()),
+        _ => return Err(DestinationAdmissionError::InvalidProof),
+    };
+    let value = serde_json::to_value(call).map_err(|_| DestinationAdmissionError::InvalidProof)?;
+    let mut canonical = Vec::new();
+    crate::cluster_principal::encode_canonical_json(&value, &mut canonical)
+        .map_err(|_| DestinationAdmissionError::InvalidProof)?;
+    let binding = DestinationRequestBinding {
+        mode: DestinationAuthorityMode::OnlineQuorumV1,
+        cluster_id: fence.cluster_id,
+        agent_id: agent_id.clone(),
+        tenant_id: Some(tenant_id.to_owned()),
+        owner_node_id: fence.owner_node_id,
+        authority_term: fence.authority_term,
+        authority_generation: fence.authority_generation,
+        fencing_token: fence.fencing_token,
+        lease_expires_at: fence.proof_expires_at,
+        operation_id: operation_id.to_owned(),
+        command_sha256: crate::cluster_control::sha256_hex(&canonical),
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
 impl DestinationRequestBinding {
     fn validate(&self) -> Result<(), DestinationAdmissionError> {
         if !canonical_uuid(&self.cluster_id)
@@ -48,7 +97,7 @@ impl DestinationRequestBinding {
             || self
                 .tenant_id
                 .as_deref()
-                .is_some_and(|id| !canonical_uuid(id))
+                .is_some_and(|id| id != crate::context::DEFAULT_TENANT && !canonical_uuid(id))
             || self.authority_term == 0
             || self.authority_generation == 0
             || self.fencing_token == 0
@@ -479,5 +528,53 @@ mod tests {
         );
         let unknown = serde_json::from_str::<DestinationAuthorityMode>("\"offline_legacy\"");
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn system_scope_requires_explicit_committed_binding_and_an_operator_key() {
+        let mut fixture = Fixture::new();
+        fixture.binding.tenant_id = Some(crate::context::DEFAULT_TENANT.to_owned());
+        fixture.view.ownership_tenant_scopes.insert(
+            fixture.binding.agent_id.clone(), crate::context::DEFAULT_TENANT.to_owned(),
+        );
+        let principal = fixture.view.principals.values_mut().next().unwrap();
+        principal.kind = AuthorityPrincipalKind::Operator;
+        principal.tenant_id = None;
+        let proof = fixture.signed();
+        assert!(verify_destination_request(
+            &proof, &fixture.binding, &fixture.view, None,
+            &fixture.binding.owner_node_id, fixture.view.logical_time,
+        ).is_ok());
+        fixture.view.ownership_tenant_scopes.clear();
+        assert_eq!(fixture.verify(&proof), Err(DestinationAdmissionError::TenantScope));
+    }
+
+    #[test]
+    fn actual_mutation_binding_is_order_independent_and_rejects_target_substitution() {
+        use crate::syscall_server::{AgentMutationFenceProof, Syscall};
+        let fixture = Fixture::new();
+        let b = &fixture.binding;
+        let fence = AgentMutationFenceProof {
+            cluster_id: b.cluster_id.clone(), owner_node_id: b.owner_node_id.clone(),
+            authority_term: b.authority_term, authority_generation: b.authority_generation,
+            fencing_token: b.fencing_token, proof_expires_at: b.lease_expires_at,
+        };
+        let make = |args| Syscall::FencedAgentMutation {
+            agent_id: b.agent_id.clone(), proof: fence.clone(),
+            mutation: Box::new(Syscall::CallTool {
+                agent_id: b.agent_id.clone(), tool: "write_file".into(), args,
+            }),
+        };
+        let a = make(serde_json::from_str(r#"{"path":"one","content":"two"}"#).unwrap());
+        let c = make(serde_json::from_str(r#"{"content":"two","path":"one"}"#).unwrap());
+        let tenant = b.tenant_id.as_deref().unwrap();
+        assert_eq!(request_binding(&a, &b.operation_id, tenant).unwrap(),
+            request_binding(&c, &b.operation_id, tenant).unwrap());
+        let mut substitution = a.clone();
+        if let Syscall::FencedAgentMutation { mutation, .. } = &mut substitution {
+            *mutation = Box::new(Syscall::PauseAgent { agent_id: uuid::Uuid::new_v4().to_string() });
+        }
+        assert!(request_binding(&substitution, &b.operation_id, tenant).is_err());
+        assert!(request_binding(&Syscall::ListAgents, &b.operation_id, tenant).is_err());
     }
 }

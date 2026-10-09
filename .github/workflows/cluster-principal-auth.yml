@@ -118,6 +118,7 @@ jobs:
           set -o pipefail
           cargo test -p agent-cli principal --lib 2>&1 | tee target/qualification/principal/cli-principal.txt
           cargo test -p agent-cli --test cluster_commands -- --test-threads=1 2>&1 | tee target/qualification/principal/cli-commands.txt
+          cargo test -p agent-cli --test cluster_server_lifecycle 2>&1 | tee target/qualification/principal/cli-daemon.txt
       - name: Warnings are errors
         run: cargo clippy -p kernel -p agent-sdk -p agent-cli --all-targets -- -D warnings
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

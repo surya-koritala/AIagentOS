@@ -12,6 +12,8 @@ use kernel::cluster_runtime::ClusterRaftTls;
 use kernel::config::{ClusterRaftConfig, ClusterRaftMemberConfig, Config};
 use kernel::syscall_server::{Syscall, SyscallReply, PROTOCOL_VERSION};
 use kernel::AgentKernelImpl;
+use agent_sdk::{AuthorityCommand, AuthorityResponse, KernelClient, PrincipalProofError, WireErrorCode};
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -56,6 +58,7 @@ fn write_cluster_config(
     root: &Path,
     listen_addr: std::net::SocketAddr,
     application_addr: std::net::SocketAddr,
+    operator: &Ed25519KeyPair,
 ) -> PathBuf {
     let ca = test_ca();
     let server_name = "node-1.agentos.test";
@@ -105,12 +108,11 @@ fn write_cluster_config(
         cluster_raft: ClusterRaftConfig {
             enabled: true,
             authority_genesis_principals: {
-                let operator = KeyPair::generate_for(&rcgen::PKCS_ED25519)
-                    .expect("generate ephemeral operator public key");
                 vec![kernel::cluster_principal::AuthorityPrincipal {
                     principal_id: "00000000-0000-0000-0000-000000000900".into(),
                     public_key: operator
-                        .public_key_raw()
+                        .public_key()
+                        .as_ref()
                         .iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect(),
@@ -118,6 +120,7 @@ fn write_cluster_config(
                     tenant_id: None,
                     allowed_command_classes: std::collections::BTreeSet::from([
                         kernel::cluster_principal::AuthorityCommandClass::PrincipalAdmin,
+                        kernel::cluster_principal::AuthorityCommandClass::Ownership,
                     ]),
                     generation: 1,
                     revoked: false,
@@ -170,7 +173,10 @@ fn agent_server_owns_configured_raft_startup_and_sigterm_shutdown() {
         .local_addr()
         .expect("application address");
     drop(application_reserved);
-    let config_path = write_cluster_config(&root.0, raft_addr, application_addr);
+    let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("generate ephemeral caller key");
+    let operator = Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("load ephemeral caller key");
+    let config_path = write_cluster_config(&root.0, raft_addr, application_addr, &operator);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-server"))
         .arg(application_addr.to_string())
@@ -272,26 +278,49 @@ fn agent_server_owns_configured_raft_startup_and_sigterm_shutdown() {
     let operation_id = uuid::Uuid::new_v4().to_string();
     let agent_id = uuid::Uuid::new_v4().to_string();
     let claim = Syscall::ClaimClusterAgentOwnership {
-        operation_id: Some(operation_id),
+        operation_id: Some(operation_id.clone()),
         agent_id: agent_id.clone(),
         owner_node_id: membership.members[0].node_id.clone(),
         ttl_seconds: 60,
         expected_fencing_token: None,
         reason: "daemon quorum lifecycle test".into(),
     };
-    let first_claim = call(&claim);
-    let replayed_claim = call(&claim);
-    assert_eq!(
-        serde_json::to_value(&first_claim).unwrap(),
-        serde_json::to_value(&replayed_claim).unwrap(),
-        "same operation id must replay the exact committed ownership result"
-    );
-    assert!(matches!(
-        first_claim,
-        SyscallReply::ClusterAgentOwnership {
-            ownership: Some(ref ownership)
-        } if ownership.agent_id == agent_id && ownership.fencing_token == 1
-    ));
+    assert!(matches!(call(&claim), SyscallReply::TypedError {
+        code: WireErrorCode::AuthorizationDenied, message, retryable: false
+    } if message == PrincipalProofError::Missing.to_string()));
+    let command = AuthorityCommand::ClaimOwnership {
+        operation_id,
+        agent_id: agent_id.clone(),
+        owner_node_id: membership.members[0].node_id.clone(),
+        ttl_seconds: 60,
+        expected_fencing_token: None,
+        actor: format!("system-node:{}", membership.members[0].node_id),
+        reason: "daemon quorum lifecycle test".into(),
+        proposed_at: chrono::Utc::now(),
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("SDK fixture runtime");
+    runtime.block_on(async {
+        let mut client = KernelClient::connect(application_addr).await.expect("connect SDK to daemon");
+        let mut responses = Vec::new();
+        for _ in 0..2 {
+            responses.push(client.submit_authority_command_with_signer(
+                command.clone(),
+                "00000000-0000-0000-0000-000000000100",
+                "00000000-0000-0000-0000-000000000900",
+                1,
+                |payload| Ok(operator.sign(payload).as_ref().to_vec()),
+            ).await.expect("independent caller authorizes daemon ownership"));
+        }
+        let AuthorityResponse::OwnershipUpdated {ownership: first, replayed: false, ..} = &responses[0] else { panic!("first signed daemon claim was not committed") };
+        let AuthorityResponse::OwnershipUpdated {ownership: second, replayed: true, ..} = &responses[1] else { panic!("same signed daemon operation was not replayed") };
+        assert_eq!(first, second, "same operation id must replay the exact committed ownership result");
+        assert_eq!(first.agent_id, agent_id);
+        assert_eq!(first.fencing_token, 1);
+        let audit = client.cluster_agent_ownership_audit(Some(agent_id), 10).await.expect("read verified daemon ownership audit");
+        assert_eq!(audit.len(), 1, "replay must not append a second ownership audit row");
+        assert_eq!(audit[0].actor, "principal:00000000-0000-0000-0000-000000000900");
+        client.close().await.expect("close SDK fixture connection");
+    });
 
     let signal_result = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     assert_eq!(signal_result, 0, "send SIGTERM");

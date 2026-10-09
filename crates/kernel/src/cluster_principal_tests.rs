@@ -87,8 +87,9 @@ async fn principal_history_requires_reader15_and_retains_real_receipt14_before_a
     {
         let connection = context.locked_conn();
         let metadata = crate::schema::read_storage_metadata(&connection).unwrap();
-        assert_eq!(metadata.schema_version, 15);
-        assert_eq!(metadata.min_reader_schema_version, 15);
+        assert_eq!(metadata.schema_version, crate::schema::CURRENT_SCHEMA_VERSION);
+        assert_eq!(metadata.min_reader_schema_version, crate::schema::MIN_READER_SCHEMA_VERSION);
+        assert!(metadata.min_reader_schema_version >= 15);
         let migration: String = connection
             .query_row(
                 "SELECT name FROM schema_migrations WHERE version=14",
@@ -102,9 +103,9 @@ async fn principal_history_requires_reader15_and_retains_real_receipt14_before_a
         assert!(matches!(
             crate::schema::preflight_for_reader(&connection, 14),
             Err(crate::ContextError::DatabaseTooNew {
-                found: 15,
+                found,
                 supported: 14
-            })
+            }) if found == crate::schema::CURRENT_SCHEMA_VERSION
         ));
         connection.pragma_update(None, "user_version", 14).unwrap();
         connection

@@ -728,9 +728,9 @@ mod tests {
         );
         let mut substitution = a.clone();
         if let Syscall::FencedAgentMutation { mutation, .. } = &mut substitution {
-            *mutation = Box::new(Syscall::PauseAgent {
+            **mutation = Syscall::PauseAgent {
                 agent_id: uuid::Uuid::new_v4().to_string(),
-            });
+            };
         }
         assert!(request_binding(&substitution, &b.operation_id, tenant).is_err());
         assert!(request_binding(&Syscall::ListAgents, &b.operation_id, tenant).is_err());

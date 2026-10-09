@@ -441,6 +441,13 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
             .network
             .clone();
         let cached_four = factory.new_client(4, prior.catalog.get(&4).unwrap()).await;
+        let mut fresh_leaf_factory = factory.clone();
+        fresh_leaf_factory.source = 4;
+        fresh_leaf_factory.client_config = next_peers[3].tls.client_config.clone();
+        fresh_leaf_factory.live_catalog = None;
+        let fresh_leaf_client = fresh_leaf_factory.new_client(1, prior.catalog.get(&1).unwrap()).await;
+        let vote_probe = || RpcRequest::Vote(VoteRequest { vote: Vote::new(0, 4), last_log_id: None });
+        assert!(fresh_leaf_client.call(vote_probe(), RPCOption::new(Duration::from_secs(3))).await.is_err(), "a same-CA leaf is denied before its authorized catalog generation");
         let mut overlap = prior.catalog.clone();
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
         for (id, node) in &mut overlap {
@@ -472,6 +479,7 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
         );
         let plan = prepared(fixture.submit(0, command).await.unwrap());
         fixture.settle(&plan, 4).await;
+        assert!(matches!(fresh_leaf_client.call(vote_probe(), RPCOption::new(Duration::from_secs(3))).await.unwrap(), RpcResponse::Vote(Ok(_))), "the running listener must admit the exact newly authorized overlap leaf");
         assert_eq!(plan.target.voter_ids, prior.voter_ids);
         assert_eq!(plan.target.voter_generation, prior.voter_generation);
         for context in &fixture.contexts {
@@ -543,6 +551,26 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
             .unwrap(),
         );
         wait_live_leader(&fixture.runtimes, "restored material-backed root evidence").await;
+        let stale_trust = fixture.configs[0].clone();
+        let mut exact = fixture.configs.clone();
+        for config in &mut exact {
+            config.members = voter_plan.target.catalog.clone();
+            config.transport_catalog_sha256 = voter_plan.target.catalog_sha256.clone();
+            config.transport_trust_generation = voter_plan.target.trust_generation;
+            config.transport_trust_overlap_not_after = voter_plan.target.overlap_not_after;
+            set_voter_plan(config, voter_plan.target.voter_generation, voter_plan.target.voter_ids.clone());
+        }
+        fixture.restart_all(exact).await;
+        let actual = fixture.runtimes[0].as_ref().unwrap().authority_handle().reconfiguration_status().await.unwrap();
+        assert!(actual.settled && actual.quorum_verified);
+        assert_eq!(actual.current, voter_plan.target);
+        fixture.runtimes[0].take().unwrap().shutdown().await.unwrap();
+        let listener = rebind_test_listener(stale_trust.listen_addr, "stale live trust configuration rejection").await;
+        let error = ClusterRaftRuntime::start_on_listener(fixture.contexts[0].clone(), stale_trust, listener).await.unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        let listener = rebind_test_listener(fixture.configs[0].listen_addr, "restore exact live trust configuration").await;
+        fixture.runtimes[0] = Some(ClusterRaftRuntime::start_on_listener(fixture.contexts[0].clone(), fixture.configs[0].clone(), listener).await.unwrap());
+        wait_live_leader(&fixture.runtimes, "restored exact live trust configuration").await;
         // A cached actual OpenRaft client must consult the current catalog.
         // Removing this non-voter makes that pre-existing client fail closed.
         let mut removed = voter_plan.target.catalog.clone();
@@ -557,6 +585,7 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
         let remove = fixture.trust_command(0, voter_plan.target.clone(), removed, 3, Some(expiry));
         let removed_plan = prepared(fixture.submit(0, remove).await.unwrap());
         fixture.settle(&removed_plan, 3).await;
+        assert!(fresh_leaf_client.call(vote_probe(), RPCOption::new(Duration::from_secs(3))).await.is_err(), "removed trust source cannot use a previously admitted leaf");
         assert!(cached_four
             .call(
                 RpcRequest::Vote(VoteRequest {
@@ -568,9 +597,42 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
             .await
             .is_err());
         drop(cached_four);
+        drop(fresh_leaf_client);
+        drop(fresh_leaf_factory);
         drop(factory);
         fixture.close().await;
     })
     .await
     .expect("live complete-catalog proof is bounded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_live_voter_and_trust_proposals_commit_only_one_generation() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let mut fixture = LiveFixture::start("simultaneous-live-proposals").await;
+        let roots = certificate_fingerprints_from_pem(fixture.ca.pem().as_bytes()).unwrap();
+        let mut versioned = fixture.configs.clone();
+        for config in &mut versioned { set_transport_trust_plan(config, 1, roots.clone(), None); }
+        fixture.restart_all(versioned).await;
+        let prior = fixture.current(0).await;
+        let voter = fixture.voter_command(0, prior.clone(), BTreeSet::from([1, 2]), 0, 1, Uuid::new_v4().to_string());
+        let mut catalog = prior.catalog.clone();
+        for node in catalog.values_mut() { node.transport_trust_generation = 2; }
+        let digest = configured_transport_catalog_sha256(&catalog);
+        for node in catalog.values_mut() { node.transport_catalog_sha256.clone_from(&digest); }
+        let trust = fixture.trust_command(1, prior.clone(), catalog, 2, None);
+        let (voter, trust) = tokio::join!(fixture.submit(0, voter), fixture.submit(1, trust));
+        let voter = voter.unwrap();
+        let trust = trust.unwrap();
+        let plan = match (voter, trust) {
+            (accepted @ AuthorityResponse::ReconfigurationPrepared { .. }, AuthorityResponse::Rejected { .. })
+            | (AuthorityResponse::Rejected { .. }, accepted @ AuthorityResponse::ReconfigurationPrepared { .. }) => prepared(accepted),
+            other => panic!("exact prior CAS must admit only one concurrent proposal: {other:?}"),
+        };
+        fixture.settle(&plan, 4).await;
+        let current = fixture.current(0).await;
+        assert_eq!(current, plan.target);
+        assert!((current.voter_generation == 1 && current.trust_generation == 1) || (current.voter_generation == 0 && current.trust_generation == 2));
+        fixture.close().await;
+    }).await.expect("concurrent live generation proof is bounded");
 }

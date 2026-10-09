@@ -1657,6 +1657,7 @@ enum RpcRequest {
     InstallSnapshot(InstallSnapshotRequest<ClusterRaftTypeConfig>),
     AuthorityWrite(Box<DelegatedAuthorityWrite>),
     AuthorityRead,
+    ReconfigurationReadBarrier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1698,6 +1699,7 @@ enum RpcResponse {
     AuthorityWrite(Box<AuthorityWriteResult>),
     AuthorityPrincipalRejected(crate::cluster_principal::PrincipalProofError),
     AuthorityRead(Result<AuthorityReadBarrier, String>),
+    ReconfigurationReadBarrier(Result<Option<openraft::LogId<ClusterRaftNodeId>>, String>),
 }
 
 impl RpcRequest {
@@ -1706,7 +1708,7 @@ impl RpcRequest {
             Self::AppendEntries(_) => RPCTypes::AppendEntries,
             Self::Vote(_) => RPCTypes::Vote,
             Self::InstallSnapshot(_) => RPCTypes::InstallSnapshot,
-            Self::AuthorityWrite(_) | Self::AuthorityRead => RPCTypes::AppendEntries,
+            Self::AuthorityWrite(_) | Self::AuthorityRead | Self::ReconfigurationReadBarrier => RPCTypes::AppendEntries,
         }
     }
 
@@ -1715,12 +1717,12 @@ impl RpcRequest {
             Self::AppendEntries(request) => request.vote.leader_id.voted_for(),
             Self::Vote(request) => request.vote.leader_id.voted_for(),
             Self::InstallSnapshot(request) => request.vote.leader_id.voted_for(),
-            Self::AuthorityWrite(_) | Self::AuthorityRead => None,
+            Self::AuthorityWrite(_) | Self::AuthorityRead | Self::ReconfigurationReadBarrier => None,
         }
     }
 
     fn is_authority_request(&self) -> bool {
-        matches!(self, Self::AuthorityWrite(_) | Self::AuthorityRead)
+        matches!(self, Self::AuthorityWrite(_) | Self::AuthorityRead | Self::ReconfigurationReadBarrier)
     }
 }
 
@@ -2234,23 +2236,12 @@ impl ClusterAuthorityHandle {
                 .is_some_and(|leader| metrics.membership_config.voter_ids().any(|id| id == leader))
         };
         let quorum_verified = if has_eligible_leader {
-            match self.linearizable_view().await {
-                Ok(_) => true,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::ConnectionAborted
-                    ) =>
-                {
-                    false
-                }
-                Err(error) => return Err(error),
+            match tokio::time::timeout(self.forward_timeout, self.verify_reconfiguration_read()).await {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied || error.kind() == io::ErrorKind::InvalidData => return Err(error),
+                Ok(Err(_)) | Err(_) => false,
             }
-        } else {
-            false
-        };
+        } else { false };
         crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
         let projection = {
             self.context
@@ -2271,6 +2262,21 @@ impl ClusterAuthorityHandle {
             crate::cluster_reconfiguration::ClusterReconfigurationObservation::LocalApplied
         };
         Ok(status)
+    }
+
+    async fn verify_reconfiguration_read(&self) -> io::Result<()> {
+        match self.raft.ensure_linearizable().await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let (leader_id, leader_node) = leader_target(&error)?;
+                match self.forward(leader_id, &leader_node, RpcRequest::ReconfigurationReadBarrier).await? {
+                    RpcResponse::ReconfigurationReadBarrier(Ok(Some(frontier))) => self.wait_for_local_apply(frontier).await,
+                    RpcResponse::ReconfigurationReadBarrier(Ok(None)) => Err(invalid_data("quorum read returned no initialized applied frontier")),
+                    RpcResponse::ReconfigurationReadBarrier(Err(message)) => Err(io::Error::new(io::ErrorKind::ConnectionRefused, message)),
+                    _ => Err(invalid_data("quorum reconfiguration read returned the wrong response type")),
+                }
+            }
+        }
     }
 
     fn validate_live_proposal(&self, command: &AuthorityCommand) -> io::Result<()> {
@@ -3853,6 +3859,14 @@ async fn handle_connection(
                     RpcResponse::AuthorityWrite(Box::new(raft.client_write(command).await))
                 }
             }
+        }
+        RpcRequest::ReconfigurationReadBarrier => {
+            let result = tokio::time::timeout(limits.inbound_request_timeout, raft.ensure_linearizable()).await;
+            RpcResponse::ReconfigurationReadBarrier(match result {
+                Ok(Ok(frontier)) => Ok(frontier),
+                Ok(Err(error)) => Err(format!("quorum reconfiguration read unavailable: {error}")),
+                Err(_) => Err("quorum reconfiguration read timed out".into()),
+            })
         }
         RpcRequest::AuthorityRead => {
             let view = match raft

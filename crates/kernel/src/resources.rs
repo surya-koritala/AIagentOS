@@ -156,6 +156,22 @@ pub(crate) fn normalize_filesystem_target(target: &str) -> Result<String, Resour
         ));
     }
 
+    // Windows canonicalize returns an extended-length DOS drive path. It is
+    // the same local filesystem target as the ordinary absolute drive form;
+    // UNC, volume GUID, device namespace and drive-relative forms stay denied.
+    #[cfg(windows)]
+    let target = if matches!(
+        std::path::Path::new(target).components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+    ) && std::path::Path::new(target).is_absolute()
+    {
+        target.get(4..).ok_or_else(|| {
+            ResourceError::OperationFailed("invalid canonical drive target".into())
+        })?
+    } else {
+        target
+    };
     let portable = target.replace('\\', "/");
     if portable.starts_with("//") {
         return Err(ResourceError::OperationFailed(
@@ -489,10 +505,16 @@ impl ProviderTaskGuard {
         parameters: serde_json::Value,
         permit: OwnedSemaphorePermit,
         cancellation: CancellationToken,
+        peripheral: bool,
     ) -> Self {
         let provider_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
             let _permit = permit;
+            if peripheral && provider_cancellation.is_cancelled() {
+                return Err(ResourceError::OperationFailed(
+                    "peripheral use revoked".into(),
+                ));
+            }
             provider
                 .execute_controlled(&operation, &parameters, &provider_cancellation)
                 .await
@@ -695,6 +717,14 @@ impl ResourceBrokerImpl {
     #[cfg(test)]
     pub fn new_unconfined(permission_system: Arc<dyn PermissionSystem>) -> Self {
         Self::build(permission_system, None, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_resource_permits_for_test(&self, resource: ResourceType) -> usize {
+        self.admission
+            .get(&resource)
+            .expect("resource class has an admission semaphore")
+            .available_permits()
     }
 
     fn sandbox_action(request: &ResourceRequest) -> Result<SandboxAction, ResourceError> {
@@ -1079,6 +1109,7 @@ impl ResourceBrokerImpl {
                     .take()
                     .expect("generic provider execution owns its admission permit"),
                 provider_cancellation,
+                request.resource_type == ResourceType::Peripheral,
             );
             match tokio::time::timeout(PROVIDER_EXECUTION_TIMEOUT, task.join()).await {
                 Ok(result) => {
@@ -1202,6 +1233,40 @@ pub(crate) struct RevocablePeripheralProvider {
 }
 
 #[cfg(test)]
+pub(crate) struct PeripheralCallbackCounter(pub(crate) Arc<AtomicUsize>);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ResourceProvider for PeripheralCallbackCounter {
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Peripheral
+    }
+    fn supported_operations(&self) -> Vec<String> {
+        vec!["capture_image".into()]
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
+        panic!("controlled callback required");
+    }
+    async fn execute_controlled(
+        &self,
+        _: &str,
+        _: &serde_json::Value,
+        _: &CancellationToken,
+    ) -> Result<serde_json::Value, ResourceError> {
+        // Count entry before cancellation inspection: the broker must refuse
+        // an already-revoked admission before this test callback is entered.
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(ResourceError::OperationFailed(
+            "peripheral use revoked".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
 #[async_trait::async_trait]
 impl ResourceProvider for RevocablePeripheralProvider {
     fn resource_type(&self) -> ResourceType {
@@ -1267,6 +1332,52 @@ mod tests {
             normalize_filesystem_target(r"C:\workspace\file.txt").unwrap(),
             "C:/workspace/file.txt"
         );
+    }
+
+    #[test]
+    fn unc_device_volume_and_verbatim_traversal_targets_remain_denied() {
+        for target in [
+            r"\\server\share\secret",
+            r"\\?\UNC\server\share\secret",
+            r"\\.\PhysicalDrive0",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\secret",
+            r"\\?\C:relative.txt",
+            r"\\?\C:\allowed\..\denied",
+            "//?/C:/allowed/../denied",
+        ] {
+            assert!(normalize_filesystem_target(target).is_err(), "{target}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn actual_canonical_drive_target_has_one_tool_authorization_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        let target = canonical.join("side-effect.txt");
+        let target = target.to_str().unwrap();
+        let ordinary = target.strip_prefix(r"\\?\").unwrap();
+        let expected = normalize_filesystem_target(ordinary).unwrap();
+        assert_eq!(normalize_filesystem_target(target).unwrap(), expected);
+        let registry = crate::tools::ToolRegistry::new();
+        let (_, resource) = registry
+            .security_context(
+                "write_file",
+                &serde_json::json!({"path":target,"content":"proof"}),
+            )
+            .unwrap();
+        assert_eq!(resource, expected);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_hosts_do_not_reinterpret_extended_drive_prefixes() {
+        assert!(normalize_filesystem_target(r"\\?\C:\workspace\file.txt").is_err());
     }
 
     struct MockProvider;

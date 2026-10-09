@@ -309,10 +309,8 @@ mod tests {
 
     #[tokio::test]
     async fn independent_sqlite_handles_cannot_both_win_the_same_revision() {
-        let db_path = std::env::temp_dir().join(format!(
-            "agentos-operator-cas-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("operator-cas.sqlite");
         // This white-box test deliberately models two SQLite participants.
         // Production context managers enforce one process owner per path.
         let first_store =

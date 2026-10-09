@@ -11,12 +11,11 @@ use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
 use agent_cli::providers::register_providers;
+use agent_cli::slash::{handle_slash, SlashOutcome};
 use kernel::config::Config;
-use kernel::connector::AgentConnector;
-use kernel::execution::{AgentExecutor, StreamEvent};
-use kernel::resources::ResourceBroker;
+use kernel::execution::StreamEvent;
+use kernel::learning::{RuleScope, RuleStore};
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
-use tokio::sync::mpsc;
 
 mod logging;
 mod policy_cmd;
@@ -45,12 +44,13 @@ USAGE:
   agent                          Interactive session
   agent \"prompt\"                 One-shot prompt (also reads piped stdin)
   agent -c \"do something\"        One-shot command
-  agent --conversation ID        Resume a stored conversation
+  agent --conversation ID        Resume a registered local conversation
   agent policy <ARGS...>         Validate or dry-run a policy document (offline)
 
 OPTIONS:
   -c <COMMAND>                   Run one command and exit
-  --conversation <ID>            Resume conversation <ID>
+  --conversation <ID>            Resume a registered local conversation <ID>
+  --config <PATH>                Use a private configuration file
   -h, --help                     Print this help and exit
   -V, --version                  Print the exact build version and exit
 
@@ -61,7 +61,15 @@ canonical operator client for an already-running kernel.";
 /// Options `agent` understands. Anything else beginning with `-` is a usage
 /// error: without this the argument fell through and was treated as a prompt,
 /// so a typo booted the kernel and persisted an agent row.
-const KNOWN_FLAGS: [&str; 6] = ["-c", "--conversation", "-h", "--help", "-V", "--version"];
+const KNOWN_FLAGS: [&str; 7] = [
+    "-c",
+    "--conversation",
+    "--config",
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+];
 
 /// First unrecognized option in `argv`, if any. `-c` and `--conversation`
 /// consume the following value, which may itself begin with `-`.
@@ -76,7 +84,7 @@ fn unrecognized_flag(argv: &[String]) -> Option<&str> {
             if !KNOWN_FLAGS.contains(&argument) {
                 return Some(argument);
             }
-            if matches!(argument, "-c" | "--conversation") {
+            if matches!(argument, "-c" | "--conversation" | "--config") {
                 index += 1;
             }
         }
@@ -85,63 +93,17 @@ fn unrecognized_flag(argv: &[String]) -> Option<&str> {
     None
 }
 
-/// Handle slash commands. Returns true if handled.
-fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -> bool {
-    match cmd.split_whitespace().next().unwrap_or("") {
-        "/quit" | "/exit" => std::process::exit(0),
-        "/id" => {
-            println!("\x1b[90m{}\x1b[0m", executor.conversation_id);
-            true
+fn positional_prompt(argv: &[String]) -> Option<&str> {
+    let mut index = 1;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--" => return argv.get(index + 1).map(String::as_str),
+            "--config" | "--conversation" | "-c" => index += 2,
+            argument if !argument.starts_with('-') || argument == "-" => return Some(argument),
+            _ => index += 1,
         }
-        "/history" => {
-            let convs = kernel.context_manager.list_conversations();
-            println!("\x1b[90mConversations ({}):\x1b[0m", convs.len());
-            for (id, _, updated) in convs.iter().take(10) {
-                println!("  {} ({})", &id[..8], updated);
-            }
-            true
-        }
-        "/usage" => {
-            let (tokens, cost) = kernel.context_manager.get_total_usage();
-            let stats = kernel.rate_limiter.stats();
-            println!(
-                "\x1b[90mTokens: {} | Cost: ${:.4} | RPM: {}/{}\x1b[0m",
-                tokens, cost, stats.requests_this_minute, stats.rpm_limit
-            );
-            true
-        }
-        "/plan" => {
-            println!("\x1b[90mUse: /plan <task description> to generate a plan\x1b[0m");
-            true
-        }
-        "/learn" => {
-            let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
-            if parts.len() == 3 {
-                println!(
-                    "\x1b[90mRule added: when '{}' → '{}'\x1b[0m",
-                    parts[1], parts[2]
-                );
-            } else {
-                println!("\x1b[90mUse: /learn <trigger> <correction>\x1b[0m");
-            }
-            true
-        }
-        "/help" => {
-            println!("\x1b[90mCommands:");
-            println!("  /quit        Exit");
-            println!("  /id          Show conversation ID");
-            println!("  /history     List saved conversations");
-            println!("  /usage       Show token usage and cost");
-            println!("  /learn T C   Add correction rule (trigger → correction)");
-            println!("  /help        This message\x1b[0m");
-            true
-        }
-        _ if cmd.starts_with('/') => {
-            println!("\x1b[90mUnknown command. Type /help\x1b[0m");
-            true
-        }
-        _ => false,
     }
+    None
 }
 
 #[tokio::main]
@@ -167,7 +129,10 @@ async fn main() {
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
     {
-        println!("{USAGE}");
+        println!(
+            "{USAGE}\n\nDefault configuration: {}",
+            kernel::config::config_file_path().display()
+        );
         return;
     }
     if let Some(unknown) = unrecognized_flag(&argv) {
@@ -175,10 +140,34 @@ async fn main() {
         std::process::exit(2);
     }
 
+    let config_path = argv
+        .iter()
+        .position(|argument| argument == "--config")
+        .map(|index| {
+            argv.get(index + 1)
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or_else(|| {
+                    eprintln!("agent: --config requires a path\n\n{USAGE}");
+                    std::process::exit(2);
+                })
+        });
+
     // Install structured logging first so kernel init (persistence/auth) logs emit.
     logging::init_logging();
-    let config = Config::try_load()
-        .unwrap_or_else(|error| fail(format!("failed to load configuration: {error}")));
+    let config = match config_path {
+        Some(path) => {
+            let path = std::path::Path::new(path);
+            if !path.is_file() {
+                fail(format!(
+                    "explicit configuration file is missing or is not a file: {}",
+                    path.display()
+                ));
+            }
+            Config::try_load_private_from(path)
+        }
+        None => Config::try_load_private(),
+    }
+    .unwrap_or_else(|error| fail(format!("failed to load configuration: {error}")));
     // Startup failures (unwritable data dir, corrupt DB, unreachable provider)
     // degrade to a clear message + non-zero exit rather than a panic backtrace.
     let kernel = match AgentKernelImpl::from_config(&config) {
@@ -216,63 +205,91 @@ async fn main() {
         None
     };
 
-    // Create agent
-    let handle = kernel
-        .create_agent_full(AgentConfig {
-            name: "cli-agent".into(),
-            task: "interactive assistant".into(),
-            llm_provider: config.llm_provider.clone(),
-            permission_profile: config.permission_profile.clone(),
-            priority: Priority::default(),
-            sandbox_config: None,
-        })
+    let operator = kernel::config::local_operator_identity()
+        .unwrap_or_else(|error| fail(format!("failed to determine local operator: {error}")));
+    let rules = Arc::new(
+        RuleStore::from_file(
+            &config.data_dir.join("rules.json"),
+            RuleScope::local_cli(),
+            &operator,
+        )
+        .unwrap_or_else(|error| fail(format!("failed to load local correction rules: {error}"))),
+    );
+    // Restore the original registered owner through the existing kernel
+    // lifecycle, rather than copying another agent's history into a new one.
+    kernel
+        .rehydrate_agents()
         .await
-        .unwrap_or_else(|e| fail(format!("failed to create agent: {e}")));
-
-    // Create executor with project context
+        .unwrap_or_else(|error| fail(format!("failed to restore kernel agents: {error}")));
+    let agent_id = if let Some(id) = conversation_id.as_deref() {
+        let binding = rules
+            .cli_conversation(id)
+            .unwrap_or_else(|error| {
+                fail(format!(
+                    "failed to read local conversation binding: {error}"
+                ))
+            })
+            .unwrap_or_else(|| fail("conversation is not registered to this local operator"));
+        let restored = kernel
+            .agent_manager
+            .get_agent_config(binding.agent_id)
+            .unwrap_or_else(|| fail("registered conversation owner is missing or was erased"));
+        if restored.llm_provider != config.llm_provider
+            || restored.permission_profile != config.permission_profile
+        {
+            fail("registered conversation provider or permission profile differs from the current CLI configuration");
+        }
+        binding.agent_id
+    } else {
+        kernel
+            .create_agent_full(AgentConfig {
+                name: "cli-agent".into(),
+                task: "interactive assistant".into(),
+                llm_provider: config.llm_provider.clone(),
+                permission_profile: config.permission_profile.clone(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap_or_else(|error| fail(format!("failed to create agent: {error}")))
+            .id
+    };
     let project_ctx = project_context();
     let system_prompt = format!("You are a helpful AI assistant running in a terminal. Be concise and use tools when needed.\n\n{}", project_ctx);
 
-    let session = AgentConnector::connect(&*kernel.connector, handle.id, &config.llm_provider)
+    let conversation = kernel
+        .configure_local_cli_agent(
+            agent_id,
+            rules.clone(),
+            system_prompt,
+            conversation_id.as_deref(),
+        )
         .await
-        .unwrap_or_else(|e| {
-            fail(format!(
-                "failed to connect to LLM provider '{}': {e}\n  (check the API key and provider settings in your config/env)",
-                config.llm_provider
-            ))
-        });
-    // Route every tool call through the kernel's syscall gate (capability /
-    // MAC / cgroup / namespace enforcement). The gate is a required argument, so
-    // there is no ungoverned path: the agent was registered with the gate in
-    // `create_agent_full` using `config.permission_profile`'s caps.
-    let mut executor = AgentExecutor::new(
-        handle.id,
-        session,
-        kernel.resource_broker.clone() as Arc<dyn ResourceBroker>,
-        kernel.tool_registry.clone(),
-        kernel.context_manager.clone(),
-        kernel.syscall_gate.clone(),
-        system_prompt,
-    );
-
-    if let Some(ref conv_id) = conversation_id {
-        executor = executor.with_conversation(conv_id);
-        eprintln!("\x1b[90mResumed: {}\x1b[0m", conv_id);
-    }
-
-    // Set up event channel
-    let (tx, mut rx) = mpsc::channel::<StreamEvent>(256);
-    executor.set_event_channel(tx);
+        .unwrap_or_else(|error| fail(format!("failed to configure CLI agent: {error}")));
 
     // One-shot mode
     if let Some(cmd) = one_shot {
+        match cancellable_cli_operation(
+            &kernel,
+            agent_id,
+            handle_slash(&cmd, &kernel, agent_id, &conversation, &rules),
+        )
+        .await
+        {
+            Ok(SlashOutcome::Output(output)) => {
+                println!("{output}");
+                return;
+            }
+            Ok(SlashOutcome::Quit) => return,
+            Ok(SlashOutcome::NotSlash) => {}
+            Err(error) => fail(error),
+        }
         let msg = if let Some(ref piped) = piped_input {
             format!("{}\n\nInput:\n{}", cmd, piped)
         } else {
             cmd
         };
-        let output = executor
-            .run(&msg)
+        let output = run_cli_turn(&kernel, agent_id, &msg)
             .await
             .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
@@ -281,13 +298,9 @@ async fn main() {
 
     // Pipe mode (no prompt, just process)
     if let Some(piped) = piped_input {
-        let prompt = args
-            .get(1)
-            .map(|s| s.as_str())
-            .unwrap_or("Process this input");
+        let prompt = positional_prompt(&args).unwrap_or("Process this input");
         let msg = format!("{}\n\nInput:\n{}", prompt, piped);
-        let output = executor
-            .run(&msg)
+        let output = run_cli_turn(&kernel, agent_id, &msg)
             .await
             .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
@@ -301,7 +314,7 @@ async fn main() {
     );
     eprintln!(
         "\x1b[90mConversation: {} | /help for commands\x1b[0m\n",
-        &executor.conversation_id[..8]
+        conversation
     );
 
     let stdin = io::stdin();
@@ -320,22 +333,25 @@ async fn main() {
             continue;
         }
 
-        if handle_slash(input, &executor, &kernel) {
-            continue;
-        }
-
-        let output = executor.run(input).await;
-
-        // Drain events
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                StreamEvent::ToolCallStarted { name, .. } => {
-                    eprint!("\x1b[33m  🔧 {}\x1b[0m", name)
-                }
-                StreamEvent::ToolCallResult { .. } => eprintln!(" ✓"),
-                _ => {}
+        match cancellable_cli_operation(
+            &kernel,
+            agent_id,
+            handle_slash(input, &kernel, agent_id, &conversation, &rules),
+        )
+        .await
+        {
+            Ok(SlashOutcome::Output(output)) => {
+                println!("{output}");
+                continue;
+            }
+            Ok(SlashOutcome::Quit) => break,
+            Ok(SlashOutcome::NotSlash) => {}
+            Err(error) => {
+                eprintln!("Error: {error}");
+                continue;
             }
         }
+        let output = run_cli_turn(&kernel, agent_id, input).await;
 
         match output {
             Ok(out) => {
@@ -343,9 +359,7 @@ async fn main() {
                 if out.tool_calls_made > 0 {
                     eprintln!(
                         "\x1b[90m  [{} tools, {} tokens, ${:.4}]\x1b[0m\n",
-                        out.tool_calls_made,
-                        out.tokens_used,
-                        out.tokens_used as f64 * 0.00001
+                        out.tool_calls_made, out.tokens_used, out.estimated_cost_usd
                     );
                 } else {
                     eprintln!("\x1b[90m  [{} tokens]\x1b[0m\n", out.tokens_used);
@@ -354,11 +368,69 @@ async fn main() {
             Err(e) => eprintln!("\x1b[31m  Error: {}\x1b[0m\n", e),
         }
     }
-    eprintln!("\n\x1b[90mSaved: {}\x1b[0m", executor.conversation_id);
+    if kernel
+        .context_manager
+        .conversation_owner(&conversation)
+        .ok()
+        == Some(agent_id)
+    {
+        eprintln!("\n\x1b[90mSaved: {}\x1b[0m", conversation);
+    } else {
+        eprintln!(
+            "\n\x1b[90mNo messages saved. Conversation: {}\x1b[0m",
+            conversation
+        );
+    }
 }
 
 fn atty_is_terminal() -> bool {
     unsafe { libc::isatty(0) != 0 }
+}
+
+async fn cancellable_cli_operation<T>(
+    kernel: &AgentKernelImpl,
+    agent: kernel::AgentId,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::pin!(operation);
+    tokio::select! {
+        result = &mut operation => result,
+        interrupted = tokio::signal::ctrl_c() => {
+            interrupted.map_err(|error| format!("failed to receive terminal interrupt: {error}"))?;
+            kernel.cancel_local_turn(agent);
+            let _ = operation.await;
+            Err("Operation cancelled by terminal interrupt.".into())
+        }
+    }
+}
+
+async fn run_cli_turn(
+    kernel: &AgentKernelImpl,
+    agent: kernel::AgentId,
+    message: &str,
+) -> Result<kernel::execution::AgentOutput, String> {
+    let (events, mut receiver) = tokio::sync::mpsc::channel(256);
+    let display = tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            match event {
+                StreamEvent::ToolCallStarted { name, .. } => eprint!("\x1b[33m  🔧 {name}\x1b[0m"),
+                StreamEvent::ToolCallResult { .. } => eprintln!(" ✓"),
+                _ => {}
+            }
+        }
+    });
+    let request = kernel::AgentId::new_v4().to_string();
+    let output = cancellable_cli_operation(kernel, agent, async {
+        kernel
+            .send_message_stream(agent, message, &request, events)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    display
+        .await
+        .map_err(|error| format!("terminal event display failed: {error}"))?;
+    output
 }
 
 /// Print a clean, user-facing startup error and exit non-zero.
@@ -370,4 +442,38 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     tracing::error!("{msg}");
     eprintln!("\x1b[31magent: {msg}\x1b[0m");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::positional_prompt;
+
+    #[test]
+    fn configuration_and_resume_values_never_become_pipe_prompts() {
+        for (arguments, expected) in [
+            (vec!["agent", "--config", "/private/config.toml"], None),
+            (
+                vec!["agent", "--config", "/private/config.toml", "actual prompt"],
+                Some("actual prompt"),
+            ),
+            (
+                vec![
+                    "agent",
+                    "--conversation",
+                    "id",
+                    "--config",
+                    "/private/config.toml",
+                    "actual prompt",
+                ],
+                Some("actual prompt"),
+            ),
+            (
+                vec!["agent", "--", "-literal prompt"],
+                Some("-literal prompt"),
+            ),
+        ] {
+            let arguments: Vec<String> = arguments.into_iter().map(str::to_string).collect();
+            assert_eq!(positional_prompt(&arguments), expected);
+        }
+    }
 }

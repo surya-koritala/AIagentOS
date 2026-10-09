@@ -1,8 +1,13 @@
-# AI Agent OS — Complete Implementation Specification
+# AI Agent OS — Historical Implementation Specification
+
+> **Historical design inventory; current support is not defined here.** Remaining
+> work is tracked in [#105](https://github.com/surya-koritala/AIagentOS/issues/105)
+> and current evidence in [capabilities.toml](capabilities.toml). Unchecked Linux
+> analogies describe proposals, not implemented APIs or host isolation guarantees.
 
 ## The Blueprint: Every Component Needed
 
-This is the exhaustive list of everything that needs to exist for AI Agent OS to be a real operating system for AI agents, mapped 1:1 from Linux kernel concepts.
+This archival checklist uses Linux concepts to organize a user-space agent runtime.
 
 ---
 

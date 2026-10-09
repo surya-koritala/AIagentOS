@@ -501,6 +501,10 @@ impl AgentKernelImpl {
 }
 
 #[cfg(test)]
+#[path = "data_deadline.rs"]
+mod deadline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;

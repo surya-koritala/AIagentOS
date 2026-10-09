@@ -11,6 +11,10 @@ permissions:
   contents: read
   checks: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -122,6 +126,7 @@ jobs:
 
   rust-platforms:
     name: Rust tests (${{ matrix.os }})
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -140,6 +145,7 @@ jobs:
       - name: Gemini governed history and restart fixtures
         run: cargo test -p integration-tests gemini_history --locked -- --nocapture
       - name: Deterministic unit and integration tests
+        timeout-minutes: 20
         run: cargo test --workspace --exclude tauri-app --locked
 
   desktop-platforms:
@@ -211,7 +217,22 @@ jobs:
       - name: Install pinned Chromium accessibility runtime
         run: npx playwright install --with-deps chromium
       - name: Rendered production UI accessibility regressions
-        run: npm run test:a11y
+        env:
+          PERIPHERAL_FEATURE_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+          PERIPHERAL_QA_DIR: ${{ runner.temp }}/peripheral-ui-qa
+        run: |
+          mkdir -p "$PERIPHERAL_QA_DIR"
+          git rev-parse HEAD > "$PERIPHERAL_QA_DIR/checked-out-source.txt"
+          printf '%s\n' "$PERIPHERAL_FEATURE_SOURCE" > "$PERIPHERAL_QA_DIR/feature-source.txt"
+          npm run test:a11y
+      - name: Retain peripheral UI visual proof outside the checkout
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: peripheral-rendered-ui-${{ github.sha }}
+          path: ${{ runner.temp }}/peripheral-ui-qa
+          if-no-files-found: warn
+          retention-days: 30
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tauri-ui-dist
@@ -231,6 +252,7 @@ jobs:
   coverage:
     name: Coverage floor
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -246,6 +268,7 @@ jobs:
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Enforce workspace line coverage floor
+        timeout-minutes: 30
         run: >-
           cargo llvm-cov --workspace --exclude tauri-app --all-targets --locked
           --lcov --output-path lcov.info --fail-under-lines 60 -- --test-threads=1

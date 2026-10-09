@@ -31,10 +31,40 @@ pub mod ipc;
 pub mod learning;
 pub mod llm_sched;
 pub mod mac;
+mod managed_workspace;
+
+/// Bounded local maintenance output; no wire or tool grants this authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOwnershipStatus {
+    pub admitted_agents: Vec<AgentId>,
+    pub unresolved: Vec<WorkspaceOwnershipIssue>,
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOwnershipKind {
+    LegacyNamespace,
+    ForeignDatastore,
+    MalformedLifecycle,
+    MalformedConfiguration,
+    VerificationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOwnershipIssue {
+    pub agent_id: AgentId,
+    pub recorded_workspace: std::path::PathBuf,
+    pub kind: WorkspaceOwnershipKind,
+    pub reason: String,
+}
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory_manager;
+pub mod message_content;
 pub mod metrics;
+pub mod model_discovery;
+#[cfg(test)]
+mod model_discovery_tests;
 pub mod models;
 #[cfg(feature = "wasm")]
 pub mod modules;
@@ -42,6 +72,7 @@ pub mod namespaces;
 pub mod observability;
 pub mod operator_control;
 pub mod package;
+mod peripheral_operator;
 pub mod permissions;
 pub mod planning;
 pub mod policy;
@@ -69,6 +100,9 @@ pub mod vision;
 #[cfg(windows)]
 pub(crate) mod windows_private_fs;
 pub mod wire_contract;
+pub use peripheral_operator::{
+    LocalPeripheralOperator, PeripheralOperatorRequest, PeripheralRequestStatus,
+};
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use wire_fuzz::exercise_fragmented_transport;
@@ -464,6 +498,9 @@ pub enum ConnectorError {
     #[error("Primary provider tool incompatibility: {0:?}")]
     ToolIncompatiblePrimary(ProviderErrorContext),
 
+    #[error("Provider content unsupported: {0:?}")]
+    UnsupportedContent(ProviderErrorContext),
+
     #[error("Provider content filter blocked request: {0:?}")]
     ContentFiltered(ProviderErrorContext),
 
@@ -472,9 +509,20 @@ pub enum ConnectorError {
 
     #[error("Provider request cancelled: {0:?}")]
     Cancelled(ProviderErrorContext),
+
+    #[error("Provider feature unsupported: {0:?}")]
+    UnsupportedFeature(ProviderErrorContext),
 }
 
 impl ConnectorError {
+    pub fn unsupported_content(provider: ProviderId) -> Self {
+        Self::UnsupportedContent(Self::provider_context(
+            provider,
+            "image or audio input is unsupported or lacks a bounded model profile",
+            None,
+        ))
+    }
+
     fn provider_context(
         provider: ProviderId,
         message: impl Into<String>,
@@ -555,6 +603,10 @@ impl ConnectorError {
         ))
     }
 
+    pub fn unsupported_feature(provider: ProviderId, message: impl Into<String>) -> Self {
+        Self::UnsupportedFeature(Self::provider_context(provider, message, None))
+    }
+
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Authentication(context)
@@ -562,9 +614,11 @@ impl ConnectorError {
             | Self::ServiceUnavailable(context)
             | Self::InvalidRequest(context)
             | Self::ToolIncompatiblePrimary(context)
+            | Self::UnsupportedContent(context)
             | Self::ContentFiltered(context)
             | Self::Timeout(context)
-            | Self::Cancelled(context) => context.request_id.as_deref(),
+            | Self::Cancelled(context)
+            | Self::UnsupportedFeature(context) => context.request_id.as_deref(),
             Self::RateLimited(limit) => limit.context.request_id.as_deref(),
             Self::ProviderUnavailable(_)
             | Self::ConnectionFailed(_)
@@ -621,6 +675,9 @@ pub enum SandboxError {
 
     #[error("Sandbox boundary violation: {0}")]
     BoundaryViolation(String),
+
+    #[error("Recorded workspace ownership requires explicit local resolution: {0:?}")]
+    OwnershipResolutionRequired(WorkspaceOwnershipKind),
 }
 
 // ─── Built-in Resource Providers ─────────────────────────────────────────────
@@ -1192,6 +1249,7 @@ pub struct AgentKernelImpl {
     /// Stable, bounded-cardinality request outcomes and latency. Correlation
     /// identifiers remain in trace spans and never become metric labels.
     pub(crate) request_telemetry: crate::telemetry::RequestTelemetry,
+    pub(crate) provider_outcomes: Arc<crate::telemetry::ProviderOutcomeCounters>,
     /// Kernel background loops ended by a panic in this process. Non-zero means
     /// restart policy, the turn watchdog, procfs publication, or scheduled
     /// backup has stopped running and will not resume without a restart.
@@ -1300,7 +1358,21 @@ pub struct PeripheralRevocation {
     pub active_uses_cancelled: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ConfigStartupMode {
+    Runtime,
+    WorkspaceMaintenance,
+    RecoveryQualification,
+}
+
 impl AgentKernelImpl {
+    /// Attach the trusted, process-local human approval surface. This handle is
+    /// never transported by the syscall server, SDK, MCP, or packages.
+    pub fn attach_local_peripheral_operator(
+        self: &Arc<Self>,
+    ) -> Result<LocalPeripheralOperator, KernelError> {
+        LocalPeripheralOperator::attach(Arc::clone(self))
+    }
     const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(not(test))]
     const TOOL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1355,6 +1427,22 @@ impl AgentKernelImpl {
     /// Create a kernel from config (uses config.data_dir for persistence and
     /// config.budgets for cgroup/rate-limit quotas).
     pub fn from_config(config: &crate::config::Config) -> Result<Self, KernelError> {
+        Self::from_config_mode(config, ConfigStartupMode::Runtime)
+    }
+
+    /// Open leased storage for trusted local workspace maintenance without
+    /// loading or retiring service definitions. Call `rehydrate_agents` to
+    /// verify and admit recorded ownership before inspecting maintenance status.
+    pub fn from_config_for_workspace_maintenance(
+        config: &crate::config::Config,
+    ) -> Result<Self, KernelError> {
+        Self::from_config_mode(config, ConfigStartupMode::WorkspaceMaintenance)
+    }
+
+    fn from_config_mode(
+        config: &crate::config::Config,
+        mode: ConfigStartupMode,
+    ) -> Result<Self, KernelError> {
         Self::validate_storage_boot_config(config)?;
         let db_path = config.data_dir.join("agent_os.db");
         if let Some(parent) = db_path.parent() {
@@ -1362,7 +1450,7 @@ impl AgentKernelImpl {
         }
         let storage_lease =
             crate::storage::acquire_storage_lease(&db_path).map_err(KernelError::Context)?;
-        Self::from_validated_config_with_storage_lease(config, storage_lease)
+        Self::from_validated_config_with_storage_lease(config, storage_lease, mode)
     }
 
     fn validate_storage_boot_config(config: &crate::config::Config) -> Result<(), KernelError> {
@@ -1378,17 +1466,22 @@ impl AgentKernelImpl {
         Ok(())
     }
 
-    pub(crate) fn from_config_with_storage_lease(
+    pub(crate) fn from_config_with_storage_lease_for_recovery(
         config: &crate::config::Config,
         storage_lease: crate::storage::StorageLease,
     ) -> Result<Self, KernelError> {
         Self::validate_storage_boot_config(config)?;
-        Self::from_validated_config_with_storage_lease(config, storage_lease)
+        Self::from_validated_config_with_storage_lease(
+            config,
+            storage_lease,
+            ConfigStartupMode::RecoveryQualification,
+        )
     }
 
     fn from_validated_config_with_storage_lease(
         config: &crate::config::Config,
         storage_lease: crate::storage::StorageLease,
+        mode: ConfigStartupMode,
     ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
@@ -1466,7 +1559,11 @@ impl AgentKernelImpl {
                 .connector
                 .set_routing_policy(provider, policy.clone());
         }
-        if let Some(service_dir) = &config.service_dir {
+        if let Some(service_dir) = config
+            .service_dir
+            .as_ref()
+            .filter(|_| !matches!(mode, ConfigStartupMode::WorkspaceMaintenance))
+        {
             *kernel
                 .service_directory
                 .write()
@@ -1482,8 +1579,10 @@ impl AgentKernelImpl {
         }
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
-        kernel.rehydrate_agents_blocking();
-        kernel.restore_service_runtime_from_store()?;
+        if matches!(mode, ConfigStartupMode::Runtime) {
+            kernel.rehydrate_agents_blocking();
+            kernel.restore_service_runtime_from_store()?;
+        }
         Ok(kernel)
     }
 
@@ -1557,7 +1656,12 @@ impl AgentKernelImpl {
         )?);
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
-        let sandbox_manager = Arc::new(SandboxManagerImpl::new());
+        let store_identity = context_manager.workspace_store_identity(storage_lease.is_some())?;
+        let sandbox_manager = Arc::new(SandboxManagerImpl::for_datastore(
+            store_identity
+                .as_ref()
+                .map(|(path, store)| (path.as_path(), *store)),
+        )?);
         let resource_broker = Arc::new(ResourceBrokerImpl::new(
             permission_manager.clone(),
             sandbox_manager.clone(),
@@ -1706,6 +1810,7 @@ impl AgentKernelImpl {
             active_requests: DashMap::new(),
             lifecycle_counters: crate::metrics::LifecycleCounters::default(),
             request_telemetry: crate::telemetry::RequestTelemetry::default(),
+            provider_outcomes: Arc::new(crate::telemetry::ProviderOutcomeCounters::default()),
             background_task_panics: std::sync::atomic::AtomicU64::new(0),
             service_operation_lock: tokio::sync::Mutex::new(()),
             service_health_checks: DashMap::new(),
@@ -1774,10 +1879,118 @@ impl AgentKernelImpl {
                 "managed application bootstrap requires an isolated backend".into(),
             ));
         }
-        sandbox.workspace_dir = SandboxManagerImpl::default_config().workspace_dir;
+        sandbox.workspace_dir = self.sandbox_manager.default_managed_config().workspace_dir;
         config.sandbox_config = Some(sandbox);
         self.create_agent_grouped_owned(config, None, crate::context::DEFAULT_TENANT, None, true)
             .await
+    }
+
+    /// Trusted local operator resolution for an unverified legacy/restored
+    /// workspace. Preserve its bytes and identity as an explicit operator
+    /// workspace; never adopt automatic deletion ownership. No wire/tool
+    /// operation exposes this authority. The record must not be live.
+    pub async fn retain_legacy_workspace_as_operator(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<(), KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        if self.agent_manager.get_agent_state(agent_id).is_some() {
+            return Err(KernelError::Policy(
+                "workspace ownership resolution requires a non-admitted agent".into(),
+            ));
+        }
+        let record = self
+            .context_manager
+            .load_all_agents()?
+            .into_iter()
+            .find(|record| record.id == agent_id)
+            .ok_or_else(|| KernelError::Policy("workspace ownership record is unknown".into()))?;
+        let serialized = record.sandbox_config_json.as_deref().ok_or_else(|| {
+            KernelError::Policy("legacy workspace record has no path to preserve".into())
+        })?;
+        let config: SandboxConfig = serde_json::from_str(serialized)
+            .map_err(|error| KernelError::Policy(error.to_string()))?;
+        self.sandbox_manager
+            .retain_legacy_workspace(&config.workspace_dir, agent_id)?;
+        Ok(())
+    }
+
+    /// Inspect recorded paths locally while the datastore lease is held.
+    /// Output remains bounded; callers can resolve a recorded UUID explicitly.
+    pub fn workspace_ownership_status(&self) -> Result<WorkspaceOwnershipStatus, KernelError> {
+        let mut admitted_agents = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut truncated = false;
+        let mut records = self.context_manager.load_all_agents()?;
+        records.sort_by_key(|record| record.id);
+        for record in records {
+            match serde_json::from_str::<AgentState>(&record.status) {
+                Ok(AgentState::Running | AgentState::Paused) => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    if unresolved.len() == 256 {
+                        truncated = true;
+                        break;
+                    }
+                    let path = record
+                        .sandbox_config_json
+                        .as_deref()
+                        .and_then(|serialized| {
+                            serde_json::from_str::<SandboxConfig>(serialized).ok()
+                        })
+                        .map(|config| config.workspace_dir)
+                        .unwrap_or_default();
+                    unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:path,
+                        kind: WorkspaceOwnershipKind::MalformedLifecycle,
+                        reason:"recorded lifecycle status is malformed; original status, identity and owned data were preserved; repair the record before admission".into() });
+                    continue;
+                }
+            }
+            if self.agent_manager.get_agent_state(record.id).is_some() {
+                if admitted_agents.len() < 256 {
+                    admitted_agents.push(record.id);
+                } else {
+                    truncated = true;
+                }
+            }
+            let Some(serialized) = record.sandbox_config_json.as_deref() else {
+                continue;
+            };
+            let config = match serde_json::from_str::<SandboxConfig>(serialized) {
+                Ok(config) => config,
+                Err(_) => {
+                    if unresolved.len() == 256 {
+                        truncated = true;
+                        break;
+                    }
+                    unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:std::path::PathBuf::new(),
+                        kind: WorkspaceOwnershipKind::MalformedConfiguration,
+                        reason:"recorded sandbox configuration is malformed; original JSON, status and data were preserved; repair the record before admission".into() });
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .sandbox_manager
+                .restored_workspace_is_managed(&config, record.id)
+            {
+                if unresolved.len() == 256 {
+                    truncated = true;
+                    break;
+                }
+                let kind = match error {
+                    SandboxError::OwnershipResolutionRequired(kind) => kind,
+                    _ => WorkspaceOwnershipKind::VerificationFailed,
+                };
+                unresolved.push(WorkspaceOwnershipIssue { agent_id: record.id, recorded_workspace: config.workspace_dir,
+                    kind,
+                    reason: "recorded workspace ownership is unresolved; data and identity were preserved".into() });
+            }
+        }
+        Ok(WorkspaceOwnershipStatus {
+            admitted_agents,
+            unresolved,
+            truncated,
+        })
     }
 
     /// Create an agent with an authority-reserved identifier.
@@ -2346,7 +2559,7 @@ impl AgentKernelImpl {
         // the wire and package formats do not expose that bypass.
         let managed_sandbox = config.sandbox_config.is_none() || owned_sandbox;
         if config.sandbox_config.is_none() {
-            config.sandbox_config = Some(SandboxManagerImpl::default_config());
+            config.sandbox_config = Some(self.sandbox_manager.default_managed_config());
         }
         // 1. Create agent via agent manager
         let handle = match requested_agent_id {
@@ -2564,24 +2777,53 @@ impl AgentKernelImpl {
             .context_manager
             .load_all_agents()
             .map_err(KernelError::Context)?;
-        let active_managed_workspaces = persisted
-            .iter()
-            .filter(|record| {
-                matches!(
-                    serde_json::from_str::<AgentState>(&record.status),
-                    Ok(AgentState::Running | AgentState::Paused)
-                )
-            })
-            .filter_map(|record| record.sandbox_config_json.as_deref())
-            .filter_map(|serialized| serde_json::from_str::<SandboxConfig>(serialized).ok())
-            .filter(SandboxManagerImpl::is_managed_config)
-            .map(|config| config.workspace_dir)
-            .collect::<std::collections::HashSet<_>>();
+        let mut active_managed_workspaces = std::collections::HashSet::new();
+        let mut unresolved_workspaces = std::collections::HashSet::new();
+        let mut protected_workspace_agents = std::collections::HashSet::new();
+        for record in &persisted {
+            if serde_json::from_str::<AgentState>(&record.status).is_err() {
+                protected_workspace_agents.insert(record.id);
+                unresolved_workspaces.insert(record.id);
+                continue;
+            }
+            if matches!(
+                serde_json::from_str::<AgentState>(&record.status),
+                Ok(AgentState::Running | AgentState::Paused)
+            ) {
+                protected_workspace_agents.insert(record.id);
+                if let Some(serialized) = &record.sandbox_config_json {
+                    match serde_json::from_str::<SandboxConfig>(serialized) {
+                        Ok(config) => match self
+                            .sandbox_manager
+                            .restored_workspace_is_managed(&config, record.id)
+                        {
+                            Ok(true) => {
+                                active_managed_workspaces.insert(config.workspace_dir);
+                            }
+                            Ok(false) => {}
+                            Err(_) => {
+                                unresolved_workspaces.insert(record.id);
+                            }
+                        },
+                        Err(_) => {
+                            unresolved_workspaces.insert(record.id);
+                        }
+                    }
+                }
+            }
+        }
         self.sandbox_manager
-            .reconcile_managed_workspaces(&active_managed_workspaces)
+            .reconcile_recorded_managed_workspaces(
+                &active_managed_workspaces,
+                &protected_workspace_agents,
+            )
             .map_err(KernelError::Sandbox)?;
         let mut restored = Vec::new();
         for p in persisted {
+            if unresolved_workspaces.contains(&p.id) {
+                tracing::warn!(agent_id = %p.id, "Recorded workspace ownership is unresolved; agent remains unadmitted and its durable status and data are preserved");
+                continue;
+            }
             // An explicit reconciliation pass may run after boot. Treat an
             // identity already present in the live registry as successfully
             // reconciled instead of trying to create a second sandbox and
@@ -2595,7 +2837,7 @@ impl AgentKernelImpl {
                 .sandbox_config_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<SandboxConfig>(s).ok())
-                .unwrap_or_else(SandboxManagerImpl::default_config);
+                .unwrap_or_else(|| self.sandbox_manager.default_managed_config());
             let config = AgentConfig {
                 name: p.name.clone(),
                 task: p.task.clone(),
@@ -2662,7 +2904,11 @@ impl AgentKernelImpl {
                     continue;
                 }
             };
-            let sandbox_result = if SandboxManagerImpl::is_managed_config(&sandbox_config) {
+            let sandbox_result = if p.sandbox_config_json.is_none()
+                || self
+                    .sandbox_manager
+                    .restored_workspace_is_managed(&sandbox_config, p.id)?
+            {
                 self.sandbox_manager
                     .create_managed_sandbox(p.id, &sandbox_config)
             } else {
@@ -3368,9 +3614,19 @@ impl AgentKernelImpl {
     /// Best-effort: a rehydration error is logged, not fatal, so a kernel still
     /// boots on a partially-readable DB.
     fn rehydrate_agents_blocking(&self) {
+        match self.rehydrate_agents_checked_blocking() {
+            Ok(ids) if !ids.is_empty() => {
+                tracing::info!("Rehydrated {} agent(s) from persistent store", ids.len());
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("Agent rehydration failed: {error}"),
+        }
+    }
+
+    pub(crate) fn rehydrate_agents_checked_blocking(&self) -> Result<Vec<AgentId>, KernelError> {
         // SAFETY/scoping: `std::thread::scope` lets the spawned thread borrow
         // `self` for its lifetime, so no `'static`/`Arc` is required here.
-        let result = std::thread::scope(|s| {
+        std::thread::scope(|s| {
             s.spawn(|| {
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -3383,15 +3639,12 @@ impl AgentKernelImpl {
                 }
             })
             .join()
-        });
-        match result {
-            Ok(Ok(ids)) if !ids.is_empty() => {
-                tracing::info!("Rehydrated {} agent(s) from persistent store", ids.len());
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!("Agent rehydration failed: {e}"),
-            Err(_) => tracing::warn!("Agent rehydration thread panicked"),
-        }
+        })
+        .map_err(|_| {
+            KernelError::Context(ContextError::StorageError(
+                "agent rehydration thread panicked".into(),
+            ))
+        })?
     }
 
     /// Rebind durable service ownership only after agent rehydration. A live
@@ -3686,6 +3939,7 @@ impl AgentKernelImpl {
         forced: bool,
     ) -> Result<(), KernelError> {
         let mut failures = Vec::new();
+        self.tool_registry.cancel_pending_peripheral(agent_id);
         self.tool_vfs.revoke_agent(agent_id);
         // Peripheral calls carry a local, visible active-use contract. Agent
         // teardown is also revocation: signal every active device operation
@@ -4715,6 +4969,7 @@ impl AgentKernelImpl {
     /// Callers hold the lifecycle lock, which prevents resume or new admission;
     /// `send_message` never waits for that lock while holding the executor.
     async fn quiesce_agent(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        self.tool_registry.cancel_pending_peripheral(agent_id);
         if let Some(token) = self.active_cancellations.get(&agent_id) {
             token.cancel();
         }
@@ -4740,6 +4995,7 @@ impl AgentKernelImpl {
     /// transition is not committed and admission is reopened; an operator can
     /// retry after the binding returns without leaking its cgroup hierarchy.
     async fn drain_agent_tool_calls(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        self.tool_registry.cancel_pending_peripheral(agent_id);
         if self.syscall_gate.agent_info(agent_id).is_none() {
             return Ok(());
         }
@@ -5109,9 +5365,13 @@ impl AgentKernelImpl {
             return Ok((AgentState::Running, None, None));
         };
 
-        let stored =
-            self.context_manager
-                .claim_generation_checkpoint(checkpoint_id, agent_id, &tenant)?;
+        let mut recovery_observation = self.context_manager.checkpoint_recovery_observation();
+        let stored = self.context_manager.claim_generation_checkpoint_observed(
+            checkpoint_id,
+            agent_id,
+            &tenant,
+            &mut recovery_observation,
+        )?;
         let executor = match self.ensure_executor(agent_id).await {
             Ok(executor) => executor,
             Err(error) => {
@@ -5164,6 +5424,8 @@ impl AgentKernelImpl {
         };
         self.scheduler.set_running(agent_id);
         let baseline = stored.checkpoint.clone();
+        recovery_observation.recovered();
+        drop(recovery_observation);
         let run_result = executor.resume(stored.checkpoint).await;
         self.active_cancellations.remove(&agent_id);
         match self.agent_manager.get_agent_state(agent_id) {
@@ -5286,6 +5548,7 @@ impl AgentKernelImpl {
         }
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
+        executor.set_provider_outcomes(self.provider_outcomes.clone());
         executor.set_context_budget(self.context_budget_tokens);
         let tenant_id = self
             .context_manager
@@ -5413,8 +5676,107 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         message: &str,
     ) -> Result<AgentOutput, KernelError> {
-        self.send_message_inner(agent_id, message, None, None, None)
+        self.send_message_inner(agent_id, message.into(), None, None, None, false)
             .await
+    }
+
+    /// Configure the trusted embedded terminal's executor. This host-only
+    /// operation is deliberately absent from the remote syscall interface.
+    pub async fn configure_local_cli_agent(
+        &self,
+        agent_id: AgentId,
+        store: Arc<crate::learning::RuleStore>,
+        system_prompt: String,
+        conversation: Option<&str>,
+    ) -> Result<String, KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        let lifecycle = self.lifecycle_lock(agent_id);
+        let _guard = lifecycle.lock().await;
+        if store.scope() != &crate::learning::RuleScope::local_cli()
+            || !store.is_durable()
+            || store.operator()
+                != crate::config::local_operator_identity()
+                    .map_err(|error| KernelError::Policy(error.to_string()))?
+            || self.context_manager.agent_tenant(agent_id)?.as_deref()
+                != Some(crate::context::DEFAULT_TENANT)
+        {
+            return Err(KernelError::Policy(
+                "local CLI corrections require the local operator scope and tenant".into(),
+            ));
+        }
+        if self.get_agent_status(agent_id)? != AgentState::Running
+            || self.syscall_gate.pid_of(agent_id).is_none()
+        {
+            return Err(KernelError::Policy(
+                "local CLI conversation owner is not an eligible running agent".into(),
+            ));
+        }
+        self.syscall_gate
+            .cgroup_quota_constraints(agent_id)
+            .map_err(|error| KernelError::Policy(error.message()))?;
+        if let Some(conversation) = conversation {
+            let binding = store
+                .cli_conversation(conversation)
+                .map_err(|error| KernelError::Policy(error.to_string()))?
+                .ok_or_else(|| {
+                    KernelError::Policy(
+                        "conversation is not registered to this local operator".into(),
+                    )
+                })?;
+            if binding.agent_id != agent_id || binding.tenant_id != crate::context::DEFAULT_TENANT {
+                return Err(KernelError::Policy(
+                    "conversation registry owner does not match this agent and tenant".into(),
+                ));
+            }
+            if self.context_manager.conversation_owner(conversation)? != agent_id {
+                return Err(KernelError::Policy(
+                    "conversation belongs to another agent".into(),
+                ));
+            }
+            if !self
+                .context_manager
+                .list_generation_checkpoints(&binding.tenant_id, Some(agent_id))?
+                .is_empty()
+            {
+                return Err(KernelError::Policy("conversation has an unfinished checkpoint; use the governed checkpoint-resume flow".into()));
+            }
+        }
+        let executor = self.ensure_executor(agent_id).await?;
+        let mut executor = executor.try_lock().map_err(|_| {
+            KernelError::Policy("cannot configure CLI corrections during an active turn".into())
+        })?;
+        executor.configure_terminal_prompt(system_prompt, conversation)?;
+        executor.set_rule_store(store)?;
+        Ok(executor.conversation_id.clone())
+    }
+
+    /// Generate text-only steps under ordinary turn admission, provider
+    /// quotas, cancellation, retries, output limits, and usage accounting.
+    pub async fn generate_plan(
+        &self,
+        agent_id: AgentId,
+        task: &str,
+    ) -> Result<crate::planning::Plan, KernelError> {
+        crate::planning::validate_plan_task(task)?;
+        let output = self
+            .send_message_inner(agent_id, task.into(), None, None, None, true)
+            .await?;
+        let result: Result<crate::planning::Plan, String> = serde_json::from_str(&output.content)
+            .map_err(|error| {
+            KernelError::Policy(format!("invalid governed plan result: {error}"))
+        })?;
+        result.map_err(KernelError::Policy)
+    }
+
+    /// Trusted embedded hosts may interrupt an active turn. Remote clients
+    /// use their separately authorized exact-request cancellation syscall.
+    pub fn cancel_local_turn(&self, agent_id: AgentId) -> bool {
+        if let Some(cancellation) = self.active_cancellations.get(&agent_id) {
+            cancellation.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     /// Send a message while publishing bounded execution events and registering
@@ -5446,10 +5808,11 @@ impl AgentKernelImpl {
         }
         self.send_message_inner(
             agent_id,
-            message,
+            message.into(),
             Some(request_id.to_string()),
             Some(events),
             request_fence,
+            false,
         )
         .await
     }
@@ -5486,13 +5849,58 @@ impl AgentKernelImpl {
         true
     }
 
+    pub async fn send_message_content(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_inner(agent_id, content, None, None, None, false)
+            .await
+    }
+
+    pub async fn send_message_content_stream(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_content_stream_with_fence(agent_id, content, request_id, events, None)
+            .await
+    }
+
+    pub(crate) async fn send_message_content_stream_with_fence(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+        request_fence: Option<ActiveRequestFence>,
+    ) -> Result<AgentOutput, KernelError> {
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err(KernelError::Policy(
+                "request id must contain 1..=128 bytes".into(),
+            ));
+        }
+        self.send_message_inner(
+            agent_id,
+            content,
+            Some(request_id.into()),
+            Some(events),
+            request_fence,
+            false,
+        )
+        .await
+    }
+
     async fn send_message_inner(
         &self,
         agent_id: AgentId,
-        message: &str,
+        message: crate::message_content::MessageContent,
         request_id: Option<String>,
         events: Option<tokio::sync::mpsc::Sender<crate::execution::StreamEvent>>,
         request_fence: Option<ActiveRequestFence>,
+        planning: bool,
     ) -> Result<AgentOutput, KernelError> {
         // Serialize executor creation against pause/stop/kill and reject work
         // unless the agent is currently runnable.
@@ -5601,7 +6009,16 @@ impl AgentKernelImpl {
         // Set/clear around `run` (not via `?`) so the slot is freed even when
         // the turn errors.
         self.scheduler.set_running(agent_id);
-        let run_result = executor.run_resumable(message).await;
+        let run_result = if planning {
+            match message.legacy_text() {
+                Some(task) => executor.run_plan(task).await,
+                None => Err(KernelError::Policy(
+                    "planning requires legacy text input".into(),
+                )),
+            }
+        } else {
+            executor.run_content_resumable(message).await
+        };
         executor.clear_event_channel();
         drop(registration);
         let output = match run_result? {
@@ -6230,7 +6647,23 @@ mod tests {
         database: &LiveErasureCrashDatabase,
         scope: &str,
     ) -> (String, String, AgentId) {
-        let kernel = AgentKernelImpl::from_config(&database.config()).unwrap();
+        let opened = AgentKernelImpl::from_config(&database.config());
+        #[cfg(windows)]
+        if opened.is_err() {
+            let mut lock_name = database.path.as_os_str().to_os_string();
+            lock_name.push(".lock");
+            let lock = std::path::PathBuf::from(lock_name);
+            for (label, path, directory) in [
+                ("parent", &database.root, true),
+                ("database", &database.path, false),
+                ("lease", &lock, false),
+            ] {
+                let exists = std::fs::symlink_metadata(path).is_ok();
+                let verified = crate::windows_private_fs::verify_path(path, directory);
+                eprintln!("erasure_seed_object label={label} exists={exists} protected={} error_kind={:?} os_error={:?}", verified.is_ok(), verified.as_ref().err().map(std::io::Error::kind), verified.as_ref().err().and_then(std::io::Error::raw_os_error));
+            }
+        }
+        let kernel = opened.unwrap();
         let tenant = kernel
             .create_tenant(&format!("{scope}-live-erasure"))
             .await
@@ -6310,6 +6743,8 @@ mod tests {
         subject: &str,
         step: &str,
     ) {
+        let child_temporary = database.root.join("crash-process-temp");
+        std::fs::create_dir(&child_temporary).unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--ignored")
             .arg("live_erasure_crash_child_only")
@@ -6320,9 +6755,11 @@ mod tests {
             // Rehydration reconciles the process-local managed workspace root.
             // Give every crash child its own root so it cannot classify a
             // concurrently running test process's workspaces as orphaned.
-            .env("TMPDIR", &database.root)
-            .env("TMP", &database.root)
-            .env("TEMP", &database.root)
+            // Keep this separate from the private database parent, whose ACL
+            // must not be mistaken for a shared temporary-root mutation.
+            .env("TMPDIR", &child_temporary)
+            .env("TMP", &child_temporary)
+            .env("TEMP", &child_temporary)
             .status()
             .unwrap();
         assert_eq!(
@@ -8263,6 +8700,493 @@ mod tests {
         AgentConfig {
             permission_profile: "full-access".into(),
             ..lifecycle_test_config(name)
+        }
+    }
+
+    async fn wait_local_peripheral_request(
+        operator: &LocalPeripheralOperator,
+        count: usize,
+    ) -> PeripheralOperatorRequest {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let requests = operator.requests();
+                if requests.len() >= count {
+                    return requests[count - 1].clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending local peripheral request")
+    }
+
+    #[tokio::test]
+    async fn local_peripheral_pending_approval_is_single_use_and_revocable_before_admission() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        register_revocable_camera(&kernel, Arc::new(tokio::sync::Notify::new()));
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("pending-camera"))
+            .await
+            .unwrap();
+        let operator = kernel.attach_local_peripheral_operator().unwrap();
+        assert!(kernel.attach_local_peripheral_operator().is_err());
+        let caller = Arc::clone(&kernel);
+        let waiting = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "capture_camera",
+                    &serde_json::json!({"device": "pending-private-target"}),
+                )
+                .await
+        });
+        let request = wait_local_peripheral_request(&operator, 1).await;
+        assert_eq!(request.status, PeripheralRequestStatus::AwaitingApproval);
+        assert!(!request.grant_pending);
+        assert_eq!(request.active_uses, 0);
+        assert!(!serde_json::to_string(&request)
+            .unwrap()
+            .contains("pending-private-target"));
+        operator.approve(request.request_id).unwrap();
+        assert!(operator.approve(request.request_id).is_err());
+        assert!(operator.requests()[0].grant_pending);
+        assert_eq!(
+            operator.revoke(request.request_id).unwrap(),
+            PeripheralRevocation {
+                pending_grant_revoked: true,
+                active_uses_cancelled: 0
+            }
+        );
+        assert!(waiting.await.unwrap().is_err());
+        assert_eq!(
+            operator.requests()[0].status,
+            PeripheralRequestStatus::Revoked
+        );
+        assert!(!operator.requests()[0].grant_pending);
+    }
+
+    #[tokio::test]
+    async fn local_peripheral_waiters_are_bounded_and_cancel_with_their_call_or_host() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        register_revocable_camera(&kernel, Arc::new(tokio::sync::Notify::new()));
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("bounded-camera"))
+            .await
+            .unwrap();
+        let operator = kernel.attach_local_peripheral_operator().unwrap();
+        let mut waiters = Vec::new();
+        for index in 0..64 {
+            let caller = Arc::clone(&kernel);
+            waiters.push(tokio::spawn(async move {
+                caller
+                    .tool_registry
+                    .authorize_and_acquire_call(
+                        &caller.syscall_gate,
+                        agent.id,
+                        "capture_camera",
+                        &serde_json::json!({"device": format!("private-{index}")}),
+                    )
+                    .await
+            }));
+        }
+        wait_local_peripheral_request(&operator, 64).await;
+        assert!(kernel
+            .tool_registry
+            .authorize_and_acquire_call(
+                &kernel.syscall_gate,
+                agent.id,
+                "capture_camera",
+                &serde_json::json!({"device": "overflow"})
+            )
+            .await
+            .is_err());
+        assert_eq!(operator.requests().len(), 64);
+        assert!(operator
+            .requests()
+            .iter()
+            .all(|request| request.active_uses == 0 && !request.grant_pending));
+        waiters[0].abort();
+        let aborted = waiters.remove(0);
+        assert!(matches!(aborted.await, Err(error) if error.is_cancelled()));
+        assert!(operator
+            .requests()
+            .iter()
+            .any(|request| request.status == PeripheralRequestStatus::Cancelled));
+        drop(operator);
+        for waiter in waiters {
+            assert!(waiter.await.unwrap().is_err());
+        }
+        // A dropped native authority does not leave a request listener behind.
+        assert!(kernel
+            .tool_registry
+            .authorize_and_acquire_call(
+                &kernel.syscall_gate,
+                agent.id,
+                "capture_camera",
+                &serde_json::json!({"device": "after-host-drop"})
+            )
+            .await
+            .is_err());
+        assert!(kernel.attach_local_peripheral_operator().is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_peripheral_approval_rechecks_binding_policy_and_agent_lifecycle() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        register_revocable_camera(&kernel, Arc::new(tokio::sync::Notify::new()));
+        kernel.tool_registry.register(crate::tools::ToolBinding {
+            name: "capture_camera_scoped".into(), description: "CI explicitly capability-scoped camera".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {"device": {"type": "string"}}, "required": ["device"]}),
+            resource_type: crate::resources::ResourceType::Peripheral, operation: "capture_image".into(),
+            security: crate::tools::ToolSecurity::argument(crate::tools::SecurityAction::Read, "device")
+                .with_capability(crate::agent_struct::CapabilitySet::CAP_NET_ACCESS)
+                .with_approval(crate::tools::ApprovalPolicy::User).sandboxed(),
+        }).unwrap();
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("fenced-camera"))
+            .await
+            .unwrap();
+        let operator = kernel.attach_local_peripheral_operator().unwrap();
+        let caller = Arc::clone(&kernel);
+        let waiting = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "capture_camera",
+                    &serde_json::json!({"device": "fenced-private-target"}),
+                )
+                .await
+        });
+        let request = wait_local_peripheral_request(&operator, 1).await;
+        kernel.tool_registry.unregister("capture_camera");
+        assert!(operator.approve(request.request_id).is_err());
+        assert!(operator.deny(request.request_id).is_err());
+        assert_eq!(
+            operator.requests()[0].status,
+            PeripheralRequestStatus::Cancelled
+        );
+        assert!(waiting.await.unwrap().is_err());
+
+        let caller = Arc::clone(&kernel);
+        let waiting = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "capture_camera_scoped",
+                    &serde_json::json!({"device": "fenced-private-target"}),
+                )
+                .await
+        });
+        let request = wait_local_peripheral_request(&operator, 2).await;
+        kernel
+            .syscall_gate
+            .set_capabilities(agent.id, crate::agent_struct::CapabilitySet::none());
+        operator.approve(request.request_id).unwrap();
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                crate::syscall_gate::GateDenial::MissingCapability(
+                    crate::agent_struct::CapabilitySet::CAP_NET_ACCESS
+                )
+            ))
+        ));
+        assert!(!operator.requests()[1].grant_pending);
+
+        kernel
+            .syscall_gate
+            .set_capabilities(agent.id, crate::agent_struct::CapabilitySet::all());
+        let caller = Arc::clone(&kernel);
+        let waiting = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "capture_camera_scoped",
+                    &serde_json::json!({"device": "fenced-private-target"}),
+                )
+                .await
+        });
+        let request = wait_local_peripheral_request(&operator, 3).await;
+        kernel.stop_agent(agent.id).await.unwrap();
+        assert!(waiting.await.unwrap().is_err());
+        assert!(operator.approve(request.request_id).is_err());
+        assert!(operator
+            .requests()
+            .iter()
+            .all(|request| !request.grant_pending && request.active_uses == 0));
+    }
+
+    #[tokio::test]
+    async fn local_peripheral_kill_cancels_active_and_waiting_requests_in_the_operator_view() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let started = Arc::new(tokio::sync::Notify::new());
+        register_revocable_camera(&kernel, Arc::clone(&started));
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("kill-camera"))
+            .await
+            .unwrap();
+        let operator = kernel.attach_local_peripheral_operator().unwrap();
+        let caller = Arc::clone(&kernel);
+        let active = tokio::spawn(async move {
+            let (prepared, _slot) = caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "capture_camera",
+                    &serde_json::json!({"device": "kill-private-target"}),
+                )
+                .await
+                .unwrap();
+            caller.resource_broker.execute(prepared.request).await
+        });
+        let request = wait_local_peripheral_request(&operator, 1).await;
+        operator.approve(request.request_id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(operator.requests()[0].active_uses, 1);
+        let caller = Arc::clone(&kernel);
+        let waiting = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "capture_camera_alternate",
+                    &serde_json::json!({"device": "kill-private-target"}),
+                )
+                .await
+        });
+        wait_local_peripheral_request(&operator, 2).await;
+        kernel.kill_agent(agent.id).await.unwrap();
+        assert!(waiting.await.unwrap().is_err());
+        let response = active.await.unwrap().unwrap();
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("peripheral use revoked"));
+        assert!(operator.requests().iter().all(|request| request.status
+            == PeripheralRequestStatus::Cancelled
+            && !request.grant_pending
+            && request.active_uses == 0));
+    }
+
+    use crate::resources::PeripheralCallbackCounter;
+
+    fn register_peripheral_race_binding(kernel: &AgentKernelImpl) {
+        kernel.tool_registry.register(crate::tools::ToolBinding {
+            name: "camera_race".into(), description: "CI peripheral registration fence".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {"device": {"type": "string"}}, "required": ["device"]}),
+            resource_type: crate::resources::ResourceType::Peripheral, operation: "capture_image".into(),
+            security: crate::tools::ToolSecurity::argument(crate::tools::SecurityAction::Read, "device")
+                .with_approval(crate::tools::ApprovalPolicy::User).sandboxed(),
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_peripheral_binding_revocation_fences_approved_retry_and_provider_dispatch() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        kernel
+            .resource_broker
+            .register_provider(Box::new(PeripheralCallbackCounter(Arc::clone(&callbacks))))
+            .unwrap();
+        register_peripheral_race_binding(&kernel);
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("binding-race-camera"))
+            .await
+            .unwrap();
+        let operator = kernel.attach_local_peripheral_operator().unwrap();
+        let caller = Arc::clone(&kernel);
+        let waiting = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "camera_race",
+                    &serde_json::json!({"device": "private-race-target"}),
+                )
+                .await
+        });
+        let request = wait_local_peripheral_request(&operator, 1).await;
+        operator.approve(request.request_id).unwrap();
+        assert!(operator.requests()[0].grant_pending);
+        // No await between approval and removal: revoke the unconsumed grant
+        // before the original waiter can repeat gate admission.
+        kernel.tool_registry.unregister("camera_race");
+        register_peripheral_race_binding(&kernel);
+        assert!(waiting.await.unwrap().is_err());
+        assert!(!operator.requests()[0].grant_pending);
+        assert_eq!(
+            operator.requests()[0].status,
+            PeripheralRequestStatus::Cancelled
+        );
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let caller = Arc::clone(&kernel);
+        let admitted = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "camera_race",
+                    &serde_json::json!({"device": "private-race-target"}),
+                )
+                .await
+        });
+        let request = wait_local_peripheral_request(&operator, 2).await;
+        operator.approve(request.request_id).unwrap();
+        let (prepared, slot) = admitted.await.unwrap().unwrap();
+        assert_eq!(operator.requests()[1].active_uses, 1);
+        // Admission has issued its owned lease, but no provider callback has
+        // run. Removal cancels that exact lease before broker dispatch.
+        kernel.tool_registry.unregister("camera_race");
+        register_peripheral_race_binding(&kernel);
+        let response = kernel
+            .resource_broker
+            .execute(prepared.request)
+            .await
+            .unwrap();
+        drop(slot);
+        assert!(!response.success);
+        assert_eq!(
+            response.error,
+            Some(ResourceError::OperationFailed("peripheral use revoked".into()).to_string())
+        );
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!operator.requests()[1].grant_pending);
+        assert_eq!(operator.requests()[1].active_uses, 0);
+        assert!(operator.approve(request.request_id).is_err());
+
+        let caller = Arc::clone(&kernel);
+        let replacement = tokio::spawn(async move {
+            caller
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &caller.syscall_gate,
+                    agent.id,
+                    "camera_race",
+                    &serde_json::json!({"device": "private-race-target"}),
+                )
+                .await
+        });
+        let replacement_request = wait_local_peripheral_request(&operator, 3).await;
+        operator.approve(replacement_request.request_id).unwrap();
+        let (prepared, slot) = replacement.await.unwrap().unwrap();
+        // An identical re-registration has a new binding contract. Revoking
+        // the stale record cannot remove its new grant or cancel its lease.
+        assert_eq!(
+            operator.revoke(request.request_id).unwrap(),
+            PeripheralRevocation {
+                pending_grant_revoked: false,
+                active_uses_cancelled: 0
+            }
+        );
+        assert_eq!(operator.requests()[2].active_uses, 1);
+        assert_eq!(
+            operator
+                .revoke(replacement_request.request_id)
+                .unwrap()
+                .active_uses_cancelled,
+            1
+        );
+        let response = kernel
+            .resource_broker
+            .execute(prepared.request)
+            .await
+            .unwrap();
+        drop(slot);
+        assert!(!response.success);
+        assert_eq!(
+            response.error,
+            Some(ResourceError::OperationFailed("peripheral use revoked".into()).to_string())
+        );
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_peripheral_concurrent_approve_and_unregister_remain_live_and_fail_closed() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        kernel
+            .resource_broker
+            .register_provider(Box::new(PeripheralCallbackCounter(Arc::clone(&callbacks))))
+            .unwrap();
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("concurrent-camera"))
+            .await
+            .unwrap();
+        let operator = Arc::new(kernel.attach_local_peripheral_operator().unwrap());
+        for index in 0..16 {
+            register_peripheral_race_binding(&kernel);
+            let caller = Arc::clone(&kernel);
+            let admitted = tokio::spawn(async move {
+                caller
+                    .tool_registry
+                    .authorize_and_acquire_call(
+                        &caller.syscall_gate,
+                        agent.id,
+                        "camera_race",
+                        &serde_json::json!({"device": format!("private-race-{index}")}),
+                    )
+                    .await
+            });
+            let request = wait_local_peripheral_request(&operator, index + 1).await;
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (completed, received) = std::sync::mpsc::channel();
+            let approve_operator = Arc::clone(&operator);
+            let approve_barrier = Arc::clone(&barrier);
+            let approve_completed = completed.clone();
+            let approve = std::thread::spawn(move || {
+                approve_barrier.wait();
+                let _ = approve_operator.approve(request.request_id);
+                approve_completed.send(()).unwrap();
+            });
+            let unregister_kernel = Arc::clone(&kernel);
+            let unregister = std::thread::spawn(move || {
+                barrier.wait();
+                unregister_kernel.tool_registry.unregister("camera_race");
+                completed.send(()).unwrap();
+            });
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..2 {
+                    received
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .expect("approve/unregister must not invert locks");
+                }
+            })
+            .await
+            .unwrap();
+            approve.join().unwrap();
+            unregister.join().unwrap();
+            if let Ok((prepared, slot)) = admitted.await.unwrap() {
+                let response = kernel
+                    .resource_broker
+                    .execute(prepared.request)
+                    .await
+                    .unwrap();
+                drop(slot);
+                assert!(!response.success);
+                assert_eq!(
+                    response.error,
+                    Some(
+                        ResourceError::OperationFailed("peripheral use revoked".into()).to_string()
+                    )
+                );
+            }
+            assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(operator
+                .requests()
+                .iter()
+                .all(|request| !request.grant_pending && request.active_uses == 0));
         }
     }
 

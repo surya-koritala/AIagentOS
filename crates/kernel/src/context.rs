@@ -22,6 +22,8 @@ mod branching;
 mod clone_store;
 #[path = "context/fact_index.rs"]
 pub(crate) mod fact_index;
+#[cfg(test)]
+mod image_input_tests;
 #[path = "context/shared_spills.rs"]
 mod shared_spills;
 pub use branching::{
@@ -1008,6 +1010,7 @@ pub struct SqliteContextManager {
     /// without touching persistence.
     embedder: Arc<dyn Embedder>,
     fact_cache: Mutex<fact_index::FactCache>,
+    checkpoint_recovery: Arc<crate::telemetry::CheckpointRecoveryCounters>,
     #[cfg(test)]
     fail_next_agent_save: AtomicBool,
     #[cfg(test)]
@@ -1015,6 +1018,31 @@ pub struct SqliteContextManager {
 }
 
 impl SqliteContextManager {
+    /// Store ownership is read only after schema initialization under the
+    /// Context or kernel's existing exclusive database lease.
+    pub(crate) fn workspace_store_identity(
+        &self,
+        external_lease: bool,
+    ) -> Result<Option<(std::path::PathBuf, uuid::Uuid)>, ContextError> {
+        let connection = self.locked_conn();
+        let Some(path) = connection.path().filter(|path| !path.is_empty()) else {
+            if self._storage_lease.is_some() || external_lease {
+                return Err(ContextError::StorageError("durable workspace datastore path is unavailable; refusing an ephemeral ownership namespace".into()));
+            }
+            return Ok(None);
+        };
+        if self._storage_lease.is_none() && !external_lease {
+            return Err(ContextError::StorageError(
+                "durable workspace namespace requires the database lease".into(),
+            ));
+        }
+        let metadata = crate::schema::read_storage_metadata(&connection)?;
+        let id = uuid::Uuid::parse_str(&metadata.installation_id).map_err(|_| {
+            ContextError::StorageError("workspace store identity is not an immutable UUID".into())
+        })?;
+        Ok(Some((std::path::PathBuf::from(path), id)))
+    }
+
     /// Lock the shared SQLite connection, recovering from a poisoned mutex.
     ///
     /// A panic while the guard is held poisons the mutex. Without recovery the
@@ -1236,6 +1264,7 @@ impl SqliteContextManager {
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fact_cache: Mutex::new(fact_index::FactCache::default()),
+            checkpoint_recovery: Arc::new(crate::telemetry::CheckpointRecoveryCounters::default()),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
             #[cfg(test)]
@@ -1275,6 +1304,7 @@ impl SqliteContextManager {
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fact_cache: Mutex::new(fact_index::FactCache::default()),
+            checkpoint_recovery: Arc::new(crate::telemetry::CheckpointRecoveryCounters::default()),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
             #[cfg(test)]
@@ -4310,6 +4340,7 @@ impl SqliteContextManager {
     ) -> Result<(), ContextError> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4352,7 +4383,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let text_content: String = tail_messages
             .iter()
-            .map(|m| m.content.as_str())
+            .map(|m| m.content.text_projection())
             .collect::<Vec<_>>()
             .join(" ");
         transaction.execute(
@@ -4366,6 +4397,20 @@ impl SqliteContextManager {
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(())
+    }
+
+    /// Load a conversation's messages.
+    pub fn conversation_owner(&self, id: &str) -> Result<AgentId, ContextError> {
+        let owner: String = self
+            .locked_conn()
+            .query_row(
+                "SELECT agent_id FROM conversations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        uuid::Uuid::parse_str(&owner)
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))
     }
 
     /// Load a conversation's messages.
@@ -4712,7 +4757,7 @@ impl SqliteContextManager {
                 &format!("WITH shared_spill_bytes AS ({}), context_bytes(agent_id, byte_count) AS (
                     SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM contexts
                     UNION ALL
-                    SELECT agent_id, SUM(LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0)) FROM facts GROUP BY agent_id
+                    SELECT agent_id, SUM({fact_bytes}) FROM facts INDEXED BY idx_facts_storage_bytes GROUP BY agent_id
                     UNION ALL
                     SELECT c.agent_id, LENGTH(CAST(c.messages_json AS BLOB)) + COALESCE(s.logical_bytes - 2, 0)
                         + CASE WHEN s.message_count > 0 AND json_array_length(c.messages_json) > 0 THEN 1 ELSE 0 END
@@ -4736,7 +4781,7 @@ impl SqliteContextManager {
                         'default'
                     ) = ?2 THEN byte_count ELSE 0 END), 0),
                     COALESCE(SUM(byte_count), 0)
-                FROM context_bytes",shared_spills::LOGICAL_SPILL_BYTES),
+                FROM context_bytes",shared_spills::LOGICAL_SPILL_BYTES, fact_bytes = fact_index::STORAGE_BYTE_EXPRESSION),
                 params![agent_id.to_string(), tenant_id],
                 |row| {
                     Ok((
@@ -4854,6 +4899,7 @@ impl SqliteContextManager {
             ));
         }
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         Self::purge_expired_spills_locked(&mut conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -5636,6 +5682,7 @@ impl SqliteContextManager {
         let json = serde_json::to_string(checkpoint)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -5777,7 +5824,52 @@ impl SqliteContextManager {
         agent_id: AgentId,
         tenant_id: &str,
     ) -> Result<StoredGenerationCheckpoint, ContextError> {
+        let mut observation = self.checkpoint_recovery_observation();
+        let result = self.claim_generation_checkpoint_observed(
+            checkpoint_id,
+            agent_id,
+            tenant_id,
+            &mut observation,
+        );
+        if result.is_ok() {
+            observation.recovered();
+        }
+        result
+    }
+
+    pub(crate) fn checkpoint_recovery_observation(
+        &self,
+    ) -> crate::telemetry::CheckpointRecoveryObservation {
+        self.checkpoint_recovery.start()
+    }
+
+    pub(crate) fn checkpoint_recovery_snapshot(
+        &self,
+    ) -> crate::telemetry::CheckpointRecoverySnapshot {
+        self.checkpoint_recovery.snapshot()
+    }
+
+    pub(crate) fn claim_generation_checkpoint_observed(
+        &self,
+        checkpoint_id: uuid::Uuid,
+        agent_id: AgentId,
+        tenant_id: &str,
+        observation: &mut crate::telemetry::CheckpointRecoveryObservation,
+    ) -> Result<StoredGenerationCheckpoint, ContextError> {
         let conn = self.locked_conn();
+        let stored_tenant = conn
+            .query_row(
+                "SELECT tenant_id FROM generation_checkpoints WHERE id=?1",
+                [checkpoint_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        observation.observed_foreign_tenant(
+            stored_tenant
+                .as_deref()
+                .is_some_and(|stored| stored != tenant_id),
+        );
         let changed = conn
             .execute(
                 "UPDATE generation_checkpoints SET status = 'resuming'
@@ -5824,7 +5916,8 @@ impl SqliteContextManager {
                 "checkpoint version {version} is incompatible with runtime version {GENERATION_CHECKPOINT_VERSION}"
             )));
         }
-        let checkpoint = match serde_json::from_str(&row.3) {
+        let checkpoint: crate::execution::GenerationCheckpoint = match serde_json::from_str(&row.3)
+        {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 let _ = conn.execute(
@@ -5836,6 +5929,15 @@ impl SqliteContextManager {
                 )));
             }
         };
+        if checkpoint.agent_id != agent_id {
+            let _ = conn.execute(
+                "UPDATE generation_checkpoints SET status='corrupt' WHERE id=?1",
+                [checkpoint_id.to_string()],
+            );
+            return Err(ContextError::RestoreFailed(
+                "checkpoint payload identity disagrees with its scoped record".into(),
+            ));
+        }
         Ok(StoredGenerationCheckpoint {
             metadata: GenerationCheckpointMetadata {
                 id: checkpoint_id,
@@ -7653,6 +7755,10 @@ impl SqliteContextManager {
 }
 
 #[cfg(test)]
+#[path = "context/storage_index_tests.rs"]
+mod storage_index_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -7890,6 +7996,81 @@ mod tests {
                 .unwrap();
             assert_eq!(status, expected);
         }
+    }
+
+    #[test]
+    fn checkpoint_recovery_sli_counts_foreign_rejections_and_refuses_payload_identity_corruption() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let foreign_agent = uuid::Uuid::new_v4();
+        let foreign = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(foreign_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        manager
+            .locked_conn()
+            .execute(
+                "UPDATE generation_checkpoints SET tenant_id='foreign-fixture' WHERE id=?1",
+                [foreign.to_string()],
+            )
+            .unwrap();
+        for _ in 0..100 {
+            assert!(manager
+                .claim_generation_checkpoint(foreign, foreign_agent, DEFAULT_TENANT)
+                .is_err());
+        }
+        let restored = manager
+            .claim_generation_checkpoint(foreign, foreign_agent, "foreign-fixture")
+            .unwrap();
+        assert_eq!(restored.checkpoint.agent_id, foreign_agent);
+        let owner = uuid::Uuid::new_v4();
+        let corrupt = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(owner),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let mismatched_payload =
+            serde_json::to_string(&sample_generation_checkpoint(foreign_agent)).unwrap();
+        manager
+            .locked_conn()
+            .execute(
+                "UPDATE generation_checkpoints SET checkpoint_json=?1 WHERE id=?2",
+                params![mismatched_payload, corrupt.to_string()],
+            )
+            .unwrap();
+        let error = manager
+            .claim_generation_checkpoint(corrupt, owner, DEFAULT_TENANT)
+            .unwrap_err();
+        assert!(error.to_string().contains("payload identity"));
+        let status: String = manager
+            .locked_conn()
+            .query_row(
+                "SELECT status FROM generation_checkpoints WHERE id=?1",
+                [corrupt.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "corrupt");
+        let snapshot = manager.checkpoint_recovery_snapshot();
+        assert_eq!(snapshot.attempted, 102);
+        assert_eq!(snapshot.recovered, 1);
+        assert_eq!(snapshot.safe_rejected, 101);
+        assert_eq!(
+            snapshot.recovered + snapshot.safe_rejected,
+            snapshot.attempted
+        );
+        assert_eq!(snapshot.cross_tenant_attempts, 100);
+        assert_eq!(snapshot.cross_tenant_recoveries, 0);
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains("foreign-fixture") && !rendered.contains("sensitive prompt"));
     }
 
     #[cfg(unix)]
@@ -9887,6 +10068,7 @@ mod tests {
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fact_cache: Mutex::new(fact_index::FactCache::default()),
+            checkpoint_recovery: Arc::new(crate::telemetry::CheckpointRecoveryCounters::default()),
             fail_next_agent_save: AtomicBool::new(false),
             fail_agent_status_update_after: AtomicUsize::new(0),
         };
@@ -9952,15 +10134,18 @@ mod tests {
 
     struct QuotaTestDatabase {
         path: std::path::PathBuf,
+        _directory: tempfile::TempDir,
     }
 
     impl QuotaTestDatabase {
         fn new(label: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
             Self {
-                path: std::env::temp_dir().join(format!(
+                path: directory.path().join(format!(
                     "aiagentos-quota-{label}-{}.db",
                     uuid::Uuid::new_v4()
                 )),
+                _directory: directory,
             }
         }
     }

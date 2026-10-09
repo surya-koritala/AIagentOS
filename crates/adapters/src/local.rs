@@ -45,7 +45,8 @@ impl LocalSession {
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
-                let mut obj = serde_json::json!({"role": m.role, "content": m.content});
+                let mut obj =
+                    serde_json::json!({"role": m.role, "content": m.content.text_projection()});
                 if let Some(ref calls) = m.tool_calls {
                     obj["tool_calls"] = serde_json::json!(calls
                         .iter()
@@ -134,6 +135,7 @@ impl LocalSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: Option<ProviderEventSink>,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.attempts.store(0, std::sync::atomic::Ordering::Release);
         let send = async {
             let body = Self::body(&messages, tools, options, &self.model, true);
@@ -185,6 +187,7 @@ impl LlmSession for LocalSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.attempts.store(0, std::sync::atomic::Ordering::Release);
         let body = Self::body(&messages, tools, options, &self.model, false);
 
@@ -296,6 +299,7 @@ impl LlmSession for LocalSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.stream(messages, tools, options, cancellation, None)
             .await
     }
@@ -307,6 +311,7 @@ impl LlmSession for LocalSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.stream(messages, tools, options, cancellation, Some(events))
             .await
     }
@@ -343,6 +348,7 @@ impl LlmProviderAdapter for LocalLlmAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            model_discovery: true,
             native_streaming: true,
             prompt_cancellation: true,
             tool_calls: true,
@@ -354,6 +360,16 @@ impl LlmProviderAdapter for LocalLlmAdapter {
 
     fn max_provider_attempts(&self) -> u32 {
         2
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
+        crate::model_discovery::discover(
+            &self.id,
+            &self.base_url,
+            crate::model_discovery::DiscoveryApi::Ollama,
+            "",
+        )
+        .await
     }
 
     async fn is_available(&self) -> bool {
@@ -383,7 +399,7 @@ impl LlmProviderAdapter for LocalLlmAdapter {
         Some(StandardMessage {
             provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
-            content: value.get("content")?.as_str().unwrap_or("").to_string(),
+            content: value.get("content")?.as_str().unwrap_or("").into(),
             tool_call_id: None,
             tool_calls: None,
         })

@@ -9,7 +9,7 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenant TENANT_ID] \
-         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|clone|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <tenant-create|tenants|tenant-revoke|user-create|users|user-revoke|api-key-issue|api-keys|api-key-revoke|create|clone|list|inspect|message|message-content|stream|stream-content|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|models|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] tenant-create NAME\n\
@@ -56,6 +56,7 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] checkpoint-delete AGENT_ID CHECKPOINT_ID\n\
            agentctl [SERVER OPTIONS] capabilities AGENT_ID\n\
            agentctl [SERVER OPTIONS] providers\n\
+           agentctl [SERVER OPTIONS] models PROVIDER_ID\n\
            agentctl [SERVER OPTIONS] metrics\n\
            agentctl [SERVER OPTIONS] protocol\n\
          \n\
@@ -64,7 +65,9 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl policy-explain POLICY_FILE --subject SUBJECT --action ACTION --object OBJECT\n\
          \n\
          system audit commands:\n\
-           agentctl [SERVER OPTIONS] gate-stats\n\
+           agentctl [SERVER OPTIONS] gate-stats [AGENT_ID]\n\
+           With AGENT_ID: owned-agent ReadOnly counters; without: System-wide counters.\n\
+           Counters are process-local and reset on restart.\n\
            agentctl [SERVER OPTIONS] node-control-audit [LIMIT]\n\
            agentctl [SERVER OPTIONS] cluster-membership-audit [LIMIT]\n\
            agentctl [SERVER OPTIONS] cluster-certificate-rollout-audit [LIMIT]\n\
@@ -83,6 +86,8 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] package-run NAME\n\
          \n\
          storage commands:\n\
+           agentctl workspace-ownership CONFIG_FILE list\n\
+           agentctl workspace-ownership CONFIG_FILE retain AGENT_UUID --confirm-offline\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
            agentctl [SERVER OPTIONS] backup-retention BACKUP_ROOT KEEP_LATEST MAX_AGE_SECONDS <--dry-run|--confirm>\n\
            agentctl [SERVER OPTIONS] backup-status\n\
@@ -92,6 +97,7 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl backup-verify BACKUP_DIR [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] [--require-anchor ANCHOR_FILE]\n\
            agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] [--require-anchor ANCHOR_FILE] --confirm-offline\n\
            agentctl backup-disaster-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE --confirm-offline\n\
+           agentctl backup-recovery-qualify CONFIG_FILE --confirm-offline\n\
            agentctl backup-corruption-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE EXPECTED_INSTALLATION_ID --confirm-offline\n\
            agentctl backup-remote-publish BACKUP_DIR PUBLIC_TRUST_FILE ANCHOR_FILE ENDPOINT BUCKET PREFIX RETAIN_UNTIL [--region REGION] [--storage-key KEY_FILE] [--allow-loopback-http] --confirm-compliance-lock\n\
            agentctl backup-remote-fetch ENDPOINT BUCKET PREFIX PUBLICATION_REPORT DEST_BACKUP_DIR PUBLIC_TRUST_FILE ANCHOR_FILE [--region REGION] [--storage-key KEY_FILE] [--allow-loopback-http]\n\
@@ -106,6 +112,33 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm AGENT_ID\n\
            agentctl [SERVER OPTIONS] erase-user USER_ID --confirm USER_ID\n\
            agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm TENANT_ID";
+
+fn read_message_content(source: &str) -> agent_sdk::MessageContent {
+    let mut bytes = Vec::new();
+    let limit = kernel::message_content::MAX_MESSAGE_CONTENT_BYTES as u64 + 1;
+    if source == "-" {
+        std::io::stdin()
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|_| content_input_error("could not read content input"));
+    } else {
+        std::fs::File::open(source)
+            .unwrap_or_else(|_| content_input_error("could not open content input"))
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|_| content_input_error("could not read content input"));
+    }
+    if bytes.len() as u64 == limit {
+        content_input_error("message content input exceeds byte limit");
+    }
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| content_input_error("invalid message content input"))
+}
+
+fn content_input_error(message: &'static str) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(1);
+}
 
 /// Usage error. Diagnostics go to stderr with a non-zero exit so a mistyped
 /// command can never be mistaken for success by a script.
@@ -432,6 +465,60 @@ type CommandArgs = std::iter::Peekable<std::iter::Skip<std::vec::IntoIter<String
 
 async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
     match command {
+        "workspace-ownership" => {
+            let config_file = args.next().unwrap_or_else(|| usage());
+            let action = args.next().unwrap_or_else(|| usage());
+            let target = match action.as_str() {
+                "list" if args.next().is_none() => None,
+                "retain" => {
+                    let id = args.next().unwrap_or_else(|| usage());
+                    let id = id.parse::<kernel::AgentId>().unwrap_or_else(|_| {
+                        fail_operator("workspace ownership requires a recorded agent UUID".into())
+                    });
+                    if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some()
+                    {
+                        usage();
+                    }
+                    Some(id)
+                }
+                _ => usage(),
+            };
+            let path = std::path::Path::new(&config_file);
+            if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+                fail_operator("workspace ownership requires an existing configuration file".into());
+            }
+            let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| {
+                fail_operator(format!("invalid local configuration: {error}"))
+            });
+            // Startup acquires the existing exclusive database lease; a live
+            // runtime cannot race this purely local maintenance command.
+            let kernel = kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&config)
+                .unwrap_or_else(|error| {
+                    fail_operator(format!(
+                        "local workspace ownership maintenance failed: {error}"
+                    ))
+                });
+            kernel
+                .rehydrate_agents()
+                .await
+                .unwrap_or_else(|error| fail_operator(error.to_string()));
+            if let Some(id) = target {
+                kernel
+                    .retain_legacy_workspace_as_operator(id)
+                    .await
+                    .unwrap_or_else(|error| fail_operator(error.to_string()));
+                print_json(
+                    &serde_json::json!({"agent_id":id,"resolution":"retain_as_operator_workspace","automatic_deletion":false}),
+                    "workspace ownership resolution",
+                );
+            } else {
+                let status = kernel
+                    .workspace_ownership_status()
+                    .unwrap_or_else(|error| fail_operator(error.to_string()));
+                print_json(&status, "workspace ownership status");
+            }
+            true
+        }
         "policy-validate" => {
             let path = args.next().unwrap_or_else(|| usage());
             if args.next().is_some() {
@@ -606,6 +693,25 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
             }
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "restore report");
+            true
+        }
+        "backup-recovery-qualify" => {
+            let config_file = args.next().unwrap_or_else(|| usage());
+            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
+                usage();
+            }
+            let path = std::path::Path::new(&config_file);
+            if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+                fail_operator(
+                    "recovery qualification requires an existing configuration file".into(),
+                );
+            }
+            let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| {
+                fail_operator(format!("failed to load recovery configuration: {error}"))
+            });
+            let report = kernel::storage::qualify_storage_recovery_from_config(&config)
+                .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "recovery qualification report");
             true
         }
         "backup-disaster-recover" => {
@@ -1114,6 +1220,44 @@ async fn run_online(
             );
             return;
         }
+        "message-content" => {
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let source = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let content = read_message_content(&source);
+            let result = client
+                .send_message_content(agent_id, content)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&result, "agent message");
+            return;
+        }
+        "stream-content" => {
+            let request_id = args.next().unwrap_or_else(|| usage());
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let source = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let content = read_message_content(&source);
+            let result = client
+                .send_message_content_stream(request_id.clone(), agent_id, content, |event| {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"event","request_id":request_id,"event":event})
+                    );
+                    let _ = std::io::stdout().flush();
+                })
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::json!({"type":"completed","request_id":request_id,"result":result})
+            );
+            return;
+        }
         "message" => {
             let agent_id = args.next().unwrap_or_else(|| usage());
             let message = args.next().unwrap_or_else(|| usage());
@@ -1555,6 +1699,18 @@ async fn run_online(
             print_json(&providers, "provider health");
             return;
         }
+        "models" => {
+            let provider_id = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let catalog = client
+                .list_provider_models(provider_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&catalog, "configured provider models");
+            return;
+        }
         "metrics" => {
             if args.next().is_some() {
                 usage();
@@ -1572,13 +1728,15 @@ async fn run_online(
             return;
         }
         "gate-stats" => {
+            let agent_id = args.next();
             if args.next().is_some() {
                 usage();
             }
-            let stats = client
-                .gate_stats()
-                .await
-                .unwrap_or_else(|error| fail(error));
+            let stats = match agent_id {
+                Some(agent_id) => client.agent_gate_stats(agent_id).await,
+                None => client.gate_stats().await,
+            }
+            .unwrap_or_else(|error| fail(error));
             print_json(&stats, "gate enforcement counters");
             return;
         }

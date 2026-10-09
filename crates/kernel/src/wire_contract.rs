@@ -19,6 +19,7 @@ use crate::wire_io::{
 /// Stable feature identifiers announced by `hello`.
 pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
+    "agent_gate_statistics",
     "authorized_cluster_membership",
     "bounded_certificate_rollout",
     "cluster_ownership_leases",
@@ -51,6 +52,8 @@ pub const WIRE_FEATURES: &[&str] = &[
     "namespace_mounts",
     "data_vfs",
     "durable_cloning",
+    "model_discovery",
+    "image_input",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -99,6 +102,7 @@ enum JsonKind {
     StringOrNull,
     IntegerOrNull,
     ObjectOrNull,
+    StringOrArray,
 }
 
 impl JsonKind {
@@ -113,6 +117,7 @@ impl JsonKind {
             Self::StringOrNull => json!({"type": ["string", "null"]}),
             Self::IntegerOrNull => json!({"type": ["integer", "null"]}),
             Self::ObjectOrNull => json!({"type": ["object", "null"]}),
+            Self::StringOrArray => json!({"type": ["string", "array"]}),
         }
     }
 }
@@ -157,6 +162,7 @@ const X: JsonKind = JsonKind::Any;
 const N: JsonKind = JsonKind::StringOrNull;
 const NI: JsonKind = JsonKind::IntegerOrNull;
 const ON: JsonKind = JsonKind::ObjectOrNull;
+const SA: JsonKind = JsonKind::StringOrArray;
 
 const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
@@ -426,6 +432,21 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "send_message_content",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("content", SA),
+        ],
+    },
+    Variant {
+        tag: "send_message_content_stream",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("agent_id", S),
+            Field::required("content", SA),
+        ],
+    },
+    Variant {
         tag: "send_message_stream",
         fields: &[
             Field::required("request_id", S),
@@ -479,6 +500,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "list_providers",
         fields: &[],
+    },
+    Variant {
+        tag: "list_provider_models",
+        fields: &[Field::required("provider_id", S)],
     },
     Variant {
         tag: "memory_store",
@@ -939,6 +964,9 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                 || !matches!(
                     variant.tag,
                     "send_message_stream"
+                        | "list_provider_models"
+                        | "send_message_content"
+                        | "send_message_content_stream"
                         | "cancel_request"
                         | "enforce_storage_backup_retention"
                         | "storage_backup_status"
@@ -1048,6 +1076,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     (_, JsonKind::Boolean) => Value::Bool(true),
                     (_, JsonKind::Object) | (_, JsonKind::Any) => Value::Object(Map::new()),
                     (_, JsonKind::Array) => Value::Array(Vec::new()),
+                    (_, JsonKind::StringOrArray) => serde_json::json!([{"type":"text","text":"fixture"}]),
                     (
                         _,
                         JsonKind::StringOrNull
@@ -1229,11 +1258,16 @@ const REPLY_VARIANTS: &[Variant] = &[
             Field::required("pid", I),
             Field::required("capabilities", A),
             Field::required("namespaces", A),
+            Field::optional("gate_decisions", O),
         ],
     },
     Variant {
         tag: "providers",
         fields: &[Field::required("providers", A)],
+    },
+    Variant {
+        tag: "provider_models",
+        fields: &[Field::required("catalog", O)],
     },
     Variant {
         tag: "memory_stored",
@@ -1633,6 +1667,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_gate_statistics_is_an_additive_discoverable_reply_field() {
+        let description = protocol_description();
+        assert_eq!(description.protocol_version, 2);
+        assert!(description
+            .features
+            .contains(&"agent_gate_statistics".to_string()));
+        let agent_info = description.reply_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["status"]["const"] == "agent_info")
+            .unwrap();
+        assert_eq!(agent_info["properties"]["gate_decisions"]["type"], "object");
+        assert!(!agent_info["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("gate_decisions")));
+        let reply = crate::syscall_server::SyscallReply::AgentInfo {
+            pid: 1,
+            capabilities: vec![],
+            namespaces: vec![],
+            gate_decisions: crate::syscall_gate::GateStats::default(),
+        };
+        let encoded = serde_json::to_value(reply).unwrap();
+        let counters = encoded["gate_decisions"].as_object().unwrap();
+        assert_eq!(counters.len(), 8);
+        for field in [
+            "allowed",
+            "denied_capability",
+            "denied_mac",
+            "denied_approval",
+            "denied_cgroup",
+            "denied_namespace",
+            "denied_unknown",
+            "audited",
+        ] {
+            assert_eq!(counters[field], 0);
+        }
+    }
+
+    #[test]
     fn schemas_have_unique_request_reply_and_event_tags() {
         let description = protocol_description();
         for (schema, tag) in [
@@ -1695,6 +1770,21 @@ mod tests {
 
     #[test]
     fn versioned_golden_fixtures_parse_with_the_public_types() {
+        let agent: crate::syscall_server::SyscallReply =
+            serde_json::from_str(include_str!("../../../protocol/v2/agent-info.json")).unwrap();
+        assert!(matches!(
+            agent,
+            crate::syscall_server::SyscallReply::AgentInfo {
+                gate_decisions: crate::syscall_gate::GateStats {
+                    allowed: 1,
+                    denied_unknown: 6,
+                    denied_namespace: 7,
+                    ..
+                },
+                ..
+            }
+        ));
+
         let v1: crate::syscall_server::SyscallReply =
             serde_json::from_str(include_str!("../../../protocol/v1/error.json")).unwrap();
         assert!(matches!(
@@ -1817,8 +1907,37 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 128);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 131);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
+    }
+
+    #[test]
+    fn model_discovery_wire_contract_is_v2_typed_and_identifier_only() {
+        let description = protocol_description();
+        assert!(description.features.contains(&"model_discovery".into()));
+        let requests = tags(&description.request_schema, "op");
+        let replies = tags(&description.reply_schema, "status");
+        assert!(requests.contains(&"list_provider_models".into()));
+        assert!(replies.contains(&"provider_models".into()));
+        let catalog: crate::syscall_server::SyscallReply =
+            serde_json::from_str(include_str!("../../../protocol/v2/provider-models.json"))
+                .unwrap();
+        assert!(
+            matches!(catalog, crate::syscall_server::SyscallReply::ProviderModels { catalog }
+            if catalog.provider_id == "openai" && catalog.models == ["fixture-model"])
+        );
+        let unsupported: crate::syscall_server::SyscallReply = serde_json::from_str(include_str!(
+            "../../../protocol/v2/unsupported-model-discovery.json"
+        ))
+        .unwrap();
+        assert!(matches!(
+            unsupported,
+            crate::syscall_server::SyscallReply::TypedError {
+                code: crate::syscall_server::WireErrorCode::Unsupported,
+                retryable: false,
+                ..
+            }
+        ));
     }
 }

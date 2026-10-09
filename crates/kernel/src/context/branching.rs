@@ -306,6 +306,7 @@ fn seal_tail(
     tenant: &str,
     base: Option<&Node>,
 ) -> Result<ExecutionSnapshotMetadata, ContextError> {
+    crate::schema::require_current_writer(conn)?;
     let (count,digest,tail_bytes): (usize,String,u64) = conn.query_row(
         "SELECT json_array_length(messages_json),messages_hash,LENGTH(CAST(messages_json AS BLOB)) FROM conversations WHERE id = ?1",
         [conversation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))
@@ -339,11 +340,25 @@ fn seal_tail(
         shared_spills::attach_tail(conn, &metadata.id.to_string(), agent, tenant, conversation)?;
     conn.execute("UPDATE execution_context_snapshots SET spill_manifest_hash = ?1,node_hash = ?2 WHERE id = ?3",
         params![&manifest,node_hash(&metadata,tenant,&parent,&digest,&manifest)?,metadata.id.to_string()]).map_err(sql_error)?;
+    let payload: String = conn
+        .query_row(
+            "SELECT payload_json FROM execution_context_snapshots WHERE id = ?1",
+            [metadata.id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let messages: Vec<StandardMessage> =
+        serde_json::from_str(&payload).map_err(|_| failed("invalid execution snapshot content"))?;
+    let projection = messages
+        .iter()
+        .map(|message| message.content.text_projection())
+        .collect::<Vec<_>>()
+        .join(" ");
     conn.execute(
-        "INSERT INTO execution_snapshot_fts(snapshot_id,content)
-         SELECT id,COALESCE((SELECT group_concat(json_extract(value,'$.content'),' ') FROM json_each(payload_json)),'')
-         FROM execution_context_snapshots WHERE id = ?1",[metadata.id.to_string()]
-    ).map_err(sql_error)?;
+        "INSERT INTO execution_snapshot_fts(snapshot_id,content) VALUES (?1,?2)",
+        params![metadata.id.to_string(), projection],
+    )
+    .map_err(sql_error)?;
     crash_multi_table_mutation_after_step_for_test("fork.snapshot");
     Ok(metadata)
 }
@@ -506,6 +521,7 @@ impl SqliteContextManager {
         child: AgentId,
         target: &str,
     ) -> Result<ExecutionSnapshotMetadata, ContextError> {
+        crate::schema::require_current_writer(tx)?;
         let owned_tenant = |agent: AgentId| -> Result<String, ContextError> {
             tx.query_row(
                 "SELECT tenant_id FROM agents WHERE id = ?1",

@@ -242,7 +242,7 @@ pub(super) fn response(
     }
     let usage = &json["usageMetadata"];
     Ok(LlmResponse {
-        content: message.content,
+        content: message.content.text_only(provider)?,
         finish_reason: candidate["finishReason"].as_str().map(str::to_string),
         tokens_used: crate::json_usage_u32(&usage["totalTokenCount"]),
         usage: LlmUsage::reported(
@@ -325,7 +325,7 @@ pub(super) fn single_message(
             Ok(json!({"role": "model", "parts": parts}))
         }
         "user" | "system" if message.provider_metadata.is_none() => {
-            Ok(json!({"role": "user", "parts": [{"text": message.content}]}))
+            Ok(json!({"role": "user", "parts": crate::vision::gemini_parts(&message.content)}))
         }
         _ => Err(invalid("message needs complete history for translation")),
     }
@@ -383,7 +383,7 @@ pub(super) fn request(
                 if message.role == "system" {
                     system.push(json!({"text": message.content}));
                 } else {
-                    contents.push(json!({"role": "user", "parts": [{"text": message.content}]}));
+                    contents.push(json!({"role": "user", "parts": crate::vision::gemini_parts(&message.content)}));
                 }
             }
             "assistant" | "model" => {
@@ -435,8 +435,8 @@ pub(super) fn request(
                 let (name, native_id, order) = pending
                     .remove(id)
                     .ok_or_else(|| invalid("orphan or duplicate tool result"))?;
-                let result = serde_json::from_str::<Value>(&message.content)
-                    .unwrap_or_else(|_| Value::String(message.content.clone()));
+                let result = serde_json::from_str::<Value>(&message.content.text_only(provider)?)
+                    .unwrap_or_else(|_| Value::String(message.content.text_projection()));
                 let result = if result.is_object() {
                     result
                 } else {

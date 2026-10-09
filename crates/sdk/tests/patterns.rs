@@ -404,7 +404,8 @@ async fn executor_path_allows(
         .find(|message| message.role == "tool")
         .expect("executor must record a tool result")
         .content
-        .as_str();
+        .legacy_text()
+        .expect("legacy pattern fixture text");
     if result.contains("denied by kernel") {
         return false;
     }

@@ -10,6 +10,9 @@ mod agent_lifecycle_props;
 mod lifecycle_coordinator;
 
 #[cfg(test)]
+mod managed_workspace_ownership;
+
+#[cfg(test)]
 mod durable_checkpoints;
 
 #[cfg(test)]
@@ -68,6 +71,8 @@ mod e2e_pipeline;
 
 #[cfg(test)]
 mod gemini_history;
+#[cfg(test)]
+mod image_input;
 
 #[cfg(test)]
 mod provider_policy;

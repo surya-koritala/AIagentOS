@@ -733,15 +733,18 @@ mod tests {
 
     struct TestDatabase {
         path: std::path::PathBuf,
+        _directory: tempfile::TempDir,
     }
 
     impl TestDatabase {
         fn new(label: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
             Self {
-                path: std::env::temp_dir().join(format!(
+                path: directory.path().join(format!(
                     "aiagentos-accounting-integrity-{label}-{}.db",
                     uuid::Uuid::new_v4()
                 )),
+                _directory: directory,
             }
         }
     }

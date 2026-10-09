@@ -182,6 +182,9 @@ pub struct MetricsSnapshot {
     pub telemetry_contract_version: u32,
     /// Bounded request outcomes and cumulative wall-clock duration.
     pub requests: RequestTelemetrySnapshot,
+    pub provider_outcomes: crate::telemetry::ProviderOutcomeSnapshot,
+    pub checkpoint_recovery: crate::telemetry::CheckpointRecoverySnapshot,
+    pub denial_probes: crate::telemetry::DenialProbeSnapshot,
     /// Syscall-gate enforcement counters.
     pub gate: GateStats,
     /// Total agents the kernel hosts.
@@ -236,6 +239,8 @@ pub struct MetricsSnapshot {
     pub quota_denied_cgroup_tokens: u64,
     pub quota_denied_migration_fence: u64,
     pub quota_storage_healthy: bool,
+    pub quota_storage_healthy_nanoseconds_total: u64,
+    pub quota_storage_unhealthy_nanoseconds_total: u64,
     /// Whether the kernel-owned SQLite store is protected by SQLCipher.
     pub storage_encryption_enabled: bool,
     /// Automatic local-backup health. No filesystem path is used as a label.
@@ -316,10 +321,14 @@ impl MetricsSnapshot {
             .try_lock()
             .map(|init| init.metrics())
             .unwrap_or_default();
+        let (quota_healthy_nanoseconds, quota_unhealthy_nanoseconds) =
+            kernel.rate_limiter.health_duration_nanoseconds();
         Self {
             telemetry_contract_version: TELEMETRY_CONTRACT_VERSION,
             requests: kernel.request_telemetry.snapshot(),
+            checkpoint_recovery: kernel.context_manager.checkpoint_recovery_snapshot(),
             gate,
+            denial_probes: kernel.syscall_gate.denial_probe_stats(),
             agent_count,
             running_agents: running,
             live_agents: agent_count.saturating_sub(stopped),
@@ -343,6 +352,7 @@ impl MetricsSnapshot {
             llm_requests_waiting: llm.waiting as u64,
             llm_core_capacity: llm.cores as u64,
             llm_admitted_total: llm.admitted_total,
+            provider_outcomes: kernel.provider_outcomes.snapshot(),
             llm_cancelled_total: llm.cancelled_total,
             llm_wait_ns_total: llm.wait_ns_total,
             llm_run_ns_total: llm.run_ns_total,
@@ -361,6 +371,8 @@ impl MetricsSnapshot {
             quota_denied_cgroup_tokens: quota.denied_cgroup_tokens,
             quota_denied_migration_fence: quota.denied_migration_fence,
             quota_storage_healthy: quota.healthy,
+            quota_storage_healthy_nanoseconds_total: quota_healthy_nanoseconds,
+            quota_storage_unhealthy_nanoseconds_total: quota_unhealthy_nanoseconds,
             storage_encryption_enabled: kernel
                 .context_manager
                 .storage_encryption_key_id()
@@ -409,6 +421,21 @@ impl MetricsSnapshot {
             "agentos_telemetry_contract_info{{version=\"{}\"}} 1\n",
             self.telemetry_contract_version
         ));
+        out.push_str("# HELP agentos_build_source_sha1 Compiled Git source identity as five fixed 32-bit segments.\n");
+        out.push_str("# TYPE agentos_build_source_sha1 gauge\n");
+        let source = env!("AGENTOS_COMPILED_SOURCE_SHA");
+        for part in 0..5 {
+            let value = u32::from_str_radix(&source[part * 8..part * 8 + 8], 16).unwrap_or(0);
+            out.push_str(&format!(
+                "agentos_build_source_sha1{{part=\"{part}\"}} {value}\n"
+            ));
+        }
+        out.push_str("# HELP agentos_build_source_verified Whether native Git or packaged Git object proof verified the compiled source.\n");
+        out.push_str("# TYPE agentos_build_source_verified gauge\n");
+        out.push_str(&format!(
+            "agentos_build_source_verified {}\n",
+            env!("AGENTOS_COMPILED_SOURCE_VERIFIED")
+        ));
         out.push_str("# HELP agentos_requests_in_flight Requests currently executing.\n");
         out.push_str("# TYPE agentos_requests_in_flight gauge\n");
         out.push_str(&format!(
@@ -456,6 +483,65 @@ impl MetricsSnapshot {
             ));
         }
 
+        out.push_str("# HELP agentos_request_class_total Completed requests by fixed control or agent latency class.\n");
+        out.push_str("# TYPE agentos_request_class_total counter\n");
+        out.push_str("# HELP agentos_request_class_duration_seconds Wall-clock request latency by fixed control or agent class.\n");
+        out.push_str("# TYPE agentos_request_class_duration_seconds histogram\n");
+        for sample in self.requests.request_classes() {
+            let class = sample.class.as_str();
+            out.push_str(&format!(
+                "agentos_request_class_total{{class=\"{class}\"}} {}\n",
+                sample.requests
+            ));
+            out.push_str(&format!(
+                "agentos_request_class_duration_seconds_sum{{class=\"{class}\"}} {:.6}\n",
+                sample.duration_microseconds_total as f64 / 1_000_000.0
+            ));
+            out.push_str(&format!(
+                "agentos_request_class_duration_seconds_count{{class=\"{class}\"}} {}\n",
+                sample.requests
+            ));
+            for (boundary, count) in REQUEST_DURATION_BUCKETS_MICROSECONDS
+                .iter()
+                .zip(sample.duration_bucket_counts)
+            {
+                out.push_str(&format!("agentos_request_class_duration_seconds_bucket{{class=\"{class}\",le=\"{:.3}\"}} {count}\n", *boundary as f64 / 1_000_000.0));
+            }
+            out.push_str(&format!("agentos_request_class_duration_seconds_bucket{{class=\"{class}\",le=\"+Inf\"}} {}\n", sample.requests));
+        }
+
+        out.push_str("# HELP agentos_checkpoint_recovery_attempts_total Completed checkpoint restoration attempts.\n");
+        out.push_str("# TYPE agentos_checkpoint_recovery_attempts_total counter\n");
+        out.push_str(&format!(
+            "agentos_checkpoint_recovery_attempts_total {}\n",
+            self.checkpoint_recovery.attempted
+        ));
+        out.push_str("# HELP agentos_checkpoint_recovery_total Completed checkpoint restorations by fixed outcome.\n");
+        out.push_str("# TYPE agentos_checkpoint_recovery_total counter\n");
+        for (outcome, count) in [
+            ("recovered", self.checkpoint_recovery.recovered),
+            ("safe_rejected", self.checkpoint_recovery.safe_rejected),
+        ] {
+            out.push_str(&format!(
+                "agentos_checkpoint_recovery_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+        for (kind, count) in [
+            ("attempts", self.checkpoint_recovery.cross_tenant_attempts),
+            (
+                "recoveries",
+                self.checkpoint_recovery.cross_tenant_recoveries,
+            ),
+        ] {
+            out.push_str(&format!("# HELP agentos_checkpoint_cross_tenant_{kind}_total Observed foreign-tenant checkpoint {kind}.\n"));
+            out.push_str(&format!(
+                "# TYPE agentos_checkpoint_cross_tenant_{kind}_total counter\n"
+            ));
+            out.push_str(&format!(
+                "agentos_checkpoint_cross_tenant_{kind}_total {count}\n"
+            ));
+        }
+
         // --- Syscall-gate enforcement: one counter family, labelled by result.
         out.push_str(
             "# HELP agentos_syscall_gate_total Tool-call decisions made by the syscall gate, by result.\n",
@@ -500,6 +586,26 @@ impl MetricsSnapshot {
             "agentos_syscall_gate_audited_total {}\n",
             g.audited
         ));
+
+        for (metric, count) in [
+            (
+                "adversarial_attempts",
+                self.denial_probes.adversarial_attempts,
+            ),
+            ("unexpected_allows", self.denial_probes.unexpected_allows),
+            (
+                "tenant_boundary_attempts",
+                self.denial_probes.tenant_boundary_attempts,
+            ),
+            (
+                "confirmed_violations",
+                self.denial_probes.confirmed_violations,
+            ),
+        ] {
+            out.push_str(&format!("# HELP agentos_{metric}_total Explicit completed expected-denial probe {metric}.\n"));
+            out.push_str(&format!("# TYPE agentos_{metric}_total counter\n"));
+            out.push_str(&format!("agentos_{metric}_total {count}\n"));
+        }
 
         // --- Agent population.
         out.push_str("# HELP agentos_agents Total agents the kernel hosts.\n");
@@ -642,6 +748,19 @@ impl MetricsSnapshot {
             ));
         }
 
+        out.push_str("# HELP agentos_llm_requests_total Observed admitted provider adapter invocations by fixed outcome.\n");
+        out.push_str("# TYPE agentos_llm_requests_total counter\n");
+        for (outcome, count) in [
+            ("success", self.provider_outcomes.success),
+            ("failed", self.provider_outcomes.failed),
+            ("timed_out", self.provider_outcomes.timed_out),
+            ("cancelled", self.provider_outcomes.cancelled),
+        ] {
+            out.push_str(&format!(
+                "agentos_llm_requests_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+
         out.push_str("# HELP agentos_llm_cores LLM request scheduler cores by state.\n");
         out.push_str("# TYPE agentos_llm_cores gauge\n");
         out.push_str(&format!(
@@ -697,6 +816,19 @@ impl MetricsSnapshot {
             "# HELP agentos_quota_storage_healthy Whether durable quota accounting is healthy.\n",
         );
         out.push_str("# TYPE agentos_quota_storage_healthy gauge\n");
+        for (state, value) in [
+            ("healthy", self.quota_storage_healthy_nanoseconds_total),
+            ("unhealthy", self.quota_storage_unhealthy_nanoseconds_total),
+        ] {
+            out.push_str(&format!("# HELP agentos_quota_storage_{state}_seconds_total Monotonic time with quota ledger health in the {state} state since startup.\n"));
+            out.push_str(&format!(
+                "# TYPE agentos_quota_storage_{state}_seconds_total counter\n"
+            ));
+            out.push_str(&format!(
+                "agentos_quota_storage_{state}_seconds_total {:.9}\n",
+                value as f64 / 1_000_000_000.0
+            ));
+        }
         out.push_str(&format!(
             "agentos_quota_storage_healthy {}\n",
             u8::from(self.quota_storage_healthy)
@@ -948,6 +1080,25 @@ mod tests {
         MetricsSnapshot {
             telemetry_contract_version: TELEMETRY_CONTRACT_VERSION,
             requests,
+            provider_outcomes: crate::telemetry::ProviderOutcomeSnapshot {
+                success: 4,
+                failed: 2,
+                timed_out: 1,
+                cancelled: 3,
+            },
+            checkpoint_recovery: crate::telemetry::CheckpointRecoverySnapshot {
+                attempted: 5,
+                recovered: 3,
+                safe_rejected: 2,
+                cross_tenant_attempts: 1,
+                cross_tenant_recoveries: 0,
+            },
+            denial_probes: crate::telemetry::DenialProbeSnapshot {
+                adversarial_attempts: 100,
+                unexpected_allows: 0,
+                tenant_boundary_attempts: 100,
+                confirmed_violations: 0,
+            },
             gate: GateStats {
                 allowed: 5,
                 denied_capability: 2,
@@ -999,6 +1150,8 @@ mod tests {
             quota_denied_cgroup_tokens: 8,
             quota_denied_migration_fence: 9,
             quota_storage_healthy: true,
+            quota_storage_healthy_nanoseconds_total: 2_250_000_000,
+            quota_storage_unhealthy_nanoseconds_total: 125_000_000,
             storage_encryption_enabled: true,
             backup_scheduler_enabled: true,
             backup_signing_enabled: true,
@@ -1093,7 +1246,7 @@ mod tests {
     #[test]
     fn render_reflects_snapshot_values() {
         let text = sample().render_prometheus();
-        assert!(text.contains("agentos_telemetry_contract_info{version=\"1\"} 1"));
+        assert!(text.contains("agentos_telemetry_contract_info{version=\"2\"} 1"));
         assert!(text.contains("agentos_requests_in_flight 2"));
         assert!(text.contains("agentos_requests_total{subsystem=\"agent\",outcome=\"success\"} 3"));
         assert!(text.contains(
@@ -1155,15 +1308,86 @@ mod tests {
     }
 
     #[test]
+    fn six_sli_source_families_have_help_types_and_measured_values() {
+        let text = sample().render_prometheus();
+        for family in [
+            "agentos_llm_requests_total",
+            "agentos_checkpoint_recovery_attempts_total",
+            "agentos_checkpoint_recovery_total",
+            "agentos_checkpoint_cross_tenant_attempts_total",
+            "agentos_checkpoint_cross_tenant_recoveries_total",
+            "agentos_adversarial_attempts_total",
+            "agentos_unexpected_allows_total",
+            "agentos_tenant_boundary_attempts_total",
+            "agentos_confirmed_violations_total",
+            "agentos_quota_storage_healthy_seconds_total",
+            "agentos_quota_storage_unhealthy_seconds_total",
+            "agentos_request_class_total",
+            "agentos_request_class_duration_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("# HELP {family} ")),
+                "missing HELP for {family}"
+            );
+            assert!(
+                text.contains(&format!("# TYPE {family} ")),
+                "missing TYPE for {family}"
+            );
+        }
+        assert!(text.contains("agentos_llm_requests_total{outcome=\"success\"} 4"));
+        assert!(text.contains("agentos_checkpoint_recovery_total{outcome=\"safe_rejected\"} 2"));
+        assert!(text.contains("agentos_checkpoint_recovery_attempts_total 5"));
+        assert!(text.contains("agentos_quota_storage_healthy_seconds_total 2.250000000"));
+        assert!(text.contains("agentos_quota_storage_unhealthy_seconds_total 0.125000000"));
+        assert!(text.contains("agentos_adversarial_attempts_total 100"));
+        assert!(text.contains("agentos_tenant_boundary_attempts_total 100"));
+    }
+
+    #[test]
     fn render_is_deterministic() {
         let s = sample();
         assert_eq!(s.render_prometheus(), s.render_prometheus());
     }
 
     #[test]
+    fn build_identity_matches_actual_compiled_source_with_fixed_labels() {
+        let text = sample().render_prometheus();
+        let source = env!("AGENTOS_COMPILED_SOURCE_SHA");
+        let mut rebuilt = String::new();
+        for part in 0..5 {
+            let prefix = format!("agentos_build_source_sha1{{part=\"{part}\"}} ");
+            let value: u32 = text
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .expect("fixed source segment exists")
+                .parse()
+                .unwrap();
+            rebuilt.push_str(&format!("{value:08x}"));
+        }
+        assert_eq!(rebuilt, source);
+        if let Ok(expected) = std::env::var("GITHUB_SHA") {
+            assert_eq!(
+                source, expected,
+                "compiled identity must match the actual CI checkout"
+            );
+            assert_eq!(env!("AGENTOS_COMPILED_SOURCE_VERIFIED"), "1");
+        }
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("agentos_build_source_sha1{"))
+                .count(),
+            5
+        );
+        assert!(text.contains(&format!(
+            "agentos_build_source_verified {}\n",
+            env!("AGENTOS_COMPILED_SOURCE_VERIFIED")
+        )));
+    }
+
+    #[test]
     fn rendered_metric_families_match_versioned_contract() {
         let contract: toml::Value = toml::from_str(include_str!(
-            "../../../observability/telemetry-contract-v1.toml"
+            "../../../observability/telemetry-contract-v2.toml"
         ))
         .expect("telemetry contract parses");
         assert_eq!(

@@ -367,6 +367,7 @@ pub struct PreparedToolExecution {
     /// SHA-256 identity of the immutable agent request. Raw parameters may
     /// contain secrets and are never retained in the approval-map key.
     pub approval_contract_digest: String,
+    pub(crate) binding_identity: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,6 +408,8 @@ pub struct ToolRegistry {
     binding_ids: DashMap<String, uuid::Uuid>,
     /// Command templates for custom tools: name -> (command, args_template)
     command_templates: DashMap<String, (String, Vec<String>)>,
+    pub(crate) local_peripheral:
+        std::sync::Mutex<std::sync::Weak<crate::peripheral_operator::PeripheralRequests>>,
 }
 
 impl Default for ToolRegistry {
@@ -422,6 +425,7 @@ impl ToolRegistry {
             tools: DashMap::new(),
             binding_ids: DashMap::new(),
             command_templates: DashMap::new(),
+            local_peripheral: std::sync::Mutex::new(std::sync::Weak::new()),
         };
         registry.register_builtins();
         registry
@@ -665,7 +669,12 @@ impl ToolRegistry {
 
     fn unregister_locked(&self, name: &str) {
         self.tools.remove(name);
-        self.binding_ids.remove(name);
+        if let Some((_, binding)) = self.binding_ids.remove(name) {
+            let requests = self.local_peripheral.lock().unwrap().upgrade();
+            if let Some(requests) = requests {
+                requests.cancel_binding(binding);
+            }
+        }
         self.command_templates.remove(name);
     }
 
@@ -950,14 +959,27 @@ impl ToolRegistry {
                 "tool '{name}' authorization target does not match provider target"
             ));
         }
-        let approval_contract = serde_json::to_vec(&serde_json::json!({
+        let binding_identity = *self.binding_ids.get(name).ok_or(TOOL_NOT_FOUND_ERROR)?;
+        let mut approval_contract = serde_json::json!({
             "version": 1,
             "security": &authorization.security,
             "resource_type": &request.resource_type,
             "operation": &request.operation,
             "parameters": &request.parameters,
-        }))
-        .map_err(|error| format!("tool '{name}' contract serialization failed: {error}"))?;
+        });
+        if request.resource_type == ResourceType::Peripheral {
+            // A replacement of the same named peripheral declaration is a new
+            // authority lifetime, even when its arguments/security are equal.
+            approval_contract
+                .as_object_mut()
+                .expect("contract is an object")
+                .insert(
+                    "binding_identity".into(),
+                    serde_json::json!(binding_identity),
+                );
+        }
+        let approval_contract = serde_json::to_vec(&approval_contract)
+            .map_err(|error| format!("tool '{name}' contract serialization failed: {error}"))?;
         let digest = ring::digest::digest(&ring::digest::SHA256, &approval_contract);
         let mut approval_contract_digest = String::with_capacity(7 + digest.as_ref().len() * 2);
         approval_contract_digest.push_str("sha256:");
@@ -970,6 +992,7 @@ impl ToolRegistry {
             authorization,
             request,
             approval_contract_digest,
+            binding_identity,
         })
     }
 
@@ -1035,6 +1058,9 @@ impl ToolRegistry {
         // registry so an exact guess is indistinguishable from a missing name.
         // Preserve UnknownAgent for unregistered callers.
         if gate.pid_of(agent_id).is_some() && !gate.tool_visible_to_agent(agent_id, name) {
+            // The diagnostic class must also match an absent name: otherwise
+            // before/after counters would disclose a hidden tool's existence.
+            gate.record_invalid_tool_declaration(agent_id);
             return Err(ToolAuthorizationError::InvalidDeclaration(
                 TOOL_NOT_FOUND_ERROR.to_string(),
             ));
@@ -1042,6 +1068,7 @@ impl ToolRegistry {
         let mut prepared = self
             .prepare_bound_execution(agent_id, name, arguments, binding_id)
             .map_err(|error| {
+                gate.record_invalid_tool_declaration(agent_id);
                 if error.starts_with("unknown tool '") {
                     ToolAuthorizationError::InvalidDeclaration(TOOL_NOT_FOUND_ERROR.to_string())
                 } else {
@@ -1055,7 +1082,8 @@ impl ToolRegistry {
             &prepared.request.parameters,
         )
         .map_err(ToolAuthorizationError::InvalidDeclaration)?;
-        let (_, guard, proof) = gate
+        let registration = gate.peripheral_registration(agent_id);
+        let admission = gate
             .authorize_and_acquire_tool_call_declared_contract(
                 agent_id,
                 name,
@@ -1066,12 +1094,79 @@ impl ToolRegistry {
                     request_identity: &request_identity,
                     track_peripheral_activity: prepared.request.resource_type
                         == ResourceType::Peripheral,
+                    expected_registration: None,
                 },
             )
-            .await
-            .map_err(ToolAuthorizationError::Denied)?;
+            .await;
+        let admission = match admission {
+            Err(crate::syscall_gate::GateDenial::ApprovalRequired { .. })
+                if prepared.request.resource_type == ResourceType::Peripheral =>
+            {
+                let requests = self.local_peripheral.lock().unwrap().upgrade();
+                if let (Some(requests), Some(registration)) = (requests, registration) {
+                    if let Some(mut approval) = requests
+                        .wait_for_approval(gate, name, &prepared, &request_identity, registration)
+                        .await
+                    {
+                        // The immutable request is admitted by the same gate again.
+                        // No slot or provider task exists while a human decides.
+                        let result = gate
+                            .authorize_and_acquire_tool_call_declared_contract(
+                                agent_id,
+                                name,
+                                &prepared.authorization.resource,
+                                &prepared.authorization.security,
+                                crate::syscall_gate::GateAdmissionContract {
+                                    approval_contract: &prepared.approval_contract_digest,
+                                    request_identity: &request_identity,
+                                    track_peripheral_activity: true,
+                                    expected_registration: Some(registration),
+                                },
+                            )
+                            .await;
+                        approval.admitted = result.is_ok();
+                        result
+                    } else {
+                        Err(crate::syscall_gate::GateDenial::ApprovalRequired {
+                            tool: name.to_string(),
+                            policy: prepared.authorization.security.approval_policy,
+                        })
+                    }
+                } else {
+                    Err(crate::syscall_gate::GateDenial::ApprovalRequired {
+                        tool: name.to_string(),
+                        policy: prepared.authorization.security.approval_policy,
+                    })
+                }
+            }
+            other => other,
+        };
+        let (_, guard, proof) = admission.map_err(ToolAuthorizationError::Denied)?;
         prepared.request.gate_admission = Some(proof);
         Ok((prepared, guard))
+    }
+
+    pub(crate) fn cancel_pending_peripheral(&self, agent_id: AgentId) {
+        if let Some(requests) = self.local_peripheral.lock().unwrap().upgrade() {
+            requests.cancel_agent(agent_id);
+        }
+    }
+
+    pub(crate) fn with_peripheral_binding<T>(
+        &self,
+        name: &str,
+        binding: uuid::Uuid,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _publication = self.publication.read().ok()?;
+        if self
+            .binding_ids
+            .get(name)
+            .is_none_or(|current| *current != binding)
+        {
+            return None;
+        }
+        Some(action())
     }
 
     pub(crate) fn binding_id_for_agent(

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use cap_primitives::fs::FollowSymlinks;
@@ -36,6 +36,17 @@ pub(crate) const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PROCESS_ARGUMENT_BYTES_TOTAL: usize = 1024 * 1024;
 #[cfg(test)]
 type FilesystemTestPause = (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
+
+#[cfg(test)]
+pub(crate) const WRITE_CRASH_EXIT_CODE: i32 = 73;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub(crate) enum WriteCrashBoundary {
+    AfterStageSync = 1,
+    AfterRename = 2,
+}
 
 /// The Sandbox Manager trait.
 #[async_trait::async_trait]
@@ -179,10 +190,16 @@ struct SandboxState {
     container_image: Option<String>,
     operation_lock: Arc<Mutex<()>>,
     process_lock: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    write_crash_boundary: Arc<AtomicU8>,
 }
 
 /// Concrete sandbox manager implementation.
 pub struct SandboxManagerImpl {
+    managed_namespace: Option<crate::managed_workspace::ManagedWorkspaceNamespace>,
+    // Live registrations end with this manager. The namespace lease prevents
+    // another manager from reconciling the same attested datastore while live.
+    live_managed_workspaces: Mutex<HashSet<PathBuf>>,
     sandboxes: DashMap<SandboxId, SandboxState>,
     agent_sandboxes: DashMap<AgentId, SandboxId>,
     #[cfg(test)]
@@ -217,6 +234,8 @@ impl SandboxManagerImpl {
             ORPHAN_CLEANUP.call_once(crate::docker_sandbox::cleanup_orphans_best_effort);
         }
         Self {
+            managed_namespace: None,
+            live_managed_workspaces: Mutex::new(HashSet::new()),
             sandboxes: DashMap::new(),
             agent_sandboxes: DashMap::new(),
             #[cfg(test)]
@@ -229,6 +248,106 @@ impl SandboxManagerImpl {
     #[cfg(test)]
     pub(crate) fn fail_next_destroy_for_test(&self) {
         self.fail_next_destroy.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn for_datastore(
+        database: Option<(&Path, uuid::Uuid)>,
+    ) -> Result<Self, SandboxError> {
+        let mut manager = Self::new();
+        manager.managed_namespace = Some(crate::managed_workspace::ManagedWorkspaceNamespace::new(
+            database,
+        )?);
+        Ok(manager)
+    }
+
+    pub(crate) fn default_managed_config(&self) -> SandboxConfig {
+        let mut config = Self::default_config();
+        if let Some(namespace) = &self.managed_namespace {
+            config.workspace_dir = namespace.data().join(uuid::Uuid::new_v4().to_string());
+        }
+        config
+    }
+
+    pub(crate) fn restored_workspace_is_managed(
+        &self,
+        config: &SandboxConfig,
+        agent: AgentId,
+    ) -> Result<bool, SandboxError> {
+        let Some(namespace) = &self.managed_namespace else {
+            return Ok(false);
+        };
+        if config.workspace_dir.parent() == Some(namespace.data()) {
+            namespace.verify(&config.workspace_dir, Some(agent))?;
+            return Ok(true);
+        }
+        let legacy_root = std::fs::canonicalize(Self::managed_root()).ok();
+        let legacy = config.workspace_dir.parent().is_some_and(|parent| {
+            parent
+                .file_name()
+                .is_some_and(|name| name == "aiagentos-workspaces")
+                || parent == Self::managed_root()
+                || legacy_root
+                    .as_ref()
+                    .is_some_and(|root| std::fs::canonicalize(parent).ok().as_ref() == Some(root))
+        }) && config
+            .workspace_dir
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .is_some_and(|leaf| uuid::Uuid::parse_str(leaf).is_ok());
+        let other_store = config.workspace_dir.parent().is_some_and(|parent| {
+            parent.file_name().is_some_and(|name| name == "data")
+                && parent.ancestors().any(|ancestor| {
+                    ancestor
+                        .file_name()
+                        .is_some_and(|name| name == ".aiagentos-workspace-stores")
+                })
+        });
+        if legacy || other_store {
+            if namespace.legacy_retained(&config.workspace_dir, agent)? {
+                return Ok(false);
+            }
+            return Err(SandboxError::OwnershipResolutionRequired(if legacy {
+                crate::WorkspaceOwnershipKind::LegacyNamespace
+            } else {
+                crate::WorkspaceOwnershipKind::ForeignDatastore
+            }));
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn retain_legacy_workspace(
+        &self,
+        path: &Path,
+        agent: AgentId,
+    ) -> Result<(), SandboxError> {
+        self.managed_namespace
+            .as_ref()
+            .ok_or_else(|| {
+                SandboxError::BoundaryViolation("workspace namespace is unavailable".into())
+            })?
+            .retain_legacy(path, agent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn crash_next_write_for_test(
+        &self,
+        sandbox_id: SandboxId,
+        boundary: WriteCrashBoundary,
+    ) {
+        self.sandboxes
+            .get(&sandbox_id)
+            .expect("crash fixture has an actual sandbox")
+            .write_crash_boundary
+            .store(boundary as u8, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn write_crash_checkpoint_for_test(state: &SandboxState, boundary: WriteCrashBoundary) {
+        if state.write_crash_boundary.load(Ordering::Acquire) == boundary as u8 {
+            // Bypass every destructor in this dedicated child process. No
+            // production configuration or public syscall can arm this hook.
+            std::process::exit(WRITE_CRASH_EXIT_CODE);
+        }
     }
 
     #[cfg(test)]
@@ -249,9 +368,9 @@ impl SandboxManagerImpl {
         (entered, release, cancellation_observed)
     }
 
-    /// Secure default used by all production agent-creation paths that do not
-    /// carry an explicit operator sandbox. Network and host process access are
-    /// denied; the workspace is unique and owned by the sandbox manager.
+    /// Secure policy template for compatibility callers. Kernel-managed
+    /// creation replaces its path with the leased datastore namespace.
+    /// Network and host process access are denied.
     pub fn default_config() -> SandboxConfig {
         SandboxConfig {
             workspace_dir: Self::managed_root().join(uuid::Uuid::new_v4().to_string()),
@@ -265,11 +384,6 @@ impl SandboxManagerImpl {
 
     pub fn managed_root() -> PathBuf {
         std::env::temp_dir().join("aiagentos-workspaces")
-    }
-
-    fn live_managed_workspaces() -> &'static Mutex<HashSet<PathBuf>> {
-        static LIVE: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
-        LIVE.get_or_init(|| Mutex::new(HashSet::new()))
     }
 
     pub fn is_managed_config(config: &SandboxConfig) -> bool {
@@ -329,36 +443,40 @@ impl SandboxManagerImpl {
         std::fs::canonicalize(root).map_err(|error| SandboxError::CreationFailed(error.to_string()))
     }
 
-    /// Remove UUID-scoped managed workspaces that have no live persisted
-    /// agent. A crash may occur before the marker is written, so ownership by
-    /// the private managed root plus a UUID leaf is the cleanup authority.
+    /// Retire only attested current-store workspaces without a live persisted
+    /// agent. UUID names and legacy markers never authorize reconciliation.
     pub fn reconcile_managed_workspaces(
         &self,
         active_workspaces: &HashSet<PathBuf>,
     ) -> Result<usize, SandboxError> {
+        self.reconcile_recorded_managed_workspaces(active_workspaces, &HashSet::new())
+    }
+
+    pub(crate) fn reconcile_recorded_managed_workspaces(
+        &self,
+        active_workspaces: &HashSet<PathBuf>,
+        protected_agents: &HashSet<AgentId>,
+    ) -> Result<usize, SandboxError> {
         // Keep discovery and deletion atomic with managed-workspace creation
         // and destruction. Without this guard, reconciliation can observe a
         // newly created directory before its live registration is published.
-        let live = Self::live_managed_workspaces().lock().map_err(|_| {
+        let live = self.live_managed_workspaces.lock().map_err(|_| {
             SandboxError::DestructionFailed("managed workspace registry unavailable".into())
         })?;
-        let root = Self::ensure_managed_root()?;
+        // A UUID name and empty legacy marker cannot attest datastore ownership.
+        // Unbound managers never sweep the shared legacy temporary root.
+        let Some(namespace) = &self.managed_namespace else {
+            return Ok(0);
+        };
         let mut active = active_workspaces
             .iter()
             .filter_map(|path| std::fs::canonicalize(path).ok())
             .collect::<HashSet<_>>();
         active.extend(live.iter().cloned());
-        let mut removed = 0;
-        for entry in std::fs::read_dir(&root)
-            .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?
-        {
-            let entry =
-                entry.map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
-            removed += usize::from(Self::reconcile_managed_entry(&root, &active, entry)?);
-        }
-        Ok(removed)
+        namespace.reconcile(&active, protected_agents)
     }
 
+    #[cfg(test)]
     fn reconcile_managed_entry(
         root: &Path,
         active: &HashSet<PathBuf>,
@@ -440,14 +558,17 @@ impl SandboxManagerImpl {
         // reconciliation cannot mistake an in-progress creation for an
         // orphan. The guard stays held until the path is published below.
         let mut managed_registry = if managed_workspace {
-            Some(Self::live_managed_workspaces().lock().map_err(|_| {
+            Some(self.live_managed_workspaces.lock().map_err(|_| {
                 SandboxError::CreationFailed("managed workspace registry unavailable".into())
             })?)
         } else {
             None
         };
         let managed_root = if managed_workspace {
-            let root = Self::ensure_managed_root()?;
+            let root = match &self.managed_namespace {
+                Some(namespace) => namespace.data().to_path_buf(),
+                None => Self::ensure_managed_root()?,
+            };
             let parent = config.workspace_dir.parent().ok_or_else(|| {
                 SandboxError::CreationFailed("managed workspace path is invalid".into())
             })?;
@@ -462,6 +583,17 @@ impl SandboxManagerImpl {
                 return Err(SandboxError::CreationFailed(
                     "managed workspace must be a UUID leaf of the private managed root".into(),
                 ));
+            }
+            if let Some(namespace) = &self.managed_namespace {
+                if config
+                    .workspace_dir
+                    .try_exists()
+                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?
+                {
+                    namespace.verify(&config.workspace_dir, Some(agent_id))?;
+                } else {
+                    namespace.publish(&config.workspace_dir, agent_id)?;
+                }
             }
             Some(root)
         } else {
@@ -525,7 +657,10 @@ impl SandboxManagerImpl {
             }
             workspace
         };
-        if managed_root.is_some() {
+        if managed_workspace && self.managed_namespace.is_some() {
+            crate::managed_workspace::allocation_cutpoint("directory_created");
+        }
+        if managed_root.is_some() && self.managed_namespace.is_none() {
             let marker = workspace_dir.join(Self::MANAGED_MARKER);
             std::fs::write(&marker, [])
                 .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
@@ -561,6 +696,8 @@ impl SandboxManagerImpl {
             container_image: config.container_image.clone(),
             operation_lock: Arc::new(Mutex::new(())),
             process_lock: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            write_crash_boundary: Arc::new(AtomicU8::new(0)),
         };
         if managed_workspace {
             managed_registry
@@ -620,9 +757,45 @@ impl SandboxManagerImpl {
         state: &SandboxState,
         path: &Path,
     ) -> Result<PathBuf, SandboxError> {
+        // Authorization uses a portable absolute DOS spelling on Windows.
+        // Compare the target and both attested workspace spellings through
+        // that same lexical normalization before deriving a relative path.
+        // Execution still uses the existing no-follow directory capability.
+        #[cfg(windows)]
+        let normalized = {
+            let normalize = |path: &Path| {
+                path.to_str()
+                    .ok_or_else(|| {
+                        SandboxError::BoundaryViolation("filesystem target denied".into())
+                    })
+                    .and_then(|path| {
+                        crate::resources::normalize_filesystem_target(path)
+                            .map(PathBuf::from)
+                            .map_err(|_| {
+                                SandboxError::BoundaryViolation("filesystem target denied".into())
+                            })
+                    })
+            };
+            (
+                normalize(path)?,
+                normalize(&state.workspace_dir)?,
+                normalize(&state.workspace_alias)?,
+            )
+        };
+        #[cfg(windows)]
+        let (path, workspace_dir, workspace_alias) = (
+            normalized.0.as_path(),
+            normalized.1.as_path(),
+            normalized.2.as_path(),
+        );
+        #[cfg(not(windows))]
+        let (workspace_dir, workspace_alias) = (
+            state.workspace_dir.as_path(),
+            state.workspace_alias.as_path(),
+        );
         let relative = if path.is_absolute() {
-            path.strip_prefix(&state.workspace_dir)
-                .or_else(|_| path.strip_prefix(&state.workspace_alias))
+            path.strip_prefix(workspace_dir)
+                .or_else(|_| path.strip_prefix(workspace_alias))
                 .map_err(|_| SandboxError::BoundaryViolation("filesystem target denied".into()))?
                 .to_path_buf()
         } else {
@@ -957,6 +1130,8 @@ impl SandboxManagerImpl {
             cancellation,
         )?;
         let temporary = Self::stage_file(workspace, relative, content, permissions, cancellation)?;
+        #[cfg(test)]
+        Self::write_crash_checkpoint_for_test(state, WriteCrashBoundary::AfterStageSync);
         if let Err(error) = Self::filesystem_checkpoint(cancellation) {
             let _ = workspace.remove_file(&temporary);
             return Err(error);
@@ -965,6 +1140,8 @@ impl SandboxManagerImpl {
             let _ = workspace.remove_file(&temporary);
             return Err(Self::filesystem_error("write commit", error));
         }
+        #[cfg(test)]
+        Self::write_crash_checkpoint_for_test(state, WriteCrashBoundary::AfterRename);
         Self::sync_parent_directory(workspace, relative)
     }
 
@@ -2023,7 +2200,7 @@ impl SandboxManager for SandboxManagerImpl {
             .map(|state| state.clone())
             .ok_or_else(|| SandboxError::DestructionFailed("Sandbox not found".to_string()))?;
         let mut managed_registry = if state.managed_workspace {
-            Some(Self::live_managed_workspaces().lock().map_err(|_| {
+            Some(self.live_managed_workspaces.lock().map_err(|_| {
                 SandboxError::DestructionFailed("managed workspace registry unavailable".into())
             })?)
         } else {
@@ -2061,7 +2238,13 @@ impl SandboxManager for SandboxManagerImpl {
             .take();
         drop(workspace);
         if state.managed_workspace {
-            if let Err(error) = std::fs::remove_dir_all(&state.workspace_dir) {
+            let retired = match &self.managed_namespace {
+                Some(namespace) => namespace
+                    .retire(&state.workspace_dir, Some(state.agent_id))
+                    .map_err(std::io::Error::other),
+                None => std::fs::remove_dir_all(&state.workspace_dir),
+            };
+            if let Err(error) = retired {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     let reopened = Dir::open_ambient_dir(&state.workspace_dir, ambient_authority())
                         .map_err(|reopen_error| {
@@ -2293,6 +2476,141 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn matching_native_file_handles(path: &Path) -> std::io::Result<Vec<(usize, u32, u32)>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Wdk::System::Threading::{
+            NtQueryInformationProcess, ProcessHandleInformation,
+        };
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_TYPE_DISK,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct HandleEntry {
+            value: *mut core::ffi::c_void,
+            _handle_count: usize,
+            _pointer_count: usize,
+            access: u32,
+            _object_type: u32,
+            attributes: u32,
+            _reserved: u32,
+        }
+
+        // Compare native identities rather than DOS path spellings: the runner
+        // TEMP path may contain a short-name alias. Exclude the diagnostic
+        // handle itself so the live-workspace positive control is meaningful.
+        let target = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut target_info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(target.as_raw_handle(), &mut target_info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let identity = |info: &BY_HANDLE_FILE_INFORMATION| {
+            (
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            )
+        };
+
+        // Read only this test process. Native pointers/paths from unrelated
+        // handles are neither dereferenced nor logged. Bound all query storage
+        // and validate the returned table before reading its entries.
+        let mut bytes = 16 * 1024;
+        let snapshot = loop {
+            let mut buffer = vec![0usize; bytes / std::mem::size_of::<usize>()];
+            let mut needed = 0u32;
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    GetCurrentProcess(),
+                    ProcessHandleInformation,
+                    buffer.as_mut_ptr().cast(),
+                    bytes as u32,
+                    &mut needed,
+                )
+            };
+            if status == 0 {
+                break buffer;
+            }
+            if status as u32 != 0xc000_0004 || bytes == 16 * 1024 * 1024 {
+                return Err(std::io::Error::other(format!(
+                    "native handle snapshot status {status:#x}"
+                )));
+            }
+            if needed as usize > 16 * 1024 * 1024 {
+                return Err(std::io::Error::other(
+                    "native handle snapshot exceeds bound",
+                ));
+            }
+            bytes = (bytes * 2)
+                .max(needed as usize)
+                .next_multiple_of(std::mem::size_of::<usize>());
+        };
+        let header_bytes = 2 * std::mem::size_of::<usize>();
+        let count = snapshot[0];
+        let capacity = (snapshot.len() * std::mem::size_of::<usize>() - header_bytes)
+            / std::mem::size_of::<HandleEntry>();
+        if count > capacity {
+            return Err(std::io::Error::other(
+                "native handle snapshot has invalid count",
+            ));
+        }
+        let entries = unsafe {
+            std::slice::from_raw_parts(snapshot.as_ptr().add(2).cast::<HandleEntry>(), count)
+        };
+        let provenance = crate::windows_private_fs::test_open_provenance(identity(&target_info));
+        for event in provenance {
+            eprintln!(
+                "target_private_open_provenance access={:#x} share={:#x} callsite={}:{}",
+                event.access, event.share, event.file, event.line
+            );
+        }
+        let mut matching = Vec::new();
+        for entry in entries {
+            if entry.value == target.as_raw_handle() {
+                continue;
+            }
+            // The snapshot number can be closed/reused by another test. Pin
+            // the current object with a non-inheritable duplicate before both
+            // queries; close only this duplicate through OwnedHandle.
+            let mut duplicate = std::ptr::null_mut();
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    entry.value,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                continue;
+            }
+            let owned = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+            if unsafe { GetFileType(owned.as_raw_handle()) } != FILE_TYPE_DISK {
+                continue;
+            }
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(owned.as_raw_handle(), &mut info) } == 0 {
+                continue;
+            }
+            if identity(&info) == identity(&target_info) {
+                matching.push((entry.value as usize, entry.access, entry.attributes));
+            }
+        }
+        Ok(matching)
+    }
 
     fn test_config() -> SandboxConfig {
         SandboxConfig {
@@ -3310,10 +3628,30 @@ mod tests {
 
     #[test]
     fn capability_directory_listing_is_deterministic_typed_and_bounded() {
+        #[cfg(windows)]
+        fn deletion_handle(path: &Path) -> std::io::Result<std::fs::File> {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS};
+
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+        }
+
         let mgr = SandboxManagerImpl::new();
         let config = test_config();
         let root = config.workspace_dir.clone();
         let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+        // Retaining state must not retain its native directory capability
+        // after teardown, including the bounded-listing early error path.
+        let retained = mgr.sandboxes.get(&sid).unwrap().clone();
+        #[cfg(windows)]
+        assert!(
+            !matching_native_file_handles(&root).unwrap().is_empty(),
+            "native snapshot must find the live workspace capability"
+        );
         std::fs::write(root.join("z.txt"), "z").unwrap();
         std::fs::create_dir(root.join("a-dir")).unwrap();
         #[cfg(unix)]
@@ -3355,7 +3693,62 @@ mod tests {
             .execute_filesystem(sid, "list", &serde_json::json!({"path": "crowded"}))
             .is_err());
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+            };
+
+            // An unrelated metadata/protection handle has the observed access
+            // mask, but must never match the crowded directory's file identity.
+            let unrelated = root.join("unrelated-identity-control");
+            std::fs::create_dir(&unrelated).unwrap();
+            let metadata = std::fs::OpenOptions::new()
+                .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&unrelated)
+                .unwrap();
+            let raw = metadata.as_raw_handle() as usize;
+            assert!(matching_native_file_handles(&unrelated)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == raw));
+            assert!(!matching_native_file_handles(&crowded)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == raw));
+            drop(metadata);
+
+            // The workspace capability deliberately denies delete sharing
+            // until teardown; the failed listing's child iterator must already
+            // have released its own native directory reference.
+            assert_eq!(deletion_handle(&root).unwrap_err().raw_os_error(), Some(32));
+            match deletion_handle(&crowded) {
+                Ok(handle) => drop(handle),
+                Err(error) => panic!("bounded-list directory sharing failure: {error}; current_process_matching_handles={:?}", matching_native_file_handles(&crowded)),
+            }
+        }
         mgr.destroy_sandbox(sid).unwrap();
+        assert!(retained.workspace.lock().unwrap().is_none());
+        assert!(retained.workspace_directories.lock().unwrap().is_empty());
+        assert!(!mgr.sandboxes.contains_key(&sid));
+        assert!(mgr
+            .execute_filesystem(sid, "list", &serde_json::json!({"path": "."}))
+            .is_err());
+        #[cfg(windows)]
+        for directory in [&root, &crowded] {
+            // A directory capability opened without FILE_SHARE_DELETE would
+            // prevent this exclusive open. Exercise the actual Windows handle
+            // lifetime before recursive deletion, without retries or new flags
+            // on the production capabilities.
+            let exclusive = deletion_handle(directory)
+                .expect("destroyed listing sandbox retained a native directory handle");
+            drop(exclusive);
+        }
+        drop(retained);
+        drop(mgr);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3512,14 +3905,15 @@ mod tests {
         mgr.reconcile_managed_workspaces(&active).unwrap();
         assert!(workspace.exists());
         assert!(
-            !orphan.exists(),
-            "the injected orphan must be absent after reconciliation"
+            orphan.exists(),
+            "an unverified legacy UUID directory must remain untouched"
         );
         assert!(unrelated.exists());
 
         mgr.destroy_sandbox(sid).unwrap();
         assert!(!workspace.exists());
         std::fs::remove_dir_all(unrelated).unwrap();
+        std::fs::remove_dir_all(orphan).unwrap();
     }
 
     #[test]

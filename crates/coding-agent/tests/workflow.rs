@@ -4,8 +4,14 @@ use coding_agent::io::JobIo;
 use coding_agent::provider::ProposalProvider;
 use coding_agent::types::*;
 use coding_agent::{run_job, Error, TestRunner};
+use kernel::connector::{
+    LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, LlmUsage, ProviderCapabilities,
+    ProviderType, StandardMessage, ToolDefinition,
+};
+use kernel::ConnectorError;
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -67,9 +73,14 @@ impl Harness {
     }
 
     async fn new(kernel: Arc<AgentKernelImpl>) -> Self {
-        kernel
-            .register_provider(Arc::new(ProposalProvider::fixture()))
-            .unwrap();
+        Self::with_provider(kernel, Arc::new(ProposalProvider::fixture())).await
+    }
+
+    async fn with_provider(
+        kernel: Arc<AgentKernelImpl>,
+        provider: Arc<dyn LlmProviderAdapter>,
+    ) -> Self {
+        kernel.register_provider(provider).unwrap();
         let server = kernel::syscall_server::SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
             .await
             .unwrap();
@@ -137,6 +148,168 @@ impl Drop for Harness {
 }
 
 struct ContractRunner;
+
+struct FailingProposalProvider {
+    id: String,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmSession for FailingProposalProvider {
+    async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if messages
+            .iter()
+            .any(|message| message.content.contains("candidate="))
+        {
+            return Err(ConnectorError::ProtocolError(
+                "controlled proposal provider failure".into(),
+            ));
+        }
+        Ok(LlmResponse {
+            content: "{\"edits\":[]}".into(),
+            finish_reason: Some("stop".into()),
+            tokens_used: 3,
+            usage: LlmUsage::reported(2, 1, 0),
+            tool_calls: Vec::new(),
+            provider_metadata: None,
+        })
+    }
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        _: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send(messages).await
+    }
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        assert!(options.max_output_tokens.is_some_and(|limit| limit >= 3));
+        self.send_with_tools(messages, tools).await
+    }
+    fn provider_id(&self) -> &String {
+        &self.id
+    }
+    fn model_id(&self) -> &str {
+        "controlled-coding-failure"
+    }
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl LlmProviderAdapter for FailingProposalProvider {
+    fn id(&self) -> &String {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        "controlled coding failure"
+    }
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Local
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            tool_calls: true,
+            ..Default::default()
+        }
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
+    async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+        Ok(Box::new(Self {
+            id: self.id.clone(),
+            calls: self.calls.clone(),
+        }))
+    }
+    fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
+        serde_json::to_value(message).unwrap()
+    }
+    fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+        serde_json::from_value(value.clone()).ok()
+    }
+}
+
+struct MustNotRun(Arc<AtomicUsize>);
+
+#[async_trait]
+impl TestRunner for MustNotRun {
+    async fn run(&self, _: &mut JobIo, _: Uuid, _: Uuid) -> Result<TestEvidence, Error> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Contract(
+            "tests must not start after provider failure".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn provider_failure_reclaims_speculative_branch_and_preserves_original_files() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let runner_calls = Arc::new(AtomicUsize::new(0));
+    let h = Harness::with_provider(
+        Arc::new(AgentKernelImpl::new().unwrap()),
+        Arc::new(FailingProposalProvider {
+            id: "coding".into(),
+            calls: provider_calls.clone(),
+        }),
+    )
+    .await;
+    let (mut journal, mut io) = h.create_job().await;
+    let result = run_job(
+        &mut io,
+        &mut journal,
+        &MustNotRun(runner_calls.clone()),
+        false,
+        false,
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        2,
+        "baseline and actual speculative provider failure must both execute"
+    );
+    assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(journal.status, "failed");
+    assert!(journal.selected.is_none());
+    assert_eq!(journal.branches.len(), 1);
+    let child = journal.branches[0].id;
+    assert!(journal.branches[0].owned);
+    assert_eq!(journal.branches[0].phase, Phase::Discarded);
+    assert!(journal.branches[0].test.is_none());
+    assert!(h
+        .kernel
+        .context_manager
+        .agent_tenant(child)
+        .unwrap()
+        .is_none());
+    assert_eq!(h.kernel.context_manager.load_all_agents().unwrap().len(), 1);
+    for (path, original) in &journal.files {
+        assert_eq!(io.read_file(journal.parent, path).await.unwrap(), *original);
+    }
+    let retained = JobIo::load(&mut io.control, journal.parent, journal.id)
+        .await
+        .unwrap();
+    assert_eq!(retained.status, "failed");
+    assert_eq!(retained.branches[0].phase, Phase::Discarded);
+    assert!(retained
+        .events
+        .iter()
+        .any(|event| event.agent == child && event.action == "failed"));
+    assert!(retained
+        .events
+        .iter()
+        .all(|event| event.action != "test_started" && event.action != "test_completed"));
+    io.client.close().await.unwrap();
+    io.control.close().await.unwrap();
+    h.kernel.stop_agent(journal.parent).await.unwrap();
+}
 #[async_trait]
 impl TestRunner for ContractRunner {
     async fn run(

@@ -1,0 +1,102 @@
+name: Optional release dependency scenario
+
+on:
+  workflow_call:
+    inputs:
+      scenario:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  required-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "$SCENARIO" != required-ci-failed
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+  wedge:
+    needs: required-ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "$SCENARIO" != wedge-failed
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+  release-artifacts:
+    needs: required-ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "$SCENARIO" != release-artifacts-failed
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+  container:
+    needs: required-ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "$SCENARIO" != container-failed
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+  desktop-release-contract:
+    if: inputs.scenario != 'desktop-disabled'
+    needs: required-ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "$SCENARIO" != desktop-failed
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+  desktop-artifacts:
+    if: inputs.scenario != 'desktop-disabled'
+    needs: [required-ci, desktop-release-contract]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Fixture desktop matrix succeeded; no installers are published.'
+  assemble:
+    if: >-
+      always() &&
+      needs.required-ci.result == 'success' &&
+      needs.wedge.result == 'success' &&
+      needs.release-artifacts.result == 'success' &&
+      needs.container.result == 'success'
+    needs: [required-ci, wedge, desktop-release-contract, desktop-artifacts, release-artifacts, container]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Fixture bundle assembled; no release assets are uploaded.'
+  publish-probe:
+    # A skipped/failed optional ancestor otherwise also skips this downstream job.
+    if: always() && needs.assemble.result == 'success'
+    needs: assemble
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Fixture reached publication boundary; no tag or release is created.'
+  verify:
+    if: always()
+    needs: [required-ci, wedge, release-artifacts, container, desktop-release-contract, desktop-artifacts, assemble, publish-probe]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the actual GitHub dependency results for this scenario
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          scenario = os.environ['SCENARIO']
+          results = {name: job['result'] for name, job in json.loads(os.environ['RESULTS']).items()}
+          expected = {name: 'success' for name in results}
+          if scenario == 'desktop-disabled':
+              expected['desktop-release-contract'] = expected['desktop-artifacts'] = 'skipped'
+          elif scenario == 'desktop-failed':
+              expected['desktop-release-contract'] = 'failure'
+              expected['desktop-artifacts'] = 'skipped'
+          elif scenario.endswith('-failed'):
+              failed = scenario.removesuffix('-failed')
+              expected[failed] = 'failure'
+              expected['assemble'] = expected['publish-probe'] = 'skipped'
+              if failed == 'required-ci':
+                  for name in ('wedge', 'release-artifacts', 'container', 'desktop-release-contract', 'desktop-artifacts'):
+                      expected[name] = 'skipped'
+          assert results == expected, (scenario, results, expected)
+          print(json.dumps({'scenario': scenario, 'actual_jobs': results, 'real_publication_exercised': False}, sort_keys=True))
+          PY

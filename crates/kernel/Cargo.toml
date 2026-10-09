@@ -1,5 +1,6 @@
 [package]
 name = "kernel"
+description = "Governed user-space agent runtime and control plane with lifecycle, durable state, quotas and tool authorization."
 version = "0.4.0-rc.1"
 edition = "2021"
 license.workspace = true
@@ -61,5 +62,10 @@ rcgen = { workspace = true }
 wiremock = { workspace = true }
 tempfile = "3"
 
+[build-dependencies]
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Win32_NetworkManagement_NetManagement"] }
+windows-sys = { version = "0.61", features = ["Win32_NetworkManagement_NetManagement", "Wdk_System_Threading"] }

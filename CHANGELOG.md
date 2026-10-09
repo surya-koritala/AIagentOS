@@ -10,6 +10,62 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Add a bounded nine-SLI observation producer over raw Prometheus history or
+  retained sample archives, with reset/gap checks, conservative latency buckets,
+  durable alert-history validation and exact provider/restore/game-day bindings.
+  A separate CI workflow exercises the schemas and negative contracts. The
+  30-day target campaign and independent release evidence remain open (#324).
+
+- Indexed exact fact payload byte counts for storage quota aggregation, retaining
+  agent, tenant and global limits. Raw-write, rollback, reopen and rejected-update
+  regressions verify accounting; a same-run hosted 100k comparison preserves
+  the existing quality, isolation, integrity, traffic and latency thresholds.
+
+- Added bounded typed inline PNG/JPEG input through governed v2 requests,
+  SDK and CLI commands, four native provider adapters, and schema-fenced
+  conversation/checkpoint persistence. Image admission uses explicit
+  model-bound operator profiles; live-provider qualification remains open.
+- Shared terminal correction-store health checks across legacy text, typed
+  content and planning, with a failed-persistence regression that requires
+  refusal before provider I/O.
+
+- Added bounded system-operator model catalogs through the wire API, SDK and
+  `agentctl`, with explicit unsupported providers and redacted diagnostics.
+  Added tenant-scoped per-agent gate statistics while preserving the existing
+  global `gate-stats` response. Relates #361 and #339.
+- Required CLI, container and supply-chain release assets can be assembled
+  independently of optional desktop qualification. Signed desktop updater
+  metadata still requires the complete eligible installer set. Relates #340;
+  actual stable publication and desktop qualification remain pending.
+- Coalesced each bounded JSON body and newline into one transport write,
+  preserving framing limits and socket options. Added controlled paired
+  loopback measurements and real SDK regressions on all three host OSes.
+- Expanded public-wire VFS acceptance with actual child-process termination
+  after stage sync and rename, plus delayed memory writes across provider
+  deadlines and client disconnects. Fixtures assert fresh authorized recovery,
+  capacity reclamation and no late durable fact publication. Physical
+  power-loss and independent production qualification remain open under #392.
+
+- Wired terminal `/learn` and `/unlearn` to bounded private correction storage
+  with operator provenance, atomic persistence, visible errors, restart, and
+  explicitly scoped executor injection. `/plan` generates bounded parsed
+  steps through kernel provider admission/accounting and clearly reports that
+  step execution is deferred. Slash help matches the accepted commands.
+  GitHub CI checks shipped binary restart, rule isolation, tool denial,
+  planning bounds, quota admission, and cancellation. Relates #338.
+
+- Add native Windows public-wire junction escape, live reparse replacement and
+  capability retirement fixtures, preserving native no-follow/share controls and
+  checking real outside data and directory release. Generated handle cases now
+  stop their final actors/controller through the SDK. Relates #392; broader
+  independent security/filesystem qualification remains open.
+
+- Check README capability rows and declared documentation statuses against the
+  existing evidence registry, with a complete public Markdown inventory and real
+  CI downgrade rejection. Clarify historical Linux analogies, crate roles and
+  component qualification boundaries. Repository framing changes remain a
+  reviewable proposal; no maturity tier is promoted. Relates #373.
+
 - Added public-wire VFS acceptance proof pairing stale descriptor rejection with
   fresh real reads by the same restored owner, and verifying that authorized COW
   cloning inherits no live tool/workspace/memory/KV/IPC handles or attenuated

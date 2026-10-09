@@ -9,7 +9,7 @@ use crate::connector::{LlmSession, StandardMessage};
 use crate::context::{ContextManager, Fact, FactCategory, SqliteContextManager};
 use crate::resources::ResourceBroker;
 use crate::tools::ToolRegistry;
-use crate::{AgentId, KernelError};
+use crate::{AgentId, ConnectorError, KernelError};
 
 /// Maximum tool call rounds before forcing termination.
 const MAX_ITERATIONS: usize = 10;
@@ -185,6 +185,63 @@ struct ProviderCall {
     tool_degradation: Option<crate::connector::ProviderToolDegradation>,
 }
 
+/// Private session facade lets the existing planning generator use the
+/// executor's provider accounting/admission without offering a tool route.
+struct GovernedPlanningSession<'a> {
+    executor: &'a AgentExecutor,
+    usage: std::sync::Mutex<UsageTelemetry>,
+}
+
+#[async_trait::async_trait]
+impl LlmSession for GovernedPlanningSession<'_> {
+    async fn send(
+        &self,
+        messages: Vec<StandardMessage>,
+    ) -> Result<crate::connector::LlmResponse, crate::ConnectorError> {
+        let (response, usage) =
+            self.executor
+                .send_plan_request(messages)
+                .await
+                .map_err(|error| {
+                    crate::ConnectorError::invalid_request(
+                        self.executor.session.provider_id().clone(),
+                        error.to_string(),
+                        None,
+                    )
+                })?;
+        *self.usage.lock().map_err(|_| {
+            crate::ConnectorError::invalid_request(
+                self.executor.session.provider_id().clone(),
+                "plan accounting lock failed",
+                None,
+            )
+        })? = usage;
+        Ok(response)
+    }
+
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[crate::connector::ToolDefinition],
+    ) -> Result<crate::connector::LlmResponse, crate::ConnectorError> {
+        if !tools.is_empty() {
+            return Err(crate::ConnectorError::invalid_request(
+                self.executor.session.provider_id().clone(),
+                "plan generation does not offer executable tools",
+                None,
+            ));
+        }
+        self.send(messages).await
+    }
+
+    fn provider_id(&self) -> &crate::ProviderId {
+        self.executor.session.provider_id()
+    }
+    fn model_id(&self) -> &str {
+        self.executor.session.model_id()
+    }
+}
+
 /// The agent executor — drives the think→act→observe loop.
 pub struct AgentExecutor {
     pub agent_id: AgentId,
@@ -206,6 +263,7 @@ pub struct AgentExecutor {
     /// Shared RPM/TPM/provider-concurrency limiter, acquired for each actual
     /// provider attempt rather than for the whole agent turn.
     rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
+    provider_outcomes: Arc<crate::telemetry::ProviderOutcomeCounters>,
     /// Shared active-prompt admission. The tenant id is immutable for the
     /// executor lifetime and restored with the owning agent.
     context_admission: Option<(Arc<crate::context_paging::ActiveContextManager>, String)>,
@@ -278,6 +336,7 @@ impl AgentExecutor {
             budget_enforcer: None,
             llm_scheduler: None,
             rate_limiter: None,
+            provider_outcomes: Arc::new(crate::telemetry::ProviderOutcomeCounters::default()),
             context_admission: None,
             context_budget_tokens: 0,
             max_tool_calls_per_turn: 0,
@@ -344,6 +403,13 @@ impl AgentExecutor {
         self.rate_limiter = Some(limiter);
     }
 
+    pub(crate) fn set_provider_outcomes(
+        &mut self,
+        counters: Arc<crate::telemetry::ProviderOutcomeCounters>,
+    ) {
+        self.provider_outcomes = counters;
+    }
+
     pub fn set_context_admission(
         &mut self,
         manager: Arc<crate::context_paging::ActiveContextManager>,
@@ -387,11 +453,25 @@ impl AgentExecutor {
         // framing all become provider input on the next round. The structural
         // floor prevents an incomplete provider hook from under-reserving a
         // known prompt; a more accurate provider estimate can only raise it.
-        let structural_floor = Self::conservative_serialized_tokens(messages)
+        // Encoded pixels are governed by the model-specific image bound, not
+        // the UTF-8 text tokenizer. Charge their non-secret projection here.
+        let projected = messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                message.content = message.content.text_projection().into();
+                message
+            })
+            .collect::<Vec<_>>();
+        let structural_floor = Self::conservative_serialized_tokens(&projected)
             .saturating_add((messages.len() as u32).saturating_mul(4));
-        self.session
+        let text_floor = self
+            .session
             .estimate_prompt_tokens(messages)
-            .map_or(structural_floor, |estimate| estimate.max(structural_floor))
+            .map_or(structural_floor, |estimate| estimate.max(structural_floor));
+        self.session
+            .validate_content(messages)
+            .map_or(u32::MAX, |images| text_floor.saturating_add(images))
     }
 
     fn conservative_serialized_tokens<T: serde::Serialize + ?Sized>(value: &T) -> u32 {
@@ -423,6 +503,9 @@ impl AgentExecutor {
         &mut self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<(), KernelError> {
+        self.session
+            .validate_content(&self.messages)
+            .map_err(KernelError::Connector)?;
         self.session
             .validate_tool_policy(tools)
             .map_err(KernelError::Connector)?;
@@ -649,6 +732,23 @@ impl AgentExecutor {
     }
 
     /// Resume from a saved conversation.
+    pub(crate) fn configure_terminal_prompt(
+        &mut self,
+        prompt: String,
+        conversation: Option<&str>,
+    ) -> Result<(), KernelError> {
+        self.system_prompt = prompt.clone();
+        self.messages = match conversation {
+            Some(id) => {
+                self.conversation_id = id.to_string();
+                self.context_manager.load_conversation(id)?
+            }
+            None => vec![StandardMessage::system(prompt)],
+        };
+        Ok(())
+    }
+
+    /// Resume from a saved conversation.
     pub fn with_conversation(mut self, conversation_id: &str) -> Self {
         self.conversation_id = conversation_id.to_string();
         if let Ok(messages) = self.context_manager.load_conversation(conversation_id) {
@@ -680,8 +780,32 @@ impl AgentExecutor {
     }
 
     /// Set a rule store for learning from corrections.
-    pub fn set_rule_store(&mut self, store: Arc<crate::learning::RuleStore>) {
+    pub fn set_rule_store(
+        &mut self,
+        store: Arc<crate::learning::RuleStore>,
+    ) -> Result<(), KernelError> {
+        let authorized = match store.scope() {
+            crate::learning::RuleScope::Agent(agent) => agent == &self.agent_id.to_string(),
+            crate::learning::RuleScope::LocalOperator {
+                tenant_id,
+                operator,
+            } => {
+                store.is_durable()
+                    && operator == "local-cli"
+                    && self
+                        .context_admission
+                        .as_ref()
+                        .is_some_and(|(_, tenant)| tenant == tenant_id)
+            }
+            _ => false,
+        };
+        if !authorized {
+            return Err(KernelError::Policy(
+                "correction scope does not match this executor".into(),
+            ));
+        }
         self.rule_store = Some(store);
+        Ok(())
     }
 
     /// Get a cancellation token for this executor.
@@ -747,7 +871,9 @@ impl AgentExecutor {
     /// message, and auto-summarize if over the overflow threshold. Shared by
     /// `run`/`run_resumable`; not called on the resume path (the checkpoint
     /// already carries the prepared `messages`).
-    async fn prepare_turn(&mut self, user_message: &str) {
+    async fn prepare_content_turn(&mut self, content: &crate::message_content::MessageContent) {
+        let projected = content.text_projection();
+        let user_message = projected.as_str();
         // Query long-term memory for relevant facts
         if let Ok(facts) = self
             .context_manager
@@ -767,19 +893,89 @@ impl AgentExecutor {
             }
         }
 
-        // Inject applicable correction rules
+        // Replace prior correction data each turn, including after removal.
+        // Correction text is user data, never elevated system policy.
         if let Some(ref store) = self.rule_store {
+            self.messages.retain(|message| {
+                !message
+                    .content
+                    .starts_with(crate::learning::RULE_PROMPT_PREFIX)
+            });
             if let Some(rules_prompt) = store.rules_as_prompt(user_message) {
-                self.messages.push(StandardMessage::system(rules_prompt));
+                self.messages.push(StandardMessage::user(rules_prompt));
             }
         }
 
-        self.messages.push(StandardMessage::user(user_message));
+        self.messages
+            .push(StandardMessage::user_content(content.clone()));
 
         // Message-count-only auto-summarization used to replace old content
         // with a count placeholder, silently losing semantics. Pressure is now
         // handled in `compact_to_token_budget`: full evicted messages are durably
         // spilled and a retrievable reference remains in the active prompt.
+    }
+
+    /// Generate a plan through the same provider admission and accounting as
+    /// an ordinary turn. Returned calls are data errors, never tool execution.
+    pub(crate) async fn run_plan(&self, task: &str) -> Result<TurnResult, KernelError> {
+        self.check_rule_store_health()?;
+        crate::planning::validate_plan_task(task)?;
+        let session = GovernedPlanningSession {
+            executor: self,
+            usage: std::sync::Mutex::new(UsageTelemetry::default()),
+        };
+        let plan = crate::planning::generate_plan(&session, task).await;
+        let usage = *session
+            .usage
+            .lock()
+            .map_err(|_| KernelError::Policy("plan accounting lock failed".into()))?;
+        // Even an invalid textual plan is a consumed, accounted response. The
+        // kernel records usage before returning the explicit parse error.
+        let result = plan.map_err(|error| error.to_string());
+        let content = serde_json::to_string(&result)
+            .map_err(|error| KernelError::Policy(error.to_string()))?;
+        Ok(TurnResult::Completed(self.output(
+            content,
+            0,
+            usage.input_tokens.saturating_add(usage.output_tokens),
+            usage,
+        )))
+    }
+
+    async fn send_plan_request(
+        &self,
+        messages: Vec<StandardMessage>,
+    ) -> Result<(crate::connector::LlmResponse, UsageTelemetry), KernelError> {
+        if self.context_budget_tokens > 0
+            && self.estimate_prompt_tokens(&messages) > self.context_budget_tokens
+        {
+            return Err(KernelError::Policy(
+                "plan prompt exceeds the configured active-context budget".into(),
+            ));
+        }
+        let budget_call = match &self.budget_enforcer {
+            Some(budget) => Some(
+                budget
+                    .begin_call(self.agent_id)
+                    .await
+                    .map_err(|error| KernelError::Policy(error.message()))?,
+            ),
+            None => None,
+        };
+        let call = self.send_prepared_with_retry(messages, &[]).await?;
+        let mut usage = UsageTelemetry::default();
+        usage.record(&call);
+        if let Some(budget) = &self.budget_enforcer {
+            let (_, charged) = budget.record_usage_charge(
+                self.agent_id,
+                &call.provider_id,
+                &call.model_id,
+                call.usage,
+            );
+            usage.charged_cost_micros = usage.charged_cost_micros.saturating_add(charged);
+        }
+        drop(budget_call);
+        Ok((call.response, usage))
     }
 
     /// Pause-aware run of a turn for `user_message`.
@@ -797,9 +993,30 @@ impl AgentExecutor {
     /// [`GenerationCheckpoint`] for the honest note on token-level vs
     /// turn-boundary granularity across local and hosted backends.
     pub async fn run_resumable(&mut self, user_message: &str) -> Result<TurnResult, KernelError> {
-        self.prepare_turn(user_message).await;
-        self.drive_loop(user_message.to_string(), 0, 0, UsageTelemetry::default())
+        self.run_content_resumable(user_message.into()).await
+    }
+
+    pub async fn run_content_resumable(
+        &mut self,
+        content: crate::message_content::MessageContent,
+    ) -> Result<TurnResult, KernelError> {
+        self.check_rule_store_health()?;
+        let candidate = StandardMessage::user_content(content.clone());
+        self.session
+            .validate_content(std::slice::from_ref(&candidate))
+            .map_err(KernelError::Connector)?;
+        self.prepare_content_turn(&content).await;
+        self.drive_loop(content.text_projection(), 0, 0, UsageTelemetry::default())
             .await
+    }
+
+    fn check_rule_store_health(&self) -> Result<(), KernelError> {
+        if let Some(store) = &self.rule_store {
+            store
+                .check_health()
+                .map_err(|error| KernelError::Policy(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Resume a turn from a checkpoint and drive it to completion (it can itself
@@ -1164,6 +1381,15 @@ impl AgentExecutor {
         &self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<ProviderCall, KernelError> {
+        self.send_prepared_with_retry(self.clean_messages(), tools)
+            .await
+    }
+
+    async fn send_prepared_with_retry(
+        &self,
+        clean_messages: Vec<StandardMessage>,
+        tools: &[crate::connector::ToolDefinition],
+    ) -> Result<ProviderCall, KernelError> {
         self.session
             .validate_tool_policy(tools)
             .map_err(KernelError::Connector)?;
@@ -1176,7 +1402,9 @@ impl AgentExecutor {
             )));
         }
         // Filter messages: remove tool results that don't have a preceding tool_calls message
-        let clean_messages = self.clean_messages();
+        self.session
+            .validate_content(&clean_messages)
+            .map_err(KernelError::Connector)?;
         let estimated_input_tokens = self
             .estimate_prompt_tokens(&clean_messages)
             .saturating_add(Self::conservative_tool_tokens(tools))
@@ -1365,6 +1593,7 @@ impl AgentExecutor {
                     }
                 }
             };
+            let mut provider_observation = self.provider_outcomes.start();
             let started = std::time::Instant::now();
             let (provider_events_tx, mut provider_events_rx) =
                 mpsc::channel(crate::wire_io::STREAM_EVENT_BUFFER_CAPACITY);
@@ -1402,6 +1631,13 @@ impl AgentExecutor {
                     }
                 }
             };
+            provider_observation.finish(match &result {
+                Ok(_) => crate::telemetry::ProviderOutcome::Success,
+                Err(ConnectorError::Timeout(_)) => crate::telemetry::ProviderOutcome::TimedOut,
+                Err(ConnectorError::Cancelled(_)) => crate::telemetry::ProviderOutcome::Cancelled,
+                Err(_) => crate::telemetry::ProviderOutcome::Failed,
+            });
+            drop(provider_observation);
             provider_latency_ms = provider_latency_ms
                 .saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             drop(_llm_core);
@@ -1561,7 +1797,23 @@ impl AgentExecutor {
     fn save_conversation(&self) -> Result<(), KernelError> {
         self.context_manager
             .save_conversation(&self.conversation_id, self.agent_id, &self.messages)
-            .map_err(KernelError::Context)
+            .map_err(KernelError::Context)?;
+        if let Some(store) = &self.rule_store {
+            if store.scope() == &crate::learning::RuleScope::local_cli() {
+                let tenant = self
+                    .context_manager
+                    .agent_tenant(self.agent_id)?
+                    .ok_or(crate::AgentError::NotFound(self.agent_id))?;
+                store
+                    .register_cli_conversation(&self.conversation_id, self.agent_id, &tenant)
+                    .map_err(|error| {
+                        KernelError::Policy(format!(
+                            "conversation registry persistence could not be confirmed: {error}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Clean messages: remove orphaned tool results (tool messages without preceding tool_calls).
@@ -2943,6 +3195,15 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
 
         let output = executor.run("test").await.unwrap();
         assert_eq!(output.content, "recovered!");
+        assert_eq!(
+            executor.provider_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                success: 1,
+                failed: 2,
+                timed_out: 0,
+                cancelled: 0
+            }
+        );
         assert_eq!(output.usage.llm_requests, 3);
         assert_eq!(output.usage.retries, 2);
         assert_eq!(output.usage.provider_reported_requests, 0);
@@ -2985,6 +3246,202 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
             1,
             "a permanent failure must burn exactly one durable request receipt"
         );
+        assert_eq!(
+            executor.provider_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                failed: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    struct ImageBoundSession {
+        id: String,
+        calls: Arc<AtomicUsize>,
+        profile: Option<crate::connector::ImageInputProfile>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for ImageBoundSession {
+        async fn send_with_tools(
+            &self,
+            messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send(messages).await
+        }
+        async fn send(
+            &self,
+            _messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LlmResponse {
+                content: "done".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 2,
+                usage: LlmUsage::reported(1, 1, 0),
+                tool_calls: vec![],
+                provider_metadata: None,
+            })
+        }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+        fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+            crate::message_content::validate_messages(messages, &self.id, self.profile.as_ref())
+        }
+    }
+
+    fn image_content_fixture() -> crate::connector::MessageContent {
+        use crate::connector::{ContentPart, ImageInput, ImageMediaType, MessageContent};
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        MessageContent::parts(vec![
+            ContentPart::Text {
+                text: "describe image".into(),
+            },
+            ContentPart::Image {
+                image: ImageInput::new(ImageMediaType::Png, png.into()).unwrap(),
+            },
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn image_input_unknown_and_token_budget_refusals_precede_admission_and_provider_io() {
+        for profile in [
+            None,
+            Some(crate::connector::ImageInputProfile {
+                model_id: "fixture".into(),
+                max_tokens_per_image: 3000,
+            }),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let limiter = execution_rate_limiter_with_tpm(2999);
+            let mut executor = AgentExecutor::new_unconfined(
+                uuid::Uuid::new_v4(),
+                Box::new(ImageBoundSession {
+                    id: "image-fixture".into(),
+                    calls: calls.clone(),
+                    profile: profile.clone(),
+                }),
+                mock_broker(),
+                Arc::new(ToolRegistry::new()),
+                mock_context_manager(),
+                "system".into(),
+            );
+            executor.set_context_budget(0);
+            executor.set_rate_limiter(limiter.clone());
+            let error = executor
+                .run_content_resumable(image_content_fixture())
+                .await
+                .unwrap_err();
+            if profile.is_none() {
+                assert!(matches!(
+                    error,
+                    KernelError::Connector(ConnectorError::UnsupportedContent(_))
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    KernelError::RateLimit(
+                        crate::rate_limit::RateLimitError::RequestExceedsTpm { .. }
+                    )
+                ));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(limiter.try_stats().unwrap().requests_this_minute, 0);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let limiter = execution_rate_limiter_with_tpm(100_000);
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(ImageBoundSession {
+                id: "image-fixture".into(),
+                calls: calls.clone(),
+                profile: Some(crate::connector::ImageInputProfile {
+                    model_id: "fixture".into(),
+                    max_tokens_per_image: 3000,
+                }),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "system".into(),
+        );
+        executor.set_context_budget(0);
+        executor.set_rate_limiter(limiter.clone());
+        assert!(matches!(
+            executor
+                .run_content_resumable(image_content_fixture())
+                .await
+                .unwrap(),
+            TurnResult::Completed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            limiter.try_stats().unwrap().tokens_this_minute >= 3000,
+            "provider underreporting cannot refund the declared image bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_input_context_compaction_spills_exact_ordered_parts_without_flattening() {
+        let context = mock_context_manager();
+        let id = uuid::Uuid::new_v4();
+        let mut executor = AgentExecutor::new_unconfined(
+            id,
+            Box::new(ImageBoundSession {
+                id: "image-fixture".into(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                profile: Some(crate::connector::ImageInputProfile {
+                    model_id: "fixture".into(),
+                    max_tokens_per_image: 3000,
+                }),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context.clone(),
+            "system".into(),
+        );
+        let image = StandardMessage::user_content(image_content_fixture());
+        executor.messages.push(image.clone());
+        executor
+            .messages
+            .push(StandardMessage::assistant("earlier result"));
+        executor.messages.push(StandardMessage::user("latest text"));
+        let original = executor.messages.clone();
+        executor.set_context_budget(900);
+        executor.compact_to_token_budget(&[]).await.unwrap();
+        assert!(!executor.messages.contains(&image));
+        let key = context.kv_list(id).unwrap().remove(0);
+        let raw = context.kv_get(id, &key).unwrap().unwrap();
+        let restored: Vec<StandardMessage> = serde_json::from_str(&raw).unwrap();
+        assert!(restored.contains(&image));
+        let digest = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let expected_reference = format!(
+            "[Context spill: key={key}; sha256-prefix={}; n={}]",
+            &digest[..16],
+            restored.len()
+        );
+        assert!(executor
+            .messages
+            .iter()
+            .any(|message| message.role == "system"
+                && message.content.legacy_text() == Some(expected_reference.as_str())));
+        assert!(executor.estimate_prompt_tokens(&executor.messages) <= 900);
+        let active_original = executor
+            .messages
+            .iter()
+            .filter(|message| message.content.legacy_text() != Some(expected_reference.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(active_original.len() + restored.len(), original.len());
+        assert!(original
+            .iter()
+            .all(|message| active_original.contains(&message) || restored.contains(message)));
     }
 
     struct CountingContentSession {
@@ -3213,6 +3670,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
             .to_string()
             .contains("does not enforce the configured max_output_tokens_per_request"));
         assert_eq!(limiter.try_stats().unwrap().requests_this_minute, 0);
+        assert_eq!(executor.provider_outcomes.snapshot(), Default::default());
     }
 
     #[tokio::test]
@@ -3609,6 +4067,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
         executor.set_rate_limiter(limiter.clone());
         let cancellation = executor.cancel_token();
 
+        let observed_outcomes = executor.provider_outcomes.clone();
         let run = tokio::spawn(async move { executor.run("cancel after invoke").await });
         tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
             .await
@@ -3618,6 +4077,13 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
 
         assert_eq!(output.content, "Cancelled.");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observed_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                cancelled: 1,
+                ..Default::default()
+            }
+        );
         let stats = limiter.try_stats().unwrap();
         assert_eq!(stats.requests_this_minute, 1);
         assert!(stats.tokens_this_minute > 0);
@@ -3663,6 +4129,46 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
         assert_eq!(stats.reconciled_receipts, 1);
         assert_eq!(stats.reserved_receipts, 0);
         assert_eq!(stats.in_flight_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn timed_out_provider_invocations_are_counted_without_failure_or_success_inflation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: None,
+                release: Some(Arc::new(tokio::sync::Notify::new())),
+                fail: false,
+                id: "timeout-fixture".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(execution_rate_limiter_with_tpm(100_000));
+        executor.set_provider_request_timeout(std::time::Duration::from_millis(10));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            executor.run("provider deadline"),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            KernelError::Connector(ConnectorError::Timeout(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), LLM_RETRIES);
+        assert_eq!(
+            executor.provider_outcomes.snapshot(),
+            crate::telemetry::ProviderOutcomeSnapshot {
+                timed_out: u64::try_from(LLM_RETRIES).unwrap(),
+                ..Default::default()
+            }
+        );
     }
 
     /// Mock session that calls a nonexistent tool — tests error recovery message to LLM.

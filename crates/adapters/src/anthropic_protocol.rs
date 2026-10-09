@@ -103,7 +103,7 @@ pub(super) fn request(
                 system.push(json!({"type": "text", "text": message.content}))
             }
             "user" if message.provider_metadata.is_none() => {
-                output.push(json!({"role": "user", "content": message.content}))
+                output.push(json!({"role": "user", "content": crate::vision::anthropic_content(&message.content)}))
             }
             "assistant" => {
                 let blocks = if let Some(metadata) = &message.provider_metadata {

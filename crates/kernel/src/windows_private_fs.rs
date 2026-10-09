@@ -43,6 +43,63 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestOpenProvenance {
+    pub identity: (u32, u32, u32),
+    pub access: u32,
+    pub share: u32,
+    pub file: &'static str,
+    pub line: u32,
+}
+
+#[cfg(test)]
+fn test_open_events() -> &'static std::sync::Mutex<std::collections::VecDeque<TestOpenProvenance>> {
+    static EVENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::VecDeque<TestOpenProvenance>>,
+    > = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+#[cfg(test)]
+#[track_caller]
+fn record_test_open(file: &File, access: u32, share: u32) {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return;
+    }
+    let caller = std::panic::Location::caller();
+    let mut events = test_open_events().lock().unwrap();
+    if events.len() == 4096 {
+        events.pop_front();
+    }
+    events.push_back(TestOpenProvenance {
+        identity: (
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ),
+        access,
+        share,
+        file: caller.file(),
+        line: caller.line(),
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_open_provenance(identity: (u32, u32, u32)) -> Vec<TestOpenProvenance> {
+    test_open_events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.identity == identity)
+        .cloned()
+        .collect()
+}
+
 fn denied(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
@@ -250,6 +307,7 @@ fn reject_reparse_ancestors(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(test, track_caller)]
 fn open(path: &Path, directory: bool, access: u32) -> io::Result<File> {
     reject_reparse_ancestors(path)?;
     let wide = local_path(path)?;
@@ -277,6 +335,12 @@ fn open(path: &Path, directory: bool, access: u32) -> io::Result<File> {
     if actual != directory {
         return Err(denied("private storage object has the wrong type"));
     }
+    #[cfg(test)]
+    record_test_open(
+        &file,
+        access | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    );
     Ok(file)
 }
 
@@ -381,7 +445,95 @@ pub(crate) fn check_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Read-only eligibility check for a recorded workspace. Does not narrow its
+/// ACL or take ownership; exact TokenUser/TokenOwner eligibility is unchanged.
+pub(crate) fn check_directory_owner(path: &Path) -> io::Result<()> {
+    let directory = open(path, true, READ_CONTROL)?;
+    owner_and_acl(&directory, &UserSid::current()?, false)
+}
+
+#[cfg(test)]
+pub(crate) fn set_system_directory_owner_for_recovery_test(path: &Path) -> io::Result<()> {
+    assert_eq!(
+        std::env::var("AIAGENTOS_RECOVERY_FOREIGN_OWNER_CHILD")
+            .ok()
+            .as_deref(),
+        Some("1")
+    );
+    use windows_sys::Win32::Foundation::{GetLastError, LUID};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, CreateWellKnownSid, LookupPrivilegeValueW, WinLocalSystemSid,
+        LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    };
+    use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+    let mut token = null_mut();
+    let mut luid = unsafe { zeroed::<LUID>() };
+    let privilege: Vec<u16> = "SeRestorePrivilege\0".encode_utf16().collect();
+    unsafe {
+        bool_result(OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+            &mut token,
+        ))?;
+        bool_result(LookupPrivilegeValueW(null(), privilege.as_ptr(), &mut luid))?;
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    unsafe {
+        bool_result(AdjustTokenPrivileges(
+            token.as_raw_handle(),
+            0,
+            &privileges,
+            0,
+            null_mut(),
+            null_mut(),
+        ))?;
+        if GetLastError() == 1300 {
+            return Err(io::Error::from_raw_os_error(1300));
+        }
+    }
+    let directory = open(path, true, READ_CONTROL | WRITE_OWNER)?;
+    let mut system = [0_usize; 16];
+    let mut bytes = std::mem::size_of_val(&system) as u32;
+    unsafe {
+        bool_result(CreateWellKnownSid(
+            WinLocalSystemSid,
+            null_mut(),
+            system.as_mut_ptr().cast(),
+            &mut bytes,
+        ))?;
+        let result = SetSecurityInfo(
+            directory.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            system.as_mut_ptr().cast(),
+            null_mut(),
+            null(),
+            null(),
+        );
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn protect_path(path: &Path, directory: bool) -> io::Result<()> {
+    #[cfg(test)]
+    if directory {
+        let target = std::fs::canonicalize(path)?;
+        let shared_temporary = std::fs::canonicalize(std::env::temp_dir())?;
+        assert_ne!(
+            target, shared_temporary,
+            "private storage test fixtures must own their directory before ACL mutation"
+        );
+    }
     let file = open(path, directory, READ_CONTROL | WRITE_DAC)?;
     let descriptor = PrivateDescriptor::new(directory)?;
     // A permissive object owned by the exact current TokenUser/TokenOwner may

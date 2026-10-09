@@ -9,6 +9,11 @@ const MAX_DIM: usize = 16_384;
 const MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CACHED_AGENTS: usize = 16;
 
+// SQLite maintains these exact integer byte counts on every row mutation,
+// including legacy writers and raw repair transactions. Keep the quota query
+// expression identical so it reads the index rather than the fact payloads.
+pub(super) const STORAGE_BYTE_EXPRESSION: &str = "LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) + COALESCE(LENGTH(embedding_blob), 0)";
+
 fn failed(error: impl ToString) -> ContextError {
     ContextError::StorageError(error.to_string())
 }
@@ -93,6 +98,11 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), ContextError> {
     }
     drop(rows);
     drop(statement);
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_facts_storage_bytes
+         ON facts(agent_id, ({STORAGE_BYTE_EXPRESSION}));"
+    ))
+    .map_err(failed)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS fact_index_generations (
         agent_id TEXT PRIMARY KEY, generation INTEGER NOT NULL CHECK(generation >= 0));
@@ -996,7 +1006,7 @@ mod tests {
                 .unwrap()],
             )
             .unwrap();
-            conn.execute_batch("DROP TABLE fact_index_generations; ALTER TABLE facts DROP COLUMN embedding_blob; DELETE FROM schema_migrations WHERE version=10; UPDATE storage_meta SET schema_version=9,min_reader_schema_version=9; PRAGMA user_version=9;").unwrap();
+            conn.execute_batch("DROP INDEX idx_facts_storage_bytes; DROP TABLE fact_index_generations; ALTER TABLE facts DROP COLUMN embedding_blob; DELETE FROM schema_migrations WHERE version=10; UPDATE storage_meta SET schema_version=9,min_reader_schema_version=9; PRAGMA user_version=9;").unwrap();
         }
         drop(manager);
         let reopened = SqliteContextManager::new(&path).unwrap();

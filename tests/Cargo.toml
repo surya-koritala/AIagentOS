@@ -10,6 +10,7 @@ name = "integration_tests"
 path = "src/lib.rs"
 
 [features]
+workspace-qualification = ["kernel/qualification"]
 wasm = ["kernel/wasm"]
 
 [dependencies]

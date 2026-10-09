@@ -55,6 +55,34 @@ as unavailable with `probe_timed_out = true`. `captured_at` is written after
 all samples. Prometheus/gate counters are process-local and reset on restart;
 durable tunables and package-instance metadata do not.
 
+## One agent's gate decisions
+
+`AgentInfo` carries `gate_decisions` with `allowed`, `denied_capability`,
+`denied_mac`, `denied_approval`, `denied_cgroup`, `denied_unknown`,
+`denied_namespace`, and `audited`. `KernelClient::agent_info` includes the same
+state; `KernelClient::agent_gate_stats(id)` returns just these counters.
+
+```bash
+agentctl --addr 127.0.0.1:7777 --token "$TENANT_API_KEY" gate-stats AGENT_ID
+```
+
+Tenant `ReadOnly` credentials may read owned-agent counters. Foreign and unknown
+agent IDs receive the same typed `AuthorizationDenied` error without counters.
+The direct read does not depend on the bounded operator snapshot's agent list.
+Without an agent ID, `agentctl gate-stats` retains its existing System-only
+process-wide output. All these counters are process-local and reset on restart;
+they are not durable history or a per-tool breakdown.
+
+Missing, invalidly declared, and namespace-hidden public tool lookups increment
+`denied_unknown`. Hidden and missing names have the same error and counter delta,
+preventing counters from exposing hidden tool existence. `denied_namespace`
+records actual namespace verdicts from the declared gate contract. Introspection
+does not itself add a gate decision.
+
+The additive defaulted reply field keeps protocol version 2 and minimum version
+1. Older replies deserialize with zero counters. `agent_gate_statistics` in the
+protocol feature list distinguishes servers providing this exposure.
+
 ## Durable tunables
 
 The public settings are intentionally small. Every value drives a live path:
@@ -108,8 +136,15 @@ trust/revocation, publish/fetch/search, install/upgrade/rollback/remove, and
 verified run. Marketplace ratings/download counters are not part of the v1
 surface.
 
-Provider health is currently availability plus timeout evidence; provider
-error taxonomies, circuit breakers, model discovery, and external contract
-tests remain tracked by issue #120. Per-agent gate counters reset on restart,
+Provider health is availability plus timeout evidence. Explicit model discovery
+uses the system-only `list_provider_models` syscall, SDK
+`KernelClient::list_provider_models`, and `agentctl models PROVIDER_ID`; tenant
+API keys, including Admin keys, cannot enumerate configured credential-backed
+catalogs. The response contains a provider ID and bounded normalized model IDs;
+unsupported adapters return the typed `unsupported` error. See
+[provider endpoints and limits](PROVIDERS.md#explicit-model-discovery). The
+ordinary provider view reports capabilities without automatically listing
+models. Live provider contracts remain tracked by issue #120.
+Per-agent gate counters reset on restart,
 and this API is an agent-runtime control surface rather than a Linux `/proc`
 mount or a claim of Linux-kernel equivalence.

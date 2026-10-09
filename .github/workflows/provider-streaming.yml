@@ -6,6 +6,14 @@ on:
     paths:
       - 'crates/adapters/**'
       - 'crates/kernel/src/connector.rs'
+      - 'crates/kernel/src/model_discovery*.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/wire_contract.rs'
+      - 'crates/sdk/**'
+      - 'crates/cli/**'
+      - 'protocol/**'
+      - 'scripts/verify_wire_fixtures.py'
+      - 'scripts/tests/test_verify_wire_fixtures.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/provider-streaming.yml'
@@ -48,6 +56,18 @@ jobs:
             git diff --binary > rustfmt.patch
             exit 1
           fi
+      - name: Versioned operation-set conformance without provider calls
+        run: python -m unittest discover -s scripts/tests -p 'test_verify_wire_fixtures.py'
+      - name: Early bounded model discovery and capability contracts
+        run: cargo test -p adapters --all-features --locked model_discovery
+      - name: System-only catalog authorization and third-party bounds
+        run: |
+          cargo test -p kernel --locked model_discovery
+          cargo test -p kernel --locked syscall_server::tests::authorization_policy_classifies_every_syscall_and_agent_resource -- --exact
+      - name: Actual operator wire, SDK and agentctl model discovery
+        run: |
+          cargo test -p agent-sdk --test model_discovery --locked
+          cargo test -p agent-cli --test model_discovery_commands --locked
       - name: Early local NDJSON and controlled decoder contracts
         run: cargo test -p adapters --all-features --locked local_streaming_tests
       - name: Controlled blocking worker cancellation and cleanup

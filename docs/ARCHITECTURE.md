@@ -1,9 +1,9 @@
 # AI Agent OS — Architecture
 
-> **Mental model (load-bearing):** *agents are processes, context is virtual
-> memory, tools are files, and the kernel orchestrates them.* Every module in
-> `crates/kernel/src/` maps to a Linux kernel subsystem. When deciding where
-> something belongs, find its Linux analogue first.
+> **Runtime model:** agents are governed runtime objects, context has prompt and
+> durable-storage limits, and tools are authorized resource operations. Linux
+> names describe design analogies. `crates/kernel/` is a user-space orchestrator
+> on the host OS, with no Linux ABI, hardware-driver or kernel-mode guarantee.
 
 This document describes the system **as it is built today**. It is the canonical
 reference for the README and for new design work.
@@ -36,8 +36,8 @@ do retain the committed authority term and exact bounded lease expiry.
 
 ## 1. The one-paragraph version
 
-AI Agent OS is a Rust workspace that runs AI agents the way Linux runs
-processes. A single orchestrator — `AgentKernelImpl` — owns every subsystem and
+AI Agent OS is a Rust workspace for governed multi-agent execution on the host
+operating system. A single orchestrator — `AgentKernelImpl` — owns every subsystem and
 wires them together. Agents are created, scheduled (CFS-style fair scheduling
 with priorities/nice), and given a token budget that behaves like virtual
 context (bounded active prompts with durable spill/backpressure). Every tool an agent calls passes through
@@ -59,7 +59,7 @@ supporting cast.
 
 ```
 crates/
-  kernel/      # The OS kernel — ~60 modules, each maps to a Linux subsystem
+  kernel/      # User-space runtime, control plane and authorization boundary
   adapters/    # 9 LLM provider adapters + centralized streaming
   resources/   # Resource providers (filesystem, network, application, browser, …)
   cli/         # `agent` binary (REPL/one-shot) + `agent-server` binary
@@ -72,9 +72,11 @@ examples/      # CLI usage examples
 docs/          # This doc + spec, roadmap, runbook, package format
 ```
 
-**Rust-only.** No Python/TS/Go runtimes, SDKs, or bindings anywhere in the
-product. TLS is `rustls` (ring provider, no C toolchain). Embeddings are
-pure-Rust and deterministic. Persistence is bundled `rusqlite`.
+The runtime and clients are Rust. The desktop frontend uses Svelte/JavaScript,
+and release/qualification automation includes Python and shell scripts. TLS
+uses `rustls` with ring; bundled SQLCipher/OpenSSL storage requires a C toolchain
+when built from source. Offline embeddings are deterministic Rust; optional
+configured embedding services have separate protocol and live-model evidence.
 
 ---
 
@@ -321,7 +323,7 @@ transport (`handle<R, W>`):
   (`bind_tls`/`connect_tls`, rustls/ring). Optional shared-secret `Authenticate`.
 - **Syscalls (current surface):**
   `CreateAgent · ListAgents · AgentInfo · SendMessage · CallTool · GateStats ·
-   ListProviders · MemoryStore · MemoryQuery · StoragePut/Get/List/Delete ·
+   ListProviders · ListProviderModels · MemoryStore · MemoryQuery · StoragePut/Get/List/Delete ·
    SnapshotContext · RestoreSnapshot · ListSnapshots · DeleteSnapshot ·
    LoadPackage · NodeInfo · Authenticate`
 

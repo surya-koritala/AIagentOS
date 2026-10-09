@@ -475,7 +475,7 @@ pub fn build_prompt_with_template(messages: &[StandardMessage], template: ChatTe
                 out.push_str("<|im_start|>");
                 out.push_str(&message.role);
                 out.push('\n');
-                out.push_str(&message.content);
+                out.push_str(&message.content.text_projection());
                 out.push_str("<|im_end|>\n");
             }
             out.push_str("<|im_start|>assistant\n");
@@ -487,7 +487,7 @@ pub fn build_prompt_with_template(messages: &[StandardMessage], template: ChatTe
                 out.push_str("<|start_header_id|>");
                 out.push_str(&message.role);
                 out.push_str("<|end_header_id|>\n\n");
-                out.push_str(&message.content);
+                out.push_str(&message.content.text_projection());
                 out.push_str("<|eot_id|>");
             }
             out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
@@ -635,6 +635,7 @@ impl OnDeviceSession {
         events: Option<ProviderEventSink>,
         streaming: bool,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         if cancellation.is_cancelled() {
             return Err(ConnectorError::cancelled(self.provider_id.clone(), None));
         }
@@ -733,6 +734,7 @@ impl LlmSession for OnDeviceSession {
         _tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         self.send_controlled(messages, _tools, options, &cancellation)
             .await
@@ -777,6 +779,7 @@ impl LlmSession for OnDeviceSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.run(messages, options, cancellation, None, true).await
     }
     async fn send_streaming_events_controlled(
@@ -787,6 +790,7 @@ impl LlmSession for OnDeviceSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: ProviderEventSink,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.run(messages, options, cancellation, Some(events), true)
             .await
     }
@@ -845,7 +849,7 @@ impl LlmProviderAdapter for OnDeviceLlmAdapter {
         Some(StandardMessage {
             provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
-            content: value.get("content")?.as_str().unwrap_or("").to_string(),
+            content: value.get("content")?.as_str().unwrap_or("").into(),
             tool_call_id: None,
             tool_calls: None,
         })

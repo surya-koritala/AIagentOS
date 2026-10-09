@@ -12,6 +12,9 @@ const MATURITY_MODEL: [&str; 5] = [
     "production-qualified",
 ];
 
+#[path = "public_claims.rs"]
+mod public_claims;
+
 #[derive(Debug, Deserialize)]
 struct Registry {
     schema_version: u32,
@@ -648,11 +651,106 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
         "pending-grant and active-use counts",
         "cooperatively cancels every active exact-match use",
         "No remote, SDK, package, or MCP surface can create, inspect, or revoke grants",
+        "Tauri desktop main window",
     ] {
         assert!(
             row.contains(contract),
             "peripheral matrix row lost honest contract {contract:?}"
         );
+    }
+
+    let native = read_workspace_file("crates/kernel/src/peripheral_operator.rs");
+    for contract in [
+        "MAX_REQUESTS: usize = 64",
+        "APPROVAL_WAIT: Duration = Duration::from_secs(30)",
+        "with_peripheral_binding",
+        "LocalPeripheralAction::Revoke",
+        "struct PendingPeripheralResume",
+    ] {
+        assert!(
+            native.contains(contract),
+            "native peripheral handoff lost {contract:?}"
+        );
+    }
+    let compact_native: String = native
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let opaque_projection =
+        "resource_identity:crate::resources::opaque_identity(record.resource.as_bytes()";
+    assert!(
+        compact_native.contains(&format!("{opaque_projection})"))
+            || compact_native.contains(&format!("{opaque_projection},)")),
+        "native resource identity must derive only from the opaque target digest"
+    );
+    let desktop = read_workspace_file("crates/tauri-app/src/lib.rs");
+    assert!(desktop.contains("peripheral_operator: Option<kernel::LocalPeripheralOperator>"));
+    assert!(desktop.contains("peripheral approval requires the embedded desktop kernel"));
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    for name in [
+        "get_peripheral_requests",
+        "approve_peripheral_request",
+        "deny_peripheral_request",
+        "revoke_peripheral_request",
+    ] {
+        let signature = commands
+            .find(&format!("pub fn {name}("))
+            .expect("native peripheral command");
+        let body = &commands[signature..];
+        assert!(body
+            .split('}')
+            .next()
+            .unwrap()
+            .contains("require_native_peripheral_window(&window)?"));
+    }
+    let capability: serde_json::Value = serde_json::from_str(&read_workspace_file(
+        "crates/tauri-app/capabilities/main.json",
+    ))
+    .unwrap();
+    assert_eq!(capability["local"], true);
+    assert_eq!(capability["windows"], serde_json::json!(["main"]));
+    assert!(capability.get("remote").is_none());
+    let permission = read_workspace_file("crates/tauri-app/permissions/desktop.toml");
+    let main = read_workspace_file("crates/tauri-app/src/main.rs");
+    let handlers = main
+        .split("tauri::generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split("])")
+        .next()
+        .unwrap();
+    for handler in handlers
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("commands::"))
+    {
+        let name = handler.trim_end_matches(',');
+        assert!(
+            permission.contains(&format!("\"{name}\"")),
+            "native permission omitted existing command {name}"
+        );
+    }
+    for path in [
+        "crates/cli/src/bin/agentctl.rs",
+        "crates/sdk/src/lib.rs",
+        "crates/kernel/src/syscall_server.rs",
+        "crates/kernel/src/mcp.rs",
+        "crates/kernel/src/mcp_server.rs",
+        "crates/kernel/src/agent_package.rs",
+        "crates/kernel/src/package.rs",
+    ] {
+        let remote = read_workspace_file(path);
+        for name in [
+            "attach_local_peripheral_operator",
+            "approve_peripheral_request",
+            "approve_peripheral_call",
+            "revoke_peripheral_request",
+            "revoke_peripheral_call(",
+        ] {
+            assert!(
+                !remote.contains(name),
+                "untrusted surface {path} acquired {name}"
+            );
+        }
     }
 }
 
@@ -1595,7 +1693,7 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "signed-updater foundation",
         "TAURI_SIGNING_PRIVATE_KEY",
         "automatic downgrade is not enabled",
-        "public `v*` tag is deliberately rejected",
+        "that requests desktop assets is deliberately rejected",
         "failed-update, and operator-led rollback evidence",
     ] {
         assert!(

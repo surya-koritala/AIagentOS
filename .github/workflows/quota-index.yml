@@ -1,0 +1,101 @@
+name: Exact fact quota accounting comparison
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/context-quota-index]
+    paths:
+      - '.github/workflows/quota-index.yml'
+      - 'crates/kernel/src/context.rs'
+      - 'crates/kernel/src/context/fact_index.rs'
+      - 'crates/kernel/src/context/storage_index_tests.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quota-index-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  comparison:
+    name: Exact quota invariants and same-run 100k comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      BASELINE_COMMIT: 96cf252352cd43dff111c8d0d9c60225d5e14a54
+      MEMORY_BENCH_MODE: production
+      MEMORY_BENCH_ITEMS: '100000'
+      MEMORY_BENCH_QUERIES: '100'
+      MEMORY_BENCH_SOAK_SECONDS: '60'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Bind both measurements to clean exact sources
+        run: |
+          set -euo pipefail
+          mkdir -p target/qualification/quota-index
+          git rev-parse HEAD > target/qualification/quota-index/candidate-source.txt
+          printf '%s\n' "$BASELINE_COMMIT" > target/qualification/quota-index/baseline-source.txt
+          test -z "$(git status --porcelain --untracked-files=no)"
+          cargo fmt --all -- --check
+          git worktree add --detach ../quota-baseline "$BASELINE_COMMIT"
+      - name: Exact indexed bytes, raw mutation, rollback, reopen and quota denial
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked storage_index_tests -- --nocapture \
+            2>&1 | tee target/qualification/quota-index/quota-tests.log
+          grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' target/qualification/quota-index/quota-tests.log
+      - name: Preserve the unchanged baseline including a failed performance threshold
+        working-directory: ../quota-baseline
+        run: |
+          set -euo pipefail
+          set +e
+          cargo run -p os-benchmark --bin memory-qualification --locked \
+            > "$GITHUB_WORKSPACE/target/qualification/quota-index/baseline.json"
+          baseline_exit=$?
+          set -e
+          printf '%s\n' "$baseline_exit" > "$GITHUB_WORKSPACE/target/qualification/quota-index/baseline-exit.txt"
+          jq -e --arg commit "$BASELINE_COMMIT" '
+            .schema_version == 3 and .mode == "production-context" and
+            .source.commit == $commit and .source.dirty == false and
+            .production_claim_allowed == false and .provider_api_calls == 0 and
+            .corpus_items == 100000 and .queries == 100 and
+            .integrity.passed == true and .isolation_passed == true and
+            .traffic.errors == 0 and .traffic.elapsed_seconds >= 60' \
+            "$GITHUB_WORKSPACE/target/qualification/quota-index/baseline.json"
+      - name: Require the same candidate workload and unchanged full acceptance thresholds
+        run: |
+          set -euo pipefail
+          cargo run -p os-benchmark --bin memory-qualification --locked \
+            > target/qualification/quota-index/candidate.json
+          jq -e --arg commit "$GITHUB_SHA" '
+            .schema_version == 3 and .mode == "production-context" and
+            .source.commit == $commit and .source.dirty == false and
+            .production_claim_allowed == false and .provider_api_calls == 0 and
+            .corpus_items == 100000 and .queries == 100 and .passed == true and
+            .scale_qualification_passed == true and .integrity.passed == true and
+            .isolation_passed == true and .traffic.errors == 0 and
+            .traffic.elapsed_seconds >= 60 and .traffic.reads >= 128 and
+            .traffic.writes >= 20 and .latency.sustained_read.p95_us <= 1000000' \
+            target/qualification/quota-index/candidate.json
+          jq -n --slurpfile baseline target/qualification/quota-index/baseline.json \
+            --slurpfile candidate target/qualification/quota-index/candidate.json \
+            '{evidence_class:"same-run-synthetic-context",production_claim_allowed:false,baseline:$baseline[0],candidate:$candidate[0]}' \
+            > target/qualification/quota-index/comparison.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: quota-index-${{ github.sha }}
+          path: target/qualification/quota-index
+          if-no-files-found: error
+          retention-days: 30

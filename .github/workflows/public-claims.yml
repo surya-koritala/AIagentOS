@@ -1,0 +1,92 @@
+name: Public claim evidence integrity
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - 'docs/**'
+      - 'crates/*/Cargo.toml'
+      - 'tests/src/capability_registry.rs'
+      - 'tests/src/public_claims.rs'
+      - '.github/workflows/public-claims.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-claims-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  evidence:
+    name: Registry claims and real downgrade rejection
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Bind report to source
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p target/qualification/public-claims
+          printf '%s\n' "$PR_HEAD" > target/qualification/public-claims/head.txt
+          git rev-parse HEAD > target/qualification/public-claims/tested-merge.txt
+          rustc --version > target/qualification/public-claims/toolchain.txt
+      - name: Validate complete current public inventory and declarations
+        run: |
+          set -euo pipefail
+          cargo test -p integration-tests capability_registry --locked -- --nocapture 2>&1 | tee target/qualification/public-claims/positive.log
+      - name: A real tier downgrade must fail and name affected documentation
+        run: |
+          set -euo pipefail
+          cp docs/capabilities.toml target/qualification/public-claims/registry.original
+          trap 'cp target/qualification/public-claims/registry.original docs/capabilities.toml' EXIT
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('docs/capabilities.toml')
+          source = path.read_text()
+          sections = source.split('[[capability]]')
+          selected = [index for index, section in enumerate(sections) if 'id = "tool-vfs"' in section]
+          assert len(selected) == 1, selected
+          index = selected[0]
+          assert sections[index].count('maturity = "integrated"') == 1
+          sections[index] = sections[index].replace('maturity = "integrated"', 'maturity = "unit-tested"', 1)
+          path.write_text('[[capability]]'.join(sections))
+          PY
+          if cargo test -p integration-tests capability_registry::public_claims::public_surfaces_and_declared_tiers_are_complete_and_honest --locked -- --nocapture > target/qualification/public-claims/downgrade.log 2>&1; then
+            cat target/qualification/public-claims/downgrade.log
+            exit 1
+          fi
+          grep -F 'README.md' target/qualification/public-claims/downgrade.log
+          grep -F 'docs/VFS.md' target/qualification/public-claims/downgrade.log
+          grep -F 'above recorded unit-tested' target/qualification/public-claims/downgrade.log
+          cp target/qualification/public-claims/registry.original docs/capabilities.toml
+          git diff --exit-code docs/capabilities.toml
+          printf '%s\n' 'real downgrade rejected; repository tiers restored' > target/qualification/public-claims/downgrade-result.txt
+      - name: Verify and retain actual external repository framing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RUNTIME_DESCRIPTION: 'A governed user-space runtime and control plane for long-lived AI agents, with lifecycle, scheduling, durable context, tool authorization, quotas and operator interfaces.'
+        run: |
+          gh api repos/${{ github.repository }} --jq '{description,topics}' > target/qualification/public-claims/external-metadata.json
+          jq -e --arg description "$EXPECTED_RUNTIME_DESCRIPTION" '
+            .description == $description and
+            (.topics | sort) == (["agent-runtime","control-plane","ai-agents","multi-agent","llm","rust"] | sort)
+          ' target/qualification/public-claims/external-metadata.json
+          printf '%s\n' 'Runtime description and topics verified against the recorded framing.' > target/qualification/public-claims/external-metadata-status.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: public-claims-${{ github.run_id }}
+          path: target/qualification/public-claims
+          if-no-files-found: error

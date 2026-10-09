@@ -44,7 +44,7 @@ use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
 use crate::observability::{AgentAction, ObservabilityEngine};
 use crate::resources::ResourceBroker;
 use crate::wire_io::{graceful_close_framed, read_bounded_line, write_bounded_json};
-use crate::{AgentConfig, AgentKernelImpl, Priority};
+use crate::{AgentConfig, AgentKernelImpl, KernelError, Priority};
 
 /// Default simultaneous syscall connection limit.
 pub use crate::wire_io::DEFAULT_MAX_CONNECTIONS as DEFAULT_WIRE_MAX_CONNECTIONS;
@@ -68,7 +68,8 @@ pub use crate::wire_io::STREAM_EVENT_BUFFER_CAPACITY;
 /// The `Syscall`/`SyscallReply` schema is versioned independently of the crate
 /// release: bump this whenever a wire-breaking change lands (a removed/renamed
 /// variant or field, or a changed serialization). Additive, backward-compatible
-/// changes (a new optional syscall) do **not** bump it. A client negotiates with
+/// changes (a new optional syscall or defaulted reply field) do **not** bump it.
+/// A client negotiates with
 /// [`Syscall::Hello`] and learns the server's `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
 /// support window; an out-of-range client gets a clear error rather than silent
 /// breakage. See `RELEASING.md` ("Toward a stable API").
@@ -81,6 +82,10 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 #[cfg(test)]
 #[path = "identity_admin_tests.rs"]
 mod identity_admin_tests;
+
+#[cfg(test)]
+#[path = "gate_statistics_tests.rs"]
+mod gate_statistics_tests;
 
 /// Maximum duration accepted from an untrusted wire `WaitAgent` request.
 ///
@@ -381,6 +386,10 @@ pub enum Syscall {
         agent_id: String,
         message: String,
     },
+    SendMessageContent {
+        agent_id: String,
+        content: crate::message_content::MessageContent,
+    },
     /// Drive one turn while emitting ordered request-scoped event frames on
     /// this connection. Cancellation is sent from another authenticated
     /// connection with [`CancelRequest`](Self::CancelRequest).
@@ -388,6 +397,11 @@ pub enum Syscall {
         request_id: String,
         agent_id: String,
         message: String,
+    },
+    SendMessageContentStream {
+        request_id: String,
+        agent_id: String,
+        content: crate::message_content::MessageContent,
     },
     /// Cooperatively cancel one exact active streaming request. The agent id
     /// keeps the operation inside the normal tenant ownership check.
@@ -529,6 +543,11 @@ pub enum Syscall {
     /// backends an agent can be created against and driven through
     /// [`SendMessage`](Self::SendMessage).
     ListProviders,
+    /// Explicit system-scoped lookup using one configured provider. Tenant
+    /// credentials cannot enumerate credential-backed model catalogs.
+    ListProviderModels {
+        provider_id: String,
+    },
     /// Store a fact in an agent's long-term memory (the durable SQLite facts
     /// store). `category` is one of `preference` / `learned_pattern` / `fact` /
     /// `instruction`; it defaults to `fact`.
@@ -1172,6 +1191,8 @@ pub enum WireErrorCode {
     Cancelled,
     IncompatibleVersion,
     Provider,
+    Unsupported,
+    UnsupportedContent,
     Lifecycle,
     Internal,
 }
@@ -1184,6 +1205,8 @@ impl WireErrorCode {
             // non-oracle message. Preserve the authorization category instead
             // of allowing the phrase "not found" to misclassify it.
             (Self::AuthorizationDenied, false)
+        } else if message.contains("content unsupported") {
+            (Self::UnsupportedContent, false)
         } else if message.contains("incompatible wire-protocol") {
             (Self::IncompatibleVersion, false)
         } else if message.contains("authentication required") {
@@ -1430,10 +1453,18 @@ pub enum SyscallReply {
         pid: u64,
         capabilities: Vec<String>,
         namespaces: Vec<u64>,
+        /// This agent's process-local decisions; reset on process restart.
+        /// Older compatible servers omit this additive field.
+        #[serde(default)]
+        gate_decisions: crate::syscall_gate::GateStats,
     },
     /// The LLM providers registered with the kernel (reply to [`Syscall::ListProviders`]).
     Providers {
         providers: Vec<ProviderSummary>,
+    },
+    /// Identifier-only catalog from one configured provider.
+    ProviderModels {
+        catalog: crate::model_discovery::ModelCatalog,
     },
     /// A fact was stored (reply to [`Syscall::MemoryStore`]); carries its id.
     MemoryStored {
@@ -1705,6 +1736,7 @@ impl std::fmt::Debug for Syscall {
         let fields: &[&str] = match self {
             Self::Authenticate { .. } => &["token"],
             Self::SendMessage { .. } | Self::SendMessageStream { .. } => &["message"],
+            Self::SendMessageContent { .. } | Self::SendMessageContentStream { .. } => &["content"],
             Self::CallTool { .. }
             | Self::VfsInvoke { .. }
             | Self::VfsReadData { .. }
@@ -1821,6 +1853,16 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::SendMessage { agent_id, .. } => {
             (AccessLevel::User, "agent.send_message", Some(agent_id))
         }
+        Syscall::SendMessageContent { agent_id, .. } => (
+            AccessLevel::User,
+            "agent.send_message_content",
+            Some(agent_id),
+        ),
+        Syscall::SendMessageContentStream { agent_id, .. } => (
+            AccessLevel::User,
+            "agent.send_message_content_stream",
+            Some(agent_id),
+        ),
         Syscall::SendMessageStream { agent_id, .. } => (
             AccessLevel::User,
             "agent.send_message_stream",
@@ -1878,6 +1920,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::GateStats => (AccessLevel::System, "system.gate_stats", None),
         Syscall::AgentInfo { agent_id } => (AccessLevel::ReadOnly, "agent.info", Some(agent_id)),
         Syscall::ListProviders => (AccessLevel::ReadOnly, "provider.list", None),
+        Syscall::ListProviderModels { .. } => (AccessLevel::System, "provider.models", None),
         Syscall::MemoryStore { agent_id, .. } => {
             (AccessLevel::User, "memory.store", Some(agent_id))
         }
@@ -2038,6 +2081,73 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
 fn authorization_error() -> SyscallReply {
     SyscallReply::Error {
         message: AUTHORIZATION_DENIED.to_string(),
+    }
+}
+
+fn model_discovery_error_reply(error: crate::ConnectorError) -> SyscallReply {
+    use crate::ConnectorError;
+    // Third-party adapters may include secrets in prose, so never forward
+    // their detail even when the built-in transport already redacts it.
+    let (code, message, retryable) = match error {
+        ConnectorError::UnsupportedFeature(_) => (
+            WireErrorCode::Unsupported,
+            "model discovery is unsupported",
+            false,
+        ),
+        ConnectorError::UnsupportedContent(_) => (
+            WireErrorCode::UnsupportedContent,
+            "model discovery provider returned unsupported content",
+            false,
+        ),
+        ConnectorError::ProviderUnavailable(_) => (
+            WireErrorCode::NotFound,
+            "configured provider not registered",
+            false,
+        ),
+        ConnectorError::Authentication(_) => (
+            WireErrorCode::AuthenticationFailed,
+            "model discovery provider authentication failed",
+            false,
+        ),
+        ConnectorError::Authorization(_) => (
+            WireErrorCode::AuthorizationDenied,
+            "model discovery provider authorization failed",
+            false,
+        ),
+        ConnectorError::Timeout(_) => (
+            WireErrorCode::Timeout,
+            "model discovery deadline exceeded",
+            true,
+        ),
+        ConnectorError::Cancelled(_) => {
+            (WireErrorCode::Cancelled, "model discovery cancelled", false)
+        }
+        ConnectorError::RateLimited(_) => (
+            WireErrorCode::Provider,
+            "model discovery provider rate limited the request",
+            true,
+        ),
+        ConnectorError::ConnectionFailed(_)
+        | ConnectorError::ServiceUnavailable(_)
+        | ConnectorError::StreamError(_) => (
+            WireErrorCode::Unavailable,
+            "model discovery provider unavailable",
+            true,
+        ),
+        ConnectorError::ProtocolError(_)
+        | ConnectorError::InvalidRequest(_)
+        | ConnectorError::ToolIncompatiblePrimary(_)
+        | ConnectorError::ContentFiltered(_)
+        | ConnectorError::PartialStream(_) => (
+            WireErrorCode::InvalidRequest,
+            "model discovery returned an invalid response",
+            false,
+        ),
+    };
+    SyscallReply::TypedError {
+        code,
+        message: message.into(),
+        retryable,
     }
 }
 
@@ -2296,6 +2406,44 @@ async fn authorize(
     Ok(())
 }
 
+/// Trusted harness check against the same live credential and tenant admission
+/// used by public dispatch. The expectation has no wire/MCP/package operation.
+/// No syscall effect is executed even when the probe detects an unexpected allow.
+pub async fn probe_expected_tenant_denial(
+    kernel: &AgentKernelImpl,
+    credential: &str,
+    call: &Syscall,
+) -> Result<bool, KernelError> {
+    let resolved = kernel.resolve_principal(credential).await.ok_or_else(|| {
+        KernelError::Policy("tenant probe credential is not currently admitted".into())
+    })?;
+    let identity = resolved.credential.as_ref().ok_or_else(|| {
+        KernelError::Policy("tenant probe requires a leased credential identity".into())
+    })?;
+    let (principal, _lease) = kernel
+        .acquire_credential_principal(identity)
+        .await
+        .ok_or_else(|| {
+            KernelError::Policy("tenant probe credential is not currently admitted".into())
+        })?;
+    let target = syscall_policy(call).2.ok_or_else(|| {
+        KernelError::Policy("tenant probe requires an agent-addressed operation".into())
+    })?;
+    let agent = uuid::Uuid::parse_str(target)
+        .map_err(|_| KernelError::Policy("tenant probe requires a valid recorded agent".into()))?;
+    if kernel.context_manager.agent_tenant(agent)?.is_none() {
+        return Err(KernelError::Policy(
+            "tenant probe requires an existing recorded target".into(),
+        ));
+    }
+    let allowed = authorize(kernel, Some(&principal), call).await.is_ok();
+    kernel
+        .syscall_gate
+        .denial_probes
+        .record(crate::telemetry::DenialProbeKind::TenantBoundary, allowed);
+    Ok(!allowed)
+}
+
 async fn dispatch_lifecycle<F, Fut>(agent_id: String, action: F) -> SyscallReply
 where
     F: FnOnce(uuid::Uuid) -> Fut,
@@ -2356,6 +2504,8 @@ fn starts_new_work(call: &Syscall) -> bool {
             | Syscall::ResumeGenerationCheckpoint { .. }
             | Syscall::SendMessage { .. }
             | Syscall::SendMessageStream { .. }
+            | Syscall::SendMessageContent { .. }
+            | Syscall::SendMessageContentStream { .. }
             | Syscall::CallTool { .. }
             | Syscall::VfsOpen { .. }
             | Syscall::VfsInvoke { .. }
@@ -2388,6 +2538,8 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
         | Syscall::DeleteGenerationCheckpoint { agent_id, .. }
         | Syscall::SendMessage { agent_id, .. }
         | Syscall::SendMessageStream { agent_id, .. }
+        | Syscall::SendMessageContent { agent_id, .. }
+        | Syscall::SendMessageContentStream { agent_id, .. }
         | Syscall::CancelRequest { agent_id, .. }
         | Syscall::CallTool { agent_id, .. }
         | Syscall::VfsOpen { agent_id, .. }
@@ -3553,9 +3705,27 @@ async fn dispatch_scoped_inner_with_fence(
                 message: format!("invalid agent id: {agent_id}"),
             },
         },
-        Syscall::SendMessageStream { .. } => SyscallReply::Error {
-            message: "streaming requests require the streaming wire transport".into(),
+        Syscall::SendMessageContent { agent_id, content } => match uuid::Uuid::parse_str(&agent_id)
+        {
+            Ok(id) => match kernel.send_message_content(id, content).await {
+                Ok(output) => SyscallReply::Message {
+                    content: output.content,
+                    tool_calls: output.tool_calls_made,
+                    tokens: output.tokens_used,
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(_) => SyscallReply::Error {
+                message: "invalid agent id".into(),
+            },
         },
+        Syscall::SendMessageStream { .. } | Syscall::SendMessageContentStream { .. } => {
+            SyscallReply::Error {
+                message: "streaming requests require the streaming wire transport".into(),
+            }
+        }
         Syscall::CancelRequest {
             request_id,
             agent_id,
@@ -3835,6 +4005,7 @@ async fn dispatch_scoped_inner_with_fence(
                     pid: info.pid,
                     capabilities: info.capabilities,
                     namespaces: info.namespaces,
+                    gate_decisions: kernel.syscall_gate.agent_stats(id),
                 },
                 None => SyscallReply::Error {
                     message: format!("unknown agent: {agent_id}"),
@@ -3861,6 +4032,29 @@ async fn dispatch_scoped_inner_with_fence(
                 })
                 .collect();
             SyscallReply::Providers { providers }
+        }
+        Syscall::ListProviderModels { provider_id } => {
+            if provider_id.is_empty()
+                || provider_id.len() > 128
+                || !provider_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return SyscallReply::TypedError {
+                    code: WireErrorCode::InvalidArgument,
+                    message: "invalid configured provider identifier".into(),
+                    retryable: false,
+                };
+            }
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            match kernel
+                .connector
+                .list_provider_models(&provider_id, &cancellation)
+                .await
+            {
+                Ok(catalog) => SyscallReply::ProviderModels { catalog },
+                Err(error) => model_discovery_error_reply(error),
+            }
         }
         Syscall::MemoryStore {
             agent_id,
@@ -5890,11 +6084,13 @@ where
 
 /// Authorize and drive one live stream on the current connection. The
 /// credential lease acquired by the caller remains held until this returns.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_message_stream<W>(
     kernel: &AgentKernelImpl,
     request_id: String,
     agent_id: String,
     message: String,
+    multipart: Option<crate::message_content::MessageContent>,
     principal: Option<&Principal>,
     write: &mut W,
     negotiated_version: u32,
@@ -5925,6 +6121,7 @@ where
             request_id,
             agent_id,
             message,
+            multipart,
             None,
             principal,
             write,
@@ -5960,6 +6157,7 @@ async fn dispatch_fenced_message_stream<W>(
     request_id: String,
     agent_id: String,
     message: String,
+    multipart: Option<crate::message_content::MessageContent>,
     fenced_agent_id: String,
     proof: AgentMutationFenceProof,
     principal: Option<&Principal>,
@@ -5987,6 +6185,7 @@ where
             request_id,
             agent_id,
             message,
+            multipart,
             Some((fenced_agent_id, proof)),
             principal,
             write,
@@ -6026,6 +6225,7 @@ async fn dispatch_message_stream_inner<W>(
     request_id: String,
     agent_id: String,
     message: String,
+    multipart: Option<crate::message_content::MessageContent>,
     fence: Option<(String, AgentMutationFenceProof)>,
     principal: Option<&Principal>,
     write: &mut W,
@@ -6042,10 +6242,17 @@ where
         write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
         return Ok(crate::telemetry::RequestOutcome::Rejected);
     }
-    let call = Syscall::SendMessageStream {
-        request_id: request_id.clone(),
-        agent_id: agent_id.clone(),
-        message: message.clone(),
+    let call = match &multipart {
+        Some(content) => Syscall::SendMessageContentStream {
+            request_id: request_id.clone(),
+            agent_id: agent_id.clone(),
+            content: content.clone(),
+        },
+        None => Syscall::SendMessageStream {
+            request_id: request_id.clone(),
+            agent_id: agent_id.clone(),
+            message: message.clone(),
+        },
     };
     let authorization_call = match fence.as_ref() {
         Some((fenced_agent_id, proof)) => Syscall::FencedAgentMutation {
@@ -6136,9 +6343,9 @@ where
     // A bounded channel makes the socket writer the backpressure boundary:
     // provider/executor production cannot outrun a slow client without bound.
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(STREAM_EVENT_BUFFER_CAPACITY);
-    let run = kernel.send_message_stream_with_fence(
+    let run = kernel.send_message_content_stream_with_fence(
         parsed_agent,
-        &message,
+        multipart.unwrap_or_else(|| message.into()),
         &request_id,
         events_tx,
         request_fence,
@@ -6833,7 +7040,7 @@ impl SyscallServer {
                 && matches!(
                     &parsed,
                     Ok(Syscall::FencedAgentMutation { mutation, .. })
-                        if matches!(mutation.as_ref(), Syscall::SendMessageStream { .. })
+                        if matches!(mutation.as_ref(), Syscall::SendMessageStream { .. } | Syscall::SendMessageContentStream { .. })
                 )
             {
                 let Ok(Syscall::FencedAgentMutation {
@@ -6844,13 +7051,23 @@ impl SyscallServer {
                 else {
                     unreachable!("fenced stream pattern checked above")
                 };
-                let Syscall::SendMessageStream {
-                    request_id,
-                    agent_id,
-                    message,
-                } = *mutation
-                else {
-                    unreachable!("nested stream pattern checked above")
+                let (request_id, agent_id, message, multipart) = match *mutation {
+                    Syscall::SendMessageStream {
+                        request_id,
+                        agent_id,
+                        message,
+                    } => (request_id, agent_id, message, None),
+                    Syscall::SendMessageContentStream {
+                        request_id,
+                        agent_id,
+                        content,
+                    } => (
+                        request_id,
+                        agent_id,
+                        content.text_projection(),
+                        Some(content),
+                    ),
+                    _ => unreachable!("nested stream pattern checked above"),
                 };
                 if let Some(identity) = credential.as_ref() {
                     match kernel.acquire_credential_principal(identity).await {
@@ -6860,6 +7077,7 @@ impl SyscallServer {
                                 request_id,
                                 agent_id,
                                 message,
+                                multipart,
                                 fenced_agent_id,
                                 proof,
                                 Some(&resolved),
@@ -6884,6 +7102,7 @@ impl SyscallServer {
                         request_id,
                         agent_id,
                         message,
+                        multipart,
                         fenced_agent_id,
                         proof,
                         None,
@@ -6898,20 +7117,27 @@ impl SyscallServer {
             if authed
                 && matches!(
                     &parsed,
-                    Ok(Syscall::SendMessageStream {
-                        request_id: _,
-                        agent_id: _,
-                        message: _
-                    })
+                    Ok(Syscall::SendMessageStream { .. }
+                        | Syscall::SendMessageContentStream { .. })
                 )
             {
-                let Ok(Syscall::SendMessageStream {
-                    request_id,
-                    agent_id,
-                    message,
-                }) = parsed
-                else {
-                    unreachable!("stream pattern checked above")
+                let (request_id, agent_id, message, multipart) = match parsed {
+                    Ok(Syscall::SendMessageStream {
+                        request_id,
+                        agent_id,
+                        message,
+                    }) => (request_id, agent_id, message, None),
+                    Ok(Syscall::SendMessageContentStream {
+                        request_id,
+                        agent_id,
+                        content,
+                    }) => (
+                        request_id,
+                        agent_id,
+                        content.text_projection(),
+                        Some(content),
+                    ),
+                    _ => unreachable!("stream pattern checked above"),
                 };
                 if let Some(identity) = credential.as_ref() {
                     match kernel.acquire_credential_principal(identity).await {
@@ -6921,6 +7147,7 @@ impl SyscallServer {
                                 request_id,
                                 agent_id,
                                 message,
+                                multipart,
                                 Some(&resolved),
                                 &mut write,
                                 negotiated_version,
@@ -6943,6 +7170,7 @@ impl SyscallServer {
                         request_id,
                         agent_id,
                         message,
+                        multipart,
                         None,
                         &mut write,
                         negotiated_version,
@@ -7036,6 +7264,9 @@ impl SyscallServer {
                         && matches!(
                             &call,
                             Syscall::SendMessageStream { .. }
+                                | Syscall::ListProviderModels { .. }
+                                | Syscall::SendMessageContent { .. }
+                                | Syscall::SendMessageContentStream { .. }
                                 | Syscall::CancelRequest { .. }
                                 | Syscall::CreateAgent {
                                     agent_id: Some(_),
@@ -10198,6 +10429,110 @@ memory = ["remember this"]
         let _ = task.await;
     }
 
+    #[tokio::test]
+    async fn explicit_tenant_sli_probes_use_leased_credentials_and_leave_ordinary_wire_unmarked() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let owner_tenant = kernel.create_tenant("sli-owner").await.unwrap();
+        let other_tenant = kernel.create_tenant("sli-other").await.unwrap();
+        let user = kernel
+            .register_user(
+                &owner_tenant,
+                "probe-user",
+                "probe@fixture.test",
+                Role::User,
+            )
+            .await
+            .unwrap();
+        let credential = kernel.issue_api_key(&user, "denial-probe").await.unwrap();
+        let config = || AgentConfig {
+            name: "denial probe target".into(),
+            task: "offline fixture".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        };
+        let owned = kernel
+            .create_agent_for_tenant(&owner_tenant, config())
+            .await
+            .unwrap()
+            .id;
+        let foreign = kernel
+            .create_agent_for_tenant(&other_tenant, config())
+            .await
+            .unwrap()
+            .id;
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_auth_token("probe-system-fixture");
+        let mut client = SyscallClient::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let serving = tokio::spawn(server.serve());
+        assert!(matches!(
+            client
+                .call(Syscall::Authenticate {
+                    token: credential.clone()
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Authenticated
+        ));
+        assert!(matches!(
+            client
+                .call(Syscall::AgentInfo {
+                    agent_id: owned.to_string()
+                })
+                .await
+                .unwrap(),
+            SyscallReply::AgentInfo { .. }
+        ));
+        assert!(matches!(
+            client
+                .call(Syscall::AgentInfo {
+                    agent_id: foreign.to_string()
+                })
+                .await
+                .unwrap(),
+            SyscallReply::TypedError { .. } | SyscallReply::Error { .. }
+        ));
+        assert_eq!(kernel.syscall_gate.denial_probe_stats(), Default::default());
+        let foreign_call = Syscall::AgentInfo {
+            agent_id: foreign.to_string(),
+        };
+        for _ in 0..100 {
+            assert!(
+                probe_expected_tenant_denial(&kernel, &credential, &foreign_call)
+                    .await
+                    .unwrap()
+            );
+        }
+        let owned_call = Syscall::AgentInfo {
+            agent_id: owned.to_string(),
+        };
+        assert!(
+            !probe_expected_tenant_denial(&kernel, &credential, &owned_call)
+                .await
+                .unwrap()
+        );
+        let snapshot = kernel.syscall_gate.denial_probe_stats();
+        assert_eq!(snapshot.tenant_boundary_attempts, 101);
+        assert_eq!(snapshot.confirmed_violations, 1);
+        assert_eq!(snapshot.adversarial_attempts, 0);
+        assert!(
+            probe_expected_tenant_denial(&kernel, "invalid-probe-credential", &foreign_call)
+                .await
+                .is_err()
+        );
+        assert_eq!(kernel.syscall_gate.denial_probe_stats(), snapshot);
+        client.close().await.unwrap();
+        serving.abort();
+        let _ = serving.await;
+        kernel.stop_agent(owned).await.unwrap();
+        kernel.stop_agent(foreign).await.unwrap();
+    }
+
     fn assert_authorization_denied(reply: SyscallReply) {
         match reply {
             SyscallReply::Error { message } => assert_eq!(message, AUTHORIZATION_DENIED),
@@ -10283,6 +10618,15 @@ memory = ["remember this"]
             Syscall::DeleteGenerationCheckpoint {
                 agent_id: id.clone(),
                 checkpoint_id: checkpoint,
+            },
+            Syscall::SendMessageContent {
+                agent_id: id.clone(),
+                content: "test".into(),
+            },
+            Syscall::SendMessageContentStream {
+                request_id: "content-fixture".into(),
+                agent_id: id.clone(),
+                content: "test".into(),
             },
             Syscall::SendMessage {
                 agent_id: id.clone(),
@@ -10586,6 +10930,12 @@ memory = ["remember this"]
             (Syscall::ListAgents, AccessLevel::ReadOnly),
             (Syscall::GateStats, AccessLevel::System),
             (Syscall::ListProviders, AccessLevel::ReadOnly),
+            (
+                Syscall::ListProviderModels {
+                    provider_id: "catalog".into(),
+                },
+                AccessLevel::System,
+            ),
             (
                 Syscall::Hello {
                     protocol_version: 1,
@@ -11037,7 +11387,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 128);
+        assert_eq!(calls.len(), 131);
         assert_eq!(fixture_tags, schema_tags);
     }
 
@@ -11493,10 +11843,8 @@ memory = ["remember this"]
 
     #[tokio::test]
     async fn operator_tunables_are_durable_audited_atomic_and_enforced() {
-        let db_path = std::env::temp_dir().join(format!(
-            "agentos-operator-tunables-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("operator-tunables.sqlite");
         {
             let kernel = AgentKernelImpl::with_db_path(&db_path).unwrap();
             let initial = match dispatch(&kernel, Syscall::ListOperatorTunables).await {

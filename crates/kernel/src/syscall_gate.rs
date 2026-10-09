@@ -123,6 +123,23 @@ pub(crate) struct GateAdmissionContract<'a> {
     pub(crate) approval_contract: &'a str,
     pub(crate) request_identity: &'a str,
     pub(crate) track_peripheral_activity: bool,
+    pub(crate) expected_registration: Option<u64>,
+}
+
+pub(crate) struct LocalPeripheralContract<'a> {
+    pub agent_id: uuid::Uuid,
+    pub registration: u64,
+    pub tool_name: &'a str,
+    pub resource: &'a str,
+    pub contract: &'a str,
+    pub required: crate::tools::ApprovalPolicy,
+    pub activity: &'a str,
+}
+
+pub(crate) enum LocalPeripheralAction {
+    Inspect,
+    Approve,
+    Revoke,
 }
 
 struct AuthorizedToolCall {
@@ -449,6 +466,7 @@ pub struct SyscallGate {
     /// lifecycle cleanup so tenant aggregates do not decrease when an agent
     /// stops; they reset on process restart as documented.
     agent_stats: DashMap<uuid::Uuid, GateStats>,
+    pub(crate) denial_probes: crate::telemetry::DenialProbeCounters,
     #[cfg(test)]
     authorization_snapshot_hook: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
     #[cfg(test)]
@@ -608,6 +626,7 @@ impl SyscallGate {
             .map(|record| (record.cgroup, record.pid, record.accepting_tool_calls))
             .ok_or(GateDenial::UnknownAgent)?;
         self.acquire_tool_call_for_record(cgroup, pid, accepting_tool_calls)
+            .inspect_err(|error| self.record_agent_denial(kid, error))
     }
     /// Create a gate with the production baseline: enforcing MAC, profile-based
     /// allow rules, and a default-deny fallthrough. Tests that intentionally
@@ -660,6 +679,7 @@ impl SyscallGate {
             denied_namespace: AtomicU64::new(0),
             audited: AtomicU64::new(0),
             agent_stats: DashMap::new(),
+            denial_probes: crate::telemetry::DenialProbeCounters::default(),
             #[cfg(test)]
             authorization_snapshot_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1209,6 +1229,69 @@ impl SyscallGate {
         self.cancel_peripheral_for_agent_locked(kid)
     }
 
+    pub(crate) fn peripheral_registration(&self, kid: uuid::Uuid) -> Option<u64> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        self.records
+            .get(&kid)
+            .filter(|record| record.accepting_tool_calls)
+            .map(|record| record.registration_revision)
+    }
+
+    /// Native UI records refer to an immutable registry contract and one agent
+    /// registration. A stale record can never grant or revoke a replacement
+    /// agent's calls. All three operations share the admission mutation fence.
+    pub(crate) fn local_peripheral_contract(
+        &self,
+        contract: LocalPeripheralContract<'_>,
+        action: LocalPeripheralAction,
+    ) -> Option<(bool, usize)> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let record = self.records.get(&contract.agent_id)?;
+        if record.registration_revision != contract.registration {
+            return None;
+        }
+        let key = (
+            contract.agent_id,
+            contract.registration,
+            contract.tool_name.to_string(),
+            crate::resources::opaque_identity(contract.resource.as_bytes()),
+            contract.contract.to_string(),
+        );
+        let tokens = self
+            .peripheral_activity
+            .iter()
+            .filter_map(|entry| {
+                let (agent, identity, _) = entry.key();
+                (*agent == contract.agent_id && identity == contract.activity)
+                    .then(|| entry.value().clone())
+            })
+            .collect::<Vec<_>>();
+        match action {
+            LocalPeripheralAction::Inspect => Some((
+                self.approvals
+                    .get(&key)
+                    .is_some_and(|approval| (*approval).satisfies(contract.required)),
+                tokens.len(),
+            )),
+            LocalPeripheralAction::Approve => {
+                if !record.accepting_tool_calls
+                    || contract.required == crate::tools::ApprovalPolicy::None
+                {
+                    return None;
+                }
+                self.approvals.insert(key, contract.required);
+                Some((true, tokens.len()))
+            }
+            LocalPeripheralAction::Revoke => {
+                let revoked = self.approvals.remove(&key).is_some();
+                for token in &tokens {
+                    token.cancel();
+                }
+                Some((revoked, tokens.len()))
+            }
+        }
+    }
+
     fn cancel_peripheral_for_agent_locked(&self, kid: uuid::Uuid) -> usize {
         let tokens = self
             .peripheral_activity
@@ -1366,6 +1449,30 @@ impl SyscallGate {
         .map(|authorized| authorized.pid)
     }
 
+    /// Trusted harness path declaring that this real gate decision must deny.
+    /// Ordinary wire, tool and package requests cannot set this expectation.
+    /// This checks authorization only and never invokes a resource provider.
+    pub async fn probe_expected_tool_denial(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        est_tokens: u64,
+    ) -> Result<Pid, GateDenial> {
+        let result = self
+            .check_tool_call(kid, tool_name, resource, est_tokens)
+            .await;
+        self.denial_probes.record(
+            crate::telemetry::DenialProbeKind::AuthorizationSandbox,
+            result.is_ok(),
+        );
+        result
+    }
+
+    pub fn denial_probe_stats(&self) -> crate::telemetry::DenialProbeSnapshot {
+        self.denial_probes.snapshot()
+    }
+
     /// Enforce the validated security declaration carried by the live tool
     /// registry without acquiring a tool slot. This remains public for
     /// compatibility and policy introspection; execution paths must use
@@ -1421,6 +1528,7 @@ impl SyscallGate {
                     approval_contract: &approval_contract,
                     request_identity: "legacy-test-request",
                     track_peripheral_activity: false,
+                    expected_registration: None,
                 },
             )
             .await?;
@@ -1448,6 +1556,7 @@ impl SyscallGate {
             approval_contract,
             request_identity,
             track_peripheral_activity,
+            expected_registration,
         } = admission;
         let authorized = self
             .check_tool_call_contract(
@@ -1463,6 +1572,16 @@ impl SyscallGate {
                 false,
             )
             .await?;
+        if let Some(expected) = expected_registration {
+            let observed = authorized
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.agent.registration_revision)
+                .or_else(|| self.peripheral_registration(kid));
+            if observed != Some(expected) {
+                return Err(GateDenial::AuthorizationStateChanged);
+            }
+        }
         let guard = if self.unconfined {
             self.cgroups
                 .acquire_tool_call_checked(self.cgroups.root())
@@ -1861,6 +1980,15 @@ impl SyscallGate {
             .get(&agent_id)
             .map(|stats| *stats)
             .unwrap_or_default()
+    }
+
+    /// Registry declaration rejection happens before policy admission. Count
+    /// that terminal verdict without exposing declaration or resource details.
+    pub(crate) fn record_invalid_tool_declaration(&self, agent_id: uuid::Uuid) {
+        self.denied_unknown.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut stats) = self.agent_stats.get_mut(&agent_id) {
+            stats.denied_unknown = stats.denied_unknown.saturating_add(1);
+        }
     }
 
     /// Sum only the supplied identities, used for tenant-safe operations
@@ -2585,6 +2713,41 @@ mod tests {
         assert!(
             gate.approvals.is_empty(),
             "unregister must purge the old registration's newly inserted grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_denial_probes_measure_an_unexpected_allow_and_leave_ordinary_traffic_unmarked(
+    ) {
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::none(), None);
+        assert!(gate
+            .check_tool_call(kid, "read_file", "/scope", 1)
+            .await
+            .is_ok());
+        assert!(gate
+            .check_tool_call(kid, "write_file", "/scope", 1)
+            .await
+            .is_err());
+        assert_eq!(gate.denial_probe_stats(), Default::default());
+        for _ in 0..100 {
+            assert!(gate
+                .probe_expected_tool_denial(kid, "write_file", "/scope", 1)
+                .await
+                .is_err());
+        }
+        assert!(gate
+            .probe_expected_tool_denial(kid, "read_file", "/scope", 1)
+            .await
+            .is_ok());
+        assert_eq!(
+            gate.denial_probe_stats(),
+            crate::telemetry::DenialProbeSnapshot {
+                adversarial_attempts: 101,
+                unexpected_allows: 1,
+                ..Default::default()
+            }
         );
     }
 

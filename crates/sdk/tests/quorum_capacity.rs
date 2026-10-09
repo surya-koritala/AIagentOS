@@ -279,21 +279,24 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         // No reporters run here. A new any-member quorum barrier must advance time
         // independently; the client's clock is never consulted for eligibility.
         tokio::time::sleep(Duration::from_secs(16)).await;
-        let snapshot = clients[2].cluster_capacity().await.unwrap();
-        for capacity in &snapshot.reports {
-            let member = snapshot
-                .members
-                .iter()
-                .find(|member| member.node_id == capacity.report.node_id)
-                .unwrap();
-            assert_eq!(
-                capacity.report.verify_current(
-                    member,
-                    &snapshot.cluster_id,
-                    snapshot.authority_time
-                ),
-                Err(kernel::cluster_capacity::CapacityRejection::Stale)
-            );
+        for client in &mut clients {
+            let snapshot = client.cluster_capacity().await.unwrap();
+            assert_eq!(snapshot.reports.len(), 3);
+            for capacity in &snapshot.reports {
+                let member = snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.node_id == capacity.report.node_id)
+                    .unwrap();
+                assert_eq!(
+                    capacity.report.verify_current(
+                        member,
+                        &snapshot.cluster_id,
+                        snapshot.authority_time
+                    ),
+                    Err(kernel::cluster_capacity::CapacityRejection::Stale)
+                );
+            }
         }
         let error = placement
             .create_agent(
@@ -429,18 +432,35 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
             runtime.shutdown().await.unwrap();
         }
         let weak = kernels.iter().map(Arc::downgrade).collect::<Vec<_>>();
+        let contexts = kernels
+            .iter()
+            .map(|kernel| Arc::downgrade(&kernel.context_manager))
+            .collect::<Vec<_>>();
         for task in serving {
             task.abort();
             let _ = task.await;
         }
         drop(kernels);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while weak.iter().any(|kernel| kernel.upgrade().is_some()) {
+            while weak.iter().any(|kernel| kernel.strong_count() != 0)
+                || contexts.iter().any(|context| context.strong_count() != 0)
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("public handlers release native database owners");
+        .unwrap_or_else(|_| {
+            panic!(
+                "public quorum retained kernel owners {:?} or Context owners {:?}",
+                weak.iter()
+                    .map(std::sync::Weak::strong_count)
+                    .collect::<Vec<_>>(),
+                contexts
+                    .iter()
+                    .map(std::sync::Weak::strong_count)
+                    .collect::<Vec<_>>()
+            )
+        });
         root.close().unwrap();
     })
     .await

@@ -74,6 +74,7 @@ jobs:
       - name: Verify exact node-origin and freshness fences
         run: |
           set -o pipefail
+          cargo test -p kernel --lib --locked cluster_control::tests -- --nocapture 2>&1 | tee capacity-cluster-control.log
           cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture 2>&1 | tee capacity-origin.log
           cargo test -p kernel --lib --locked signed_capacity_projection_is_bounded -- --nocapture 2>&1 | tee capacity-projection.log
           cargo test -p kernel --lib --locked capacity_churn_reclaims_only_retired_epochs -- --nocapture 2>&1 | tee capacity-churn.log
@@ -81,6 +82,7 @@ jobs:
       - name: Exercise actual SDK compatibility and quorum placement
         run: |
           set -o pipefail
+          cargo test -p agent-sdk --lib --locked cluster::tests::unsigned_or_forged_capacity_is_never_used_for_placement -- --exact --nocapture 2>&1 | tee capacity-sdk-negative.log
           cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture 2>&1 | tee capacity-compatibility.log
           cargo test -p agent-sdk --test quorum_capacity --locked -- --nocapture 2>&1 | tee capacity-public-quorum.log
           cargo test -p agent-sdk --test cluster --locked -- --nocapture 2>&1 | tee capacity-cluster-sdk.log
@@ -134,6 +136,7 @@ jobs:
       - name: Native origin, replay, epochs, snapshot and churn
         run: |
           set -o pipefail
+          cargo test -p kernel --lib --locked cluster_control::tests -- --nocapture 2>&1 | tee capacity-cluster-control.log
           cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture 2>&1 | tee capacity-origin.log
           cargo test -p kernel --lib --locked signed_capacity_projection_is_bounded -- --nocapture 2>&1 | tee capacity-projection.log
           cargo test -p kernel --lib --locked capacity_churn_reclaims_only_retired_epochs -- --nocapture 2>&1 | tee capacity-churn.log
@@ -141,6 +144,7 @@ jobs:
       - name: Actual native public SDK and managed ownership proof
         run: |
           set -o pipefail
+          cargo test -p agent-sdk --lib --locked cluster::tests::unsigned_or_forged_capacity_is_never_used_for_placement -- --exact --nocapture 2>&1 | tee capacity-sdk-negative.log
           cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture 2>&1 | tee capacity-compatibility.log
           cargo test -p agent-sdk --test quorum_capacity --locked -- --nocapture 2>&1 | tee capacity-public-quorum.log
           cargo test -p agent-sdk --test cluster --locked -- --nocapture 2>&1 | tee capacity-cluster-sdk.log

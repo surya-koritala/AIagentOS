@@ -365,7 +365,7 @@ pub enum AuthorityRejection {
 pub enum AuthorityResponse {
     AgentIdentityUpdated {
         operation_id: String,
-        identity: AgentIdentityRecord,
+        identity: Box<AgentIdentityRecord>,
         sequence: u64,
         log_id: LogId<ClusterRaftNodeId>,
         replayed: bool,
@@ -3210,7 +3210,7 @@ fn apply_new_authority_command(
             *control = next;
             Ok(AuthorityResponse::AgentIdentityUpdated {
                 operation_id,
-                identity,
+                identity: Box::new(identity),
                 sequence,
                 log_id,
                 replayed: false,
@@ -3235,8 +3235,11 @@ fn apply_new_authority_command(
             receipt
                 .validate(&identity.reservation)
                 .map_err(invalid_command)?;
-            if receipt.schema_version != crate::schema::CURRENT_SCHEMA_VERSION
-                || receipt.min_reader_schema_version != crate::schema::MIN_READER_SCHEMA_VERSION
+            // A retained receipt describes the original creation transaction.
+            // A compatible upgrade must not rewrite it or prevent recovery;
+            // current destination schema/protocol admission is checked online.
+            if receipt.schema_version > crate::schema::CURRENT_SCHEMA_VERSION
+                || receipt.min_reader_schema_version > crate::schema::CURRENT_SCHEMA_VERSION
                 || next
                     .agent_identities
                     .values()
@@ -3255,8 +3258,7 @@ fn apply_new_authority_command(
                 .members
                 .get(&receipt.destination_node_id)
                 .ok_or_else(|| conflict("creation receipt destination is unknown"))?;
-            if receipt.protocol_version < member.min_protocol_version
-                || receipt.protocol_version > member.protocol_version
+            if receipt.protocol_version > member.protocol_version
             {
                 return Err(conflict("creation receipt protocol is incompatible"));
             }
@@ -3285,7 +3287,7 @@ fn apply_new_authority_command(
             *control = next;
             Ok(AuthorityResponse::AgentIdentityUpdated {
                 operation_id,
-                identity,
+                identity: Box::new(identity),
                 sequence,
                 log_id,
                 replayed: false,
@@ -3334,7 +3336,7 @@ fn apply_new_authority_command(
             *control = next;
             Ok(AuthorityResponse::AgentIdentityUpdated {
                 operation_id,
-                identity,
+                identity: Box::new(identity),
                 sequence,
                 log_id,
                 replayed: false,
@@ -3412,7 +3414,7 @@ fn apply_new_authority_command(
             *control = next;
             Ok(AuthorityResponse::AgentIdentityUpdated {
                 operation_id,
-                identity,
+                identity: Box::new(identity),
                 sequence,
                 log_id,
                 replayed: false,

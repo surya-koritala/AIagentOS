@@ -129,13 +129,8 @@ impl IdentityFixture {
                 reason: "exact receipt".into(),
                 proposed_at: Utc::now(),
             }),
-            AuthorityResponse::AgentIdentityUpdated {
-                identity: AgentIdentityRecord {
-                    state: AgentIdentityState::Created,
-                    ..
-                },
-                ..
-            }
+            AuthorityResponse::AgentIdentityUpdated { identity, .. }
+                if identity.state == AgentIdentityState::Created
         ));
         receipt
     }
@@ -151,13 +146,8 @@ impl IdentityFixture {
                 reason: "publish exact receipt".into(),
                 proposed_at: Utc::now(),
             }),
-            AuthorityResponse::AgentIdentityUpdated {
-                identity: AgentIdentityRecord {
-                    state: AgentIdentityState::Published,
-                    ..
-                },
-                ..
-            }
+            AuthorityResponse::AgentIdentityUpdated { identity, .. }
+                if identity.state == AgentIdentityState::Published
         ));
     }
 }
@@ -203,13 +193,8 @@ fn immutable_identity_allocation_retry_conflicts_and_tombstones_are_permanent() 
     };
     assert!(matches!(
         fixture.apply(deletion.clone()),
-        AuthorityResponse::AgentIdentityUpdated {
-            identity: AgentIdentityRecord {
-                state: AgentIdentityState::Deleted,
-                ..
-            },
-            ..
-        }
+        AuthorityResponse::AgentIdentityUpdated { identity, .. }
+            if identity.state == AgentIdentityState::Deleted
     ));
     assert!(matches!(
         fixture.apply(deletion),
@@ -342,13 +327,8 @@ fn immutable_identity_abort_never_becomes_a_new_creation_or_published_agent() {
                 reason: "incomplete creation abort".into(),
                 proposed_at: Utc::now(),
             }),
-            AuthorityResponse::AgentIdentityUpdated {
-                identity: AgentIdentityRecord {
-                    state: AgentIdentityState::Aborted,
-                    ..
-                },
-                ..
-            }
+            AuthorityResponse::AgentIdentityUpdated { identity, .. }
+                if identity.state == AgentIdentityState::Aborted
         ));
         assert_eq!(fixture.record(&agent).reservation, identity.reservation);
         assert!(matches!(
@@ -518,4 +498,14 @@ fn immutable_identity_current_principal_checks_precede_all_receipt_replay() {
         }
     ));
     assert_eq!(fixture.state, current);
+}
+
+#[test]
+fn immutable_identity_reserved_nil_uuid_cannot_allocate_an_unerasable_agent() {
+    let mut fixture = IdentityFixture::new();
+    let nil = Uuid::nil().to_string();
+    let command = fixture.prepare(&nil, &Uuid::new_v4().to_string());
+    assert!(matches!(fixture.apply(command), AuthorityResponse::Rejected { reason: AuthorityRejection::InvalidCommand, .. }));
+    assert!(fixture.state.control_plane.as_ref().unwrap().agent_identities.is_empty());
+    assert!(fixture.state.control_plane.as_ref().unwrap().ownerships.is_empty());
 }

@@ -49,7 +49,7 @@ fn updated_identity(
             log_id,
             replayed,
             ..
-        } => (identity, log_id, replayed),
+        } => (*identity, log_id, replayed),
         other => panic!("expected committed immutable identity, got {other:?}"),
     }
 }

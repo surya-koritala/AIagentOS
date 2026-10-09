@@ -2619,7 +2619,7 @@ impl KernelClient {
                         "authority returned a foreign immutable identity".into(),
                     ));
                 }
-                Ok(identity)
+                Ok(*identity)
             }
             other => Err(SdkError::Configuration(format!(
                 "immutable identity transition rejected: {other:?}"

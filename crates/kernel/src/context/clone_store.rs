@@ -31,12 +31,12 @@ impl SqliteContextManager {
         &self,
         record: &PersistedAgent,
         parent: AgentId,
-        request_digest: &str,
+        request: (&str, &BTreeSet<u64>),
         group: Option<&str>,
         security: &CloneSecurity,
         max_agents: u64,
-        dropped: &BTreeSet<u64>,
     ) -> Result<(), ContextError> {
+        let (request_digest, dropped) = request;
         let mut conn = self.locked_conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)

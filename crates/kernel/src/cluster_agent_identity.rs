@@ -314,7 +314,7 @@ pub enum AgentIdentityError {
 }
 
 pub(crate) fn canonical_uuid(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
+    uuid::Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
 
 pub(crate) fn identity_command_agent(

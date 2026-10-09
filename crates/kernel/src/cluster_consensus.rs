@@ -798,8 +798,11 @@ fn write_persistent_state(
 ) -> Result<(), AnyError> {
     validate_persistent_state(state)?;
     if let Some(control) = &state.authority.control_plane {
-        crate::cluster_agent_identity::retain_identity_tombstones(transaction, &control.agent_identities)
-            .map_err(|error| read_io(error.to_string()))?;
+        crate::cluster_agent_identity::retain_identity_tombstones(
+            transaction,
+            &control.agent_identities,
+        )
+        .map_err(|error| read_io(error.to_string()))?;
     }
     let last_applied = state.last_applied.as_ref().map(serialize).transpose()?;
     let membership = serialize(&state.membership)?;

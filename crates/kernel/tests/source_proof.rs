@@ -156,10 +156,15 @@ fn native_metrics_receipt_matches_the_actual_clean_git_checkout() {
 #[test]
 #[ignore = "explicit CI consumer of the actual Docker COPY artifact"]
 fn actual_docker_copy_validates_every_authenticated_blob_before_compilation() {
-    let context = std::env::var_os("AGENTOS_SOURCE_PROOF_DOCKER_CONTEXT").expect("actual Docker context path is required");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let context = std::env::var_os("AGENTOS_SOURCE_PROOF_DOCKER_CONTEXT")
+        .expect("actual Docker context path is required");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
     let actual = source_proof::verify_packaged_source(Path::new(&context)).unwrap();
-    assert_eq!(actual.commit,git(root,&["rev-parse","HEAD"]));
+    assert_eq!(actual.commit, git(root, &["rev-parse", "HEAD"]));
     assert!(!Path::new(&context).join(".git").exists());
     assert!(!Path::new(&context).join("target").exists());
 }

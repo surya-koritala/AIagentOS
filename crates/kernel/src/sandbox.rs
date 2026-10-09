@@ -197,6 +197,9 @@ struct SandboxState {
 /// Concrete sandbox manager implementation.
 pub struct SandboxManagerImpl {
     managed_namespace: Option<crate::managed_workspace::ManagedWorkspaceNamespace>,
+    // Live registrations end with this manager. The namespace lease prevents
+    // another manager from reconciling the same attested datastore while live.
+    live_managed_workspaces: Mutex<HashSet<PathBuf>>,
     sandboxes: DashMap<SandboxId, SandboxState>,
     agent_sandboxes: DashMap<AgentId, SandboxId>,
     #[cfg(test)]
@@ -232,6 +235,7 @@ impl SandboxManagerImpl {
         }
         Self {
             managed_namespace: None,
+            live_managed_workspaces: Mutex::new(HashSet::new()),
             sandboxes: DashMap::new(),
             agent_sandboxes: DashMap::new(),
             #[cfg(test)]
@@ -382,11 +386,6 @@ impl SandboxManagerImpl {
         std::env::temp_dir().join("aiagentos-workspaces")
     }
 
-    fn live_managed_workspaces() -> &'static Mutex<HashSet<PathBuf>> {
-        static LIVE: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
-        LIVE.get_or_init(|| Mutex::new(HashSet::new()))
-    }
-
     pub fn is_managed_config(config: &SandboxConfig) -> bool {
         let reserved_root = std::fs::canonicalize(Self::managed_root()).ok();
         let parent = config
@@ -461,7 +460,7 @@ impl SandboxManagerImpl {
         // Keep discovery and deletion atomic with managed-workspace creation
         // and destruction. Without this guard, reconciliation can observe a
         // newly created directory before its live registration is published.
-        let live = Self::live_managed_workspaces().lock().map_err(|_| {
+        let live = self.live_managed_workspaces.lock().map_err(|_| {
             SandboxError::DestructionFailed("managed workspace registry unavailable".into())
         })?;
         // A UUID name and empty legacy marker cannot attest datastore ownership.
@@ -559,7 +558,7 @@ impl SandboxManagerImpl {
         // reconciliation cannot mistake an in-progress creation for an
         // orphan. The guard stays held until the path is published below.
         let mut managed_registry = if managed_workspace {
-            Some(Self::live_managed_workspaces().lock().map_err(|_| {
+            Some(self.live_managed_workspaces.lock().map_err(|_| {
                 SandboxError::CreationFailed("managed workspace registry unavailable".into())
             })?)
         } else {
@@ -758,9 +757,45 @@ impl SandboxManagerImpl {
         state: &SandboxState,
         path: &Path,
     ) -> Result<PathBuf, SandboxError> {
+        // Authorization uses a portable absolute DOS spelling on Windows.
+        // Compare the target and both attested workspace spellings through
+        // that same lexical normalization before deriving a relative path.
+        // Execution still uses the existing no-follow directory capability.
+        #[cfg(windows)]
+        let normalized = {
+            let normalize = |path: &Path| {
+                path.to_str()
+                    .ok_or_else(|| {
+                        SandboxError::BoundaryViolation("filesystem target denied".into())
+                    })
+                    .and_then(|path| {
+                        crate::resources::normalize_filesystem_target(path)
+                            .map(PathBuf::from)
+                            .map_err(|_| {
+                                SandboxError::BoundaryViolation("filesystem target denied".into())
+                            })
+                    })
+            };
+            (
+                normalize(path)?,
+                normalize(&state.workspace_dir)?,
+                normalize(&state.workspace_alias)?,
+            )
+        };
+        #[cfg(windows)]
+        let (path, workspace_dir, workspace_alias) = (
+            normalized.0.as_path(),
+            normalized.1.as_path(),
+            normalized.2.as_path(),
+        );
+        #[cfg(not(windows))]
+        let (workspace_dir, workspace_alias) = (
+            state.workspace_dir.as_path(),
+            state.workspace_alias.as_path(),
+        );
         let relative = if path.is_absolute() {
-            path.strip_prefix(&state.workspace_dir)
-                .or_else(|_| path.strip_prefix(&state.workspace_alias))
+            path.strip_prefix(workspace_dir)
+                .or_else(|_| path.strip_prefix(workspace_alias))
                 .map_err(|_| SandboxError::BoundaryViolation("filesystem target denied".into()))?
                 .to_path_buf()
         } else {
@@ -2165,7 +2200,7 @@ impl SandboxManager for SandboxManagerImpl {
             .map(|state| state.clone())
             .ok_or_else(|| SandboxError::DestructionFailed("Sandbox not found".to_string()))?;
         let mut managed_registry = if state.managed_workspace {
-            Some(Self::live_managed_workspaces().lock().map_err(|_| {
+            Some(self.live_managed_workspaces.lock().map_err(|_| {
                 SandboxError::DestructionFailed("managed workspace registry unavailable".into())
             })?)
         } else {

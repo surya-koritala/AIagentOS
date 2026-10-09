@@ -430,7 +430,7 @@ impl MetricsSnapshot {
                 "agentos_build_source_sha1{{part=\"{part}\"}} {value}\n"
             ));
         }
-        out.push_str("# HELP agentos_build_source_verified Whether compiled Git metadata was available and tracked source was clean.\n");
+        out.push_str("# HELP agentos_build_source_verified Whether native Git or packaged Git object proof verified the compiled source.\n");
         out.push_str("# TYPE agentos_build_source_verified gauge\n");
         out.push_str(&format!(
             "agentos_build_source_verified {}\n",

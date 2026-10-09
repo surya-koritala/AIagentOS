@@ -231,7 +231,7 @@ impl LlmSession for RestartToolSession {
 
     async fn send_with_tools(
         &self,
-        _messages: Vec<StandardMessage>,
+        messages: Vec<StandardMessage>,
         _tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
         match self.calls.fetch_add(1, Ordering::SeqCst) {
@@ -251,6 +251,14 @@ impl LlmSession for RestartToolSession {
                 }],
             }),
             1 => {
+                eprintln!(
+                    "completed checkpoint fixture tool result: {:?}",
+                    messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "tool")
+                        .map(|message| &message.content)
+                );
                 self.second_request_started.notify_waiters();
                 std::future::pending::<Result<LlmResponse, ConnectorError>>().await
             }
@@ -673,7 +681,9 @@ fn restart_resume_does_not_repeat_a_completed_tool_side_effect() {
                         .await
                 })
             };
-            second_request_wait.await;
+            tokio::time::timeout(Duration::from_secs(30), second_request_wait)
+                .await
+                .expect("controlled provider did not reach the post-tool checkpoint boundary");
             assert_eq!(
                 std::fs::read_to_string(&side_effect_path).unwrap(),
                 "written exactly once"

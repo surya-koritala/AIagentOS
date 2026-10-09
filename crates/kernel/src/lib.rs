@@ -6280,9 +6280,13 @@ mod tests {
             proof_expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
         };
         let cancellation = tokio_util::sync::CancellationToken::new();
-        kernel.active_requests.insert((agent_id, request_id.to_owned()), ActiveRequestHandle {
-            cancellation: cancellation.clone(), fence: Some(fence.clone()),
-        });
+        kernel.active_requests.insert(
+            (agent_id, request_id.to_owned()),
+            ActiveRequestHandle {
+                cancellation: cancellation.clone(),
+                fence: Some(fence.clone()),
+            },
+        );
         let mut foreign = fence.clone();
         foreign.caller.as_mut().unwrap().principal_id = uuid::Uuid::new_v4().to_string();
         assert!(!kernel.cancel_request_fenced(agent_id, request_id, &foreign));
@@ -6303,9 +6307,13 @@ mod tests {
         let mut newer = fence.clone();
         newer.authority_term += 1;
         newer.fencing_token += 1;
-        kernel.active_requests.insert((agent_id, request_id.to_owned()), ActiveRequestHandle {
-            cancellation: replacement.clone(), fence: Some(newer.clone()),
-        });
+        kernel.active_requests.insert(
+            (agent_id, request_id.to_owned()),
+            ActiveRequestHandle {
+                cancellation: replacement.clone(),
+                fence: Some(newer.clone()),
+            },
+        );
         assert!(!kernel.cancel_request_fenced(agent_id, request_id, &fence));
         assert!(!replacement.is_cancelled());
         assert!(kernel.cancel_request_fenced(agent_id, request_id, &newer));

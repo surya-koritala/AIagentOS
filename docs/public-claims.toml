@@ -222,6 +222,10 @@ path = "docs/WORKSPACE_VFS.md"
 kind = "current"
 
 [[surface]]
+path = "docs/WORKSPACE_OWNERSHIP.md"
+kind = "current"
+
+[[surface]]
 path = "docs/src/SUMMARY.md"
 kind = "current"
 

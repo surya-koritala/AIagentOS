@@ -21,6 +21,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
     "agent_gate_statistics",
     "authorized_cluster_membership",
+    crate::cluster_operation_receipts::FEATURE,
     "bounded_certificate_rollout",
     "cluster_ownership_leases",
     "backup_retention",
@@ -677,6 +678,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "set_node_availability",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("availability", S),
             Field::required("expected_generation", I),
             Field::required("reason", S),
@@ -685,6 +687,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "set_node_profile",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("profile", O),
             Field::required("expected_generation", I),
             Field::required("reason", S),
@@ -818,6 +821,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "install_agent_mutation_fence",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("agent_id", S),
             Field::required("cluster_id", S),
             Field::required("owner_node_id", S),
@@ -831,6 +835,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "retire_agent_mutation_fence",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("agent_id", S),
             Field::required("cluster_id", S),
             Field::required("owner_node_id", S),

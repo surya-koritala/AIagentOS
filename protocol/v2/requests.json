@@ -476,11 +476,13 @@
     "availability": "active",
     "expected_generation": 1,
     "op": "set_node_availability",
+    "operation_id": "fixture",
     "reason": "fixture"
   },
   {
     "expected_generation": 1,
     "op": "set_node_profile",
+    "operation_id": "fixture",
     "profile": {},
     "reason": "fixture"
   },
@@ -610,6 +612,7 @@
     "cluster_id": "fixture",
     "fencing_token": 1,
     "op": "install_agent_mutation_fence",
+    "operation_id": "fixture",
     "owner_node_id": "00000000-0000-0000-0000-000000000004",
     "proof_expires_at": "2026-01-01T00:00:00Z",
     "reason": "fixture"
@@ -621,6 +624,7 @@
     "cluster_id": "fixture",
     "fencing_token": 1,
     "op": "retire_agent_mutation_fence",
+    "operation_id": "fixture",
     "owner_node_id": "00000000-0000-0000-0000-000000000004",
     "proof_expires_at": "2026-01-01T00:00:00Z",
     "reason": "fixture"

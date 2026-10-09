@@ -1,0 +1,151 @@
+name: Cluster operator CLI conformance
+
+on:
+  push:
+    branches: [codex/cluster-cli-operations]
+    paths:
+      - 'crates/sdk/src/**'
+      - 'crates/sdk/tests/cluster_admission.rs'
+      - 'crates/kernel/src/cluster*.rs'
+      - 'crates/kernel/src/context.rs'
+      - 'crates/kernel/src/context/**'
+      - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/wire_contract.rs'
+      - 'crates/kernel/src/auth.rs'
+      - 'crates/kernel/src/config.rs'
+      - 'crates/kernel/src/data_inventory.rs'
+      - 'crates/kernel/src/sandbox.rs'
+      - 'protocol/**'
+      - 'tests/src/capability_registry.rs'
+      - 'docs/capabilities.toml'
+      - 'docs/public-claims.toml'
+      - 'docs/DISTRIBUTED_CONTROL_PLANE.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/cli/src/**'
+      - 'crates/cli/tests/cluster_commands.rs'
+      - '.github/workflows/cluster-cli.yml'
+  pull_request:
+    paths:
+      - 'crates/sdk/src/cluster.rs'
+      - 'crates/sdk/src/lib.rs'
+      - 'crates/sdk/tests/cluster_admission.rs'
+      - 'crates/cli/src/cluster.rs'
+      - 'crates/cli/src/bin/agentctl.rs'
+      - 'crates/cli/src/lib.rs'
+      - 'crates/cli/Cargo.toml'
+      - 'crates/kernel/src/cluster*.rs'
+      - 'crates/kernel/src/context.rs'
+      - 'crates/kernel/src/context/**'
+      - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/wire_contract.rs'
+      - 'crates/kernel/src/auth.rs'
+      - 'crates/kernel/src/config.rs'
+      - 'crates/kernel/src/data_inventory.rs'
+      - 'crates/kernel/src/sandbox.rs'
+      - 'protocol/**'
+      - 'tests/src/capability_registry.rs'
+      - 'docs/capabilities.toml'
+      - 'docs/public-claims.toml'
+      - 'docs/DISTRIBUTED_CONTROL_PLANE.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/cli/tests/cluster_commands.rs'
+      - '.github/workflows/cluster-cli.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cluster-cli-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formatting:
+    name: Cluster operator source formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Retain the actual formatter patch
+        run: |
+          git rev-parse HEAD > cluster-source.txt
+          cargo fmt --all
+          git diff --binary > cluster-rustfmt.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: cluster-cli-format-${{ github.run_id }}
+          path: |
+            cluster-source.txt
+            cluster-rustfmt.patch
+          retention-days: 30
+      - name: Require committed formatting
+        run: git diff --exit-code
+
+  admission:
+    name: Public challenged admission (${{ matrix.os }})
+    needs: formatting
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_INCREMENTAL: 0
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Compile every changed public surface and enforce existing lint gates
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > cluster-source.txt
+          cargo clippy -p kernel -p agent-sdk -p agent-cli -p integration-tests --all-targets --locked -- -D warnings
+      - name: Public admission and unchanged SDK contracts
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > cluster-source.txt
+          cargo test -p agent-sdk --locked -- --nocapture 2>&1 | tee cluster-sdk.log
+      - name: Durable operator receipts and wire compatibility
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked cluster_operation_receipts:: -- --nocapture 2>&1 | tee cluster-receipts.log
+          cargo test -p kernel --lib --locked wire_contract:: -- --nocapture 2>&1 | tee cluster-wire.log
+      - name: Actual shipped CLI operations and capability contracts
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p agent-cli --test cluster_commands --locked -- --nocapture 2>&1 | tee cluster-cli.log
+          cargo test -p agent-cli --test help_commands --locked -- --nocapture 2>&1 | tee cluster-help.log
+          cargo test -p integration-tests capability_registry --locked -- --nocapture 2>&1 | tee cluster-capabilities.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: cluster-cli-${{ runner.os }}-${{ github.run_id }}
+          path: |
+            cluster-source.txt
+            cluster-*.log
+          retention-days: 30
+          if-no-files-found: error

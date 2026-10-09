@@ -272,7 +272,9 @@ impl LiveFixture {
             while stores.iter().any(|store| store.upgrade().is_some()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("shutdown releases every durable Raft context owner before native deletion");
+        })
+        .await
+        .expect("shutdown releases every durable Raft context owner before native deletion");
         self.root
             .close()
             .expect("release all real native database handles");

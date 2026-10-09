@@ -798,6 +798,54 @@ impl KernelClient {
         }
     }
 
+    /// Return exact creation evidence for a caller-retained immutable identity.
+    /// The signed destination adapter admits the current creator and credential;
+    /// the receipt remains pending until the separate quorum publication.
+    pub async fn create_reserved_agent(
+        &mut self,
+        identity: &AgentIdentityReservation,
+        creation: Syscall,
+        destination_public_key: &str,
+    ) -> Result<DestinationCreationReceipt, SdkError> {
+        let (agent_id, proof) = match &creation {
+            Syscall::CreateAgent { agent_id: Some(id), ownership_proof: Some(proof), .. } => (id, proof),
+            _ => return Err(SdkError::Configuration("exact reserved creation and current ownership proof are required".into())),
+        };
+        validate_reserved_creation(identity, agent_id, proof, &creation)?;
+        self.require_online_identity_destination().await?;
+        let reply = self.call(creation).await?;
+        exact_reserved_creation_reply(identity, destination_public_key, reply)
+    }
+
+    pub async fn clone_reserved_agent(
+        &mut self,
+        identity: &AgentIdentityReservation,
+        parent_proof: AgentMutationFenceProof,
+        creation: Syscall,
+        destination_public_key: &str,
+    ) -> Result<DestinationCreationReceipt, SdkError> {
+        let (parent, child, proof) = match &creation {
+            Syscall::CloneAgent { agent_id, child_agent_id, child_ownership_proof: Some(proof), .. } =>
+                (agent_id.clone(), child_agent_id, proof),
+            _ => return Err(SdkError::Configuration("exact reserved clone and current child ownership proof are required".into())),
+        };
+        validate_reserved_creation(identity, child, proof, &creation)?;
+        self.require_online_identity_destination().await?;
+        let reply = self.fenced_call(parent, parent_proof, creation).await?;
+        exact_reserved_creation_reply(identity, destination_public_key, reply)
+    }
+
+    async fn require_online_identity_destination(&mut self) -> Result<(), SdkError> {
+        let protocol = self.hello().await?;
+        if protocol.protocol_version < 2
+            || !protocol.features.iter().any(|feature| feature == kernel::cluster_agent_identity::FEATURE)
+            || !protocol.features.iter().any(|feature| feature == "destination-authority-online-v1")
+        {
+            return Err(SdkError::Configuration("signed online quorum identity destination is required before creation".into()));
+        }
+        Ok(())
+    }
+
     /// List all agents the kernel knows about.
     pub async fn list_agents(&mut self) -> Result<Vec<AgentSummary>, SdkError> {
         match self.call(Syscall::ListAgents).await? {
@@ -4128,6 +4176,41 @@ fn mutation_operation_name(call: &Syscall) -> &'static str {
         | Syscall::SendMessageContentStream { .. } => "agent turn",
         Syscall::FencedAgentMutation { mutation, .. } => mutation_operation_name(mutation),
         _ => "side-effecting syscall",
+    }
+}
+
+fn validate_reserved_creation(
+    identity: &AgentIdentityReservation,
+    agent_id: &str,
+    proof: &AgentMutationFenceProof,
+    creation: &Syscall,
+) -> Result<(), SdkError> {
+    identity.validate().map_err(|error| SdkError::Configuration(error.to_string()))?;
+    if agent_id != identity.agent_id || proof.cluster_id != identity.cluster_id
+        || proof.owner_node_id != identity.initial_owner_node_id
+        || kernel::cluster_agent_identity::creation_command_sha256(creation)
+            .map_err(|error| SdkError::Configuration(error.to_string()))? != identity.creation_sha256
+    {
+        return Err(SdkError::Configuration("creation arguments differ from the immutable quorum reservation".into()));
+    }
+    Ok(())
+}
+
+fn exact_reserved_creation_reply(
+    identity: &AgentIdentityReservation,
+    destination_public_key: &str,
+    reply: SyscallReply,
+) -> Result<DestinationCreationReceipt, SdkError> {
+    match reply {
+        SyscallReply::ReservedAgentCreated { id, receipt } => {
+            if id != identity.agent_id {
+                return Err(SdkError::Configuration("destination returned a foreign reserved identity".into()));
+            }
+            receipt.validate(identity).map_err(|error| SdkError::Configuration(error.to_string()))?;
+            receipt.verify_signature(destination_public_key).map_err(|error| SdkError::Configuration(error.to_string()))?;
+            Ok(*receipt)
+        }
+        other => Err(unexpected("ReservedAgentCreated", &other)),
     }
 }
 

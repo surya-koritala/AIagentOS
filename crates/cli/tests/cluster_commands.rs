@@ -771,12 +771,19 @@ async fn older_server_without_receipts_is_refused_before_any_mutation() {
             let mut operations = Vec::new();
             loop {
                 let mut frame = String::new();
-                if read.read_line(&mut frame).await.unwrap() == 0 { break; }
+                if read.read_line(&mut frame).await.unwrap() == 0 {
+                    break;
+                }
                 let call: Syscall = serde_json::from_str(&frame).unwrap();
                 let reply = match call {
                     Syscall::Hello { .. } => {
                         operations.push("hello");
-                        SyscallReply::Hello { protocol_version: agent_sdk::PROTOCOL_VERSION, min_protocol_version: 1, server_version: "older-receiptless-fixture".into(), features: Vec::new() }
+                        SyscallReply::Hello {
+                            protocol_version: agent_sdk::PROTOCOL_VERSION,
+                            min_protocol_version: 1,
+                            server_version: "older-receiptless-fixture".into(),
+                            features: Vec::new(),
+                        }
                     }
                     Syscall::Authenticate { token } => {
                         assert_eq!(token, TOKEN);
@@ -785,15 +792,34 @@ async fn older_server_without_receipts_is_refused_before_any_mutation() {
                     }
                     _ => panic!("a receiptless server must receive no mutation"),
                 };
-                let mut reply = serde_json::to_vec(&reply).unwrap(); reply.push(b'\n');
+                let mut reply = serde_json::to_vec(&reply).unwrap();
+                reply.push(b'\n');
                 write.write_all(&reply).await.unwrap();
             }
             write.shutdown().await.unwrap();
             operations
-        }).await.expect("bounded receiptless endpoint capture")
+        })
+        .await
+        .expect("bounded receiptless endpoint capture")
     });
     let id = Uuid::new_v4().to_string();
-    let output = binary(&address, TOKEN, None, None, &args(&["cluster", "node-availability", "draining", "must refuse ignored ids", "--generation", "0", "--operation-id", &id])).await;
+    let output = binary(
+        &address,
+        TOKEN,
+        None,
+        None,
+        &args(&[
+            "cluster",
+            "node-availability",
+            "draining",
+            "must refuse ignored ids",
+            "--generation",
+            "0",
+            "--operation-id",
+            &id,
+        ]),
+    )
+    .await;
     assert!(!output.success);
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing ignored operation IDs"));

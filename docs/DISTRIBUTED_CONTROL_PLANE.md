@@ -115,16 +115,21 @@ historical prepared record and does not restore that target.
 The first live trust contract requires a prior versioned trust catalog and the
 **unchanged exact CA set already provisioned from PEM on every participating
 runtime**. It can replace the complete catalog and bounded leaf overlap while
-retaining running local TLS credentials. Fingerprints cannot install absent CA
-certificates; root addition/removal and private leaf-key reload are unsupported
+retaining every prior allowed leaf for retained peers, because the origin cannot
+prove which overlap leaf another node currently has installed. Fingerprints
+cannot install absent CA certificates; root addition/removal, retained-peer leaf
+retirement, and private leaf-key reload are unsupported
 by this live API. Opaque prebuilt rustls configurations lack root-material
 evidence and cannot satisfy this admission check. Provisioning and root rotation
 remain explicit operator operations through the existing startup configuration.
 
 Operator config is never rewritten. Before restart, the operator must update
 its generations, voter IDs, and complete peer catalog to the exact durable live
-target; old or conflicting configuration fails closed, including a crash after
-proposal commit but before the membership intent is applied. Schema 16 refuses
+target while a live plan is pending; old or conflicting configuration fails
+closed, including a crash after proposal commit but before membership intent
+application. Once a plan settles, the existing exact +1 operator-configured
+voter/trust transition remains available for provisioned credential reload.
+The superseded historical live plan is never reapplied. Schema 16 refuses
 older readers before writes or snapshot installation can discard signed plans.
 At most 64 immutable plans and 512 KiB of serialized plan evidence are retained,
 bounded independently of the existing receipt capacity; exhaustion denies a new proposal before mutation. No automatic

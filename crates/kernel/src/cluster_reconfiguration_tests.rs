@@ -211,12 +211,10 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
         removed.remove(&4);
         for node in removed.values_mut() {
             node.transport_trust_generation = 3;
-            node.transport_trust_overlap_not_after = None;
-            node.tls_client_certificate_sha256_overlap.clear();
         }
         let digest = configured_transport_catalog_sha256(&removed);
         for node in removed.values_mut() { node.transport_catalog_sha256.clone_from(&digest); }
-        let remove = fixture.trust_command(0, plan.target.clone(), removed, 3, None);
+        let remove = fixture.trust_command(0, plan.target.clone(), removed, 3, Some(expiry));
         let removed_plan = prepared(fixture.submit(0, remove).await.unwrap());
         fixture.settle(&removed_plan, 3).await;
         assert!(cached_four.call(RpcRequest::Vote(VoteRequest { vote: Vote::new(0, 1), last_log_id: None }), RPCOption::new(Duration::from_secs(3))).await.is_err());

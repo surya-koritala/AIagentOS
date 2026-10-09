@@ -1711,6 +1711,9 @@ impl RpcRequest {
     }
 }
 
+type PeerCatalog = BTreeMap<ClusterRaftNodeId, ClusterRaftNode>;
+type TrustedPeerCatalogs = (PeerCatalog, PeerCatalog);
+
 #[derive(Clone)]
 struct LiveTransportCatalog {
     context: Arc<SqliteContextManager>,
@@ -1718,6 +1721,7 @@ struct LiveTransportCatalog {
     local_node_id: ClusterRaftNodeId,
     local_server_sha256: String,
     local_client_sha256: String,
+    startup_target: crate::cluster_reconfiguration::ClusterReconfigurationTarget,
 }
 
 impl LiveTransportCatalog {
@@ -1755,29 +1759,24 @@ impl LiveTransportCatalog {
         Ok(())
     }
 
-    fn latest(
-        &self,
-    ) -> io::Result<
-        Option<(
-            BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
-            BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
-        )>,
-    > {
-        let (membership, plan) =
-            crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
-        let Some(plan) = plan else {
-            return Ok(None);
-        };
-        if plan.target.trust_generation != plan.prior.trust_generation {
-            self.check_target(&plan.target)?;
-        }
-        let prior = if plan.target.is_settled(&membership) {
-            BTreeMap::new()
+    fn latest(&self) -> io::Result<Option<TrustedPeerCatalogs>> {
+        let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
+        let Some(plan) = plan else { return Ok(None); };
+        let current = crate::cluster_reconfiguration::ClusterReconfigurationTarget::from_membership(&membership)?;
+        let (target, prior) = if plan.is_unresolved(&membership) {
+            (plan.target.clone(), plan.prior.catalog.clone())
+        } else if !self.startup_target.is_settled(&membership)
+            && self.startup_target.voter_generation >= current.voter_generation
+            && self.startup_target.trust_generation >= current.trust_generation
+        {
+            (self.startup_target.clone(), current.catalog.clone())
         } else {
-            plan.prior.catalog
+            (current, BTreeMap::new())
         };
-        Ok(Some((plan.target.catalog, prior)))
+        if target.trust_generation > 0 { self.check_target(&target)?; }
+        Ok(Some((target.catalog, prior)))
     }
+
 }
 
 #[derive(Clone)]
@@ -2417,7 +2416,7 @@ impl ClusterRaftRuntime {
         listener: TcpListener,
     ) -> io::Result<Self> {
         config.validate()?;
-        let (_, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&context)?;
+        let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&context)?;
         if let Some(plan) = plan {
             let configured = crate::cluster_reconfiguration::ClusterReconfigurationTarget {
                 catalog: config.members.clone(),
@@ -2429,7 +2428,12 @@ impl ClusterRaftRuntime {
                 overlap_not_after: config.transport_trust_overlap_not_after,
             };
             if configured != plan.target {
-                return Err(invalid_data("operator restart configuration differs from the durable live reconfiguration target"));
+                if plan.is_unresolved(&membership) {
+                    return Err(invalid_data("operator restart configuration differs from the durable live reconfiguration target"));
+                }
+                // Completed history must not disable the fenced operator path
+                // for subsequently provisioned root and private-leaf changes.
+                inspect_membership_target(&membership, &configured.catalog, &configured.catalog_sha256, configured.trust_generation, &configured.voter_ids, configured.voter_generation, &configured.voter_set_sha256)?;
             }
         }
         let local_addr = listener.local_addr()?;
@@ -2444,6 +2448,11 @@ impl ClusterRaftRuntime {
             local_node_id: config.node_id,
             local_server_sha256: config.tls.server_certificate_sha256.clone(),
             local_client_sha256: config.tls.client_certificate_sha256.clone(),
+            startup_target: crate::cluster_reconfiguration::ClusterReconfigurationTarget {
+                catalog: config.members.clone(), voter_ids: config.voter_ids.clone(), voter_generation: config.voter_set_generation,
+                voter_set_sha256: config.voter_set_sha256.clone(), trust_generation: config.transport_trust_generation,
+                catalog_sha256: config.transport_catalog_sha256.clone(), overlap_not_after: config.transport_trust_overlap_not_after,
+            },
         });
         let network = ClusterNetworkFactory {
             source: config.node_id,
@@ -2817,10 +2826,10 @@ async fn serve_reconfiguration(
         }
         let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&context)?;
         if let Some(plan) = plan {
-            if !plan.target.is_settled(&membership)
+            if plan.is_unresolved(&membership)
                 && metrics.borrow().current_leader == Some(node_id)
             {
-                if plan.target.trust_generation != plan.prior.trust_generation {
+                if plan.target.trust_generation > 0 {
                     live.check_target(&plan.target)?;
                 }
                 // An interrupted attempt leaves the same durable target. The

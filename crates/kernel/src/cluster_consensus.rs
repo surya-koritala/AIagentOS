@@ -2760,7 +2760,7 @@ fn apply_new_authority_command(
             if control
                 .reconfiguration_plans
                 .last()
-                .is_some_and(|plan| !plan.target.is_settled(membership))
+                .is_some_and(|plan| plan.is_unresolved(membership))
             {
                 return Err((
                     AuthorityRejection::Conflict,

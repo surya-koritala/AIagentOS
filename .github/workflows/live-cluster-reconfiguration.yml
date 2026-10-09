@@ -65,21 +65,26 @@ jobs:
         with:
           save-if: false
       - name: Compile all kernel targets before native qualification
+        id: compile
         timeout-minutes: 15
         run: cargo check -p kernel -p agent-sdk --all-targets --locked
       - name: Check exact generation and provisioned-root validation
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 5
         run: cargo test -p kernel --lib --locked cluster_reconfiguration::tests -- --nocapture
       - name: Check actual four-node live membership and transport behavior
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 5
         run: |
           cargo test -p kernel --lib --locked live_reconfiguration:: -- --nocapture
       - name: Preserve generated protocol fixtures and principal storage fences
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 5
         run: |
           cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture
           cargo test -p kernel --lib --locked principal_history_requires_current_reader -- --nocapture
           cargo test -p kernel --lib --locked live_transport_proposals_remain_system_only -- --nocapture
       - name: Exercise live proposals through actual public SDK clients
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 5
         run: cargo test -p agent-sdk --test cluster_reconfiguration --locked -- --nocapture

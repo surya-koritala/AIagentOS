@@ -36,6 +36,7 @@ jobs:
         run: |
           git rev-parse HEAD > live-cluster-source.txt
           cargo fmt --all
+          rustfmt --edition 2021 crates/kernel/src/cluster_reconfiguration_tests.rs
           git diff --binary > live-cluster-rustfmt.patch
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
@@ -54,6 +55,7 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772

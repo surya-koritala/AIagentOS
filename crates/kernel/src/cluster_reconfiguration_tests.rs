@@ -1,3 +1,19 @@
+async fn wait_live_leader(runtimes: &[Option<ClusterRaftRuntime>], phase: &str) -> ClusterRaftNodeId {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut votes = BTreeMap::new();
+        for runtime in runtimes.iter().flatten() {
+            if let Some(leader) = runtime.metrics().borrow().current_leader { *votes.entry(leader).or_insert(0usize) += 1; }
+        }
+        if let Some((leader, _)) = votes.into_iter().find(|(_, count)| *count >= 2) { return leader; }
+        if Instant::now() >= deadline {
+            let actual = runtimes.iter().flatten().map(|runtime| runtime.metrics().borrow().clone()).collect::<Vec<_>>();
+            panic!("{phase}: no leader; actual bounded node metrics: {actual:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 struct LiveFixture {
     root: TempDir,
     ca: CertifiedIssuer<'static, KeyPair>,
@@ -28,7 +44,7 @@ impl LiveFixture {
             runtimes[3].as_ref().unwrap().ensure_configured_membership(false),
         );
         one.unwrap(); two.unwrap(); three.unwrap(); four.unwrap();
-        let leader = wait_for_leader(&runtimes, None).await;
+        let leader = wait_live_leader(&runtimes, "initial live fixture").await;
         runtimes[(leader - 1) as usize].as_ref().unwrap().ensure_authority_initialized().await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -91,7 +107,7 @@ impl LiveFixture {
             self.runtimes[3].as_ref().unwrap().ensure_configured_membership(false),
         );
         one.unwrap(); two.unwrap(); three.unwrap(); four.unwrap();
-        wait_for_leader(&self.runtimes, None).await;
+        wait_live_leader(&self.runtimes, "configured live fixture restart").await;
     }
 
     async fn close(self) {
@@ -166,16 +182,16 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
         for config in &mut versioned { set_transport_trust_plan(config, 1, roots.clone(), None); }
         fixture.restart_all(versioned).await;
         let prior = fixture.current(0).await;
-        let next_peer = test_peer(&fixture.ca, 4);
+        let next_peers = (1..=4).map(|id| test_peer(&fixture.ca, id)).collect::<Vec<_>>();
         let mut factory = fixture.runtimes[0].as_ref().unwrap().authority_handle().network.clone();
         let cached_four = factory.new_client(4, prior.catalog.get(&4).unwrap()).await;
         let mut overlap = prior.catalog.clone();
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
-        for node in overlap.values_mut() {
+        for (id, node) in &mut overlap {
             node.transport_trust_generation = 2;
             node.transport_trust_overlap_not_after = Some(expiry);
+            node.tls_client_certificate_sha256_overlap = vec![next_peers[(*id - 1) as usize].tls.client_certificate_sha256().into()];
         }
-        overlap.get_mut(&4).unwrap().tls_client_certificate_sha256_overlap = vec![next_peer.tls.client_certificate_sha256().into()];
         let digest = configured_transport_catalog_sha256(&overlap);
         for node in overlap.values_mut() { node.transport_catalog_sha256.clone_from(&digest); }
         let command = fixture.trust_command(0, prior.clone(), overlap, 2, Some(expiry));

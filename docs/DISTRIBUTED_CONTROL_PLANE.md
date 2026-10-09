@@ -126,8 +126,8 @@ its generations, voter IDs, and complete peer catalog to the exact durable live
 target; old or conflicting configuration fails closed, including a crash after
 proposal commit but before the membership intent is applied. Schema 16 refuses
 older readers before writes or snapshot installation can discard signed plans.
-At most 64 immutable plans are retained, bounded independently of the existing
-receipt capacity; exhaustion denies a new proposal before mutation. No automatic
+At most 64 immutable plans and 512 KiB of serialized plan evidence are retained,
+bounded independently of the existing receipt capacity; exhaustion denies a new proposal before mutation. No automatic
 plan eviction or implicit resolution of a pending target exists.
 
 Controlled CI fixtures exercise actual mutual-TLS four-node catch-up, live

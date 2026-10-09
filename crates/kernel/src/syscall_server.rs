@@ -7483,9 +7483,6 @@ impl SyscallServer {
                                 | Syscall::ProposeClusterVoterChange { .. }
                                 | Syscall::ProposeClusterTrustChange { .. }
                                 | Syscall::GetClusterReconfigurationStatus
-                                | Syscall::ProposeClusterVoterChange { .. }
-                                | Syscall::ProposeClusterTrustChange { .. }
-                                | Syscall::GetClusterReconfigurationStatus
                                 | Syscall::ListProviderModels { .. }
                                 | Syscall::SendMessageContent { .. }
                                 | Syscall::SendMessageContentStream { .. }

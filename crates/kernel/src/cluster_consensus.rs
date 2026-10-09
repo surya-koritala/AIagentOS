@@ -874,7 +874,8 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
     }
     if let Some(control) = &state.control_plane {
         validate_control_plane_state(control)?;
-        if control.reconfiguration_plans.len() > 64 {
+        if control.reconfiguration_plans.len() > crate::cluster_reconfiguration::MAX_RECONFIGURATION_PLANS
+            || crate::cluster_reconfiguration::retained_plan_bytes(&control.reconfiguration_plans).map_err(|error| read_io(error.to_string()))? > crate::cluster_reconfiguration::MAX_RECONFIGURATION_PLAN_BYTES {
             return Err(read_io(
                 "retained live reconfiguration plan capacity exceeded",
             ));
@@ -2766,7 +2767,7 @@ fn apply_new_authority_command(
                     "another voter or trust reconfiguration is in progress".into(),
                 ));
             }
-            if control.reconfiguration_plans.len() >= 64 {
+            if control.reconfiguration_plans.len() >= crate::cluster_reconfiguration::MAX_RECONFIGURATION_PLANS {
                 return Err((
                     AuthorityRejection::CapacityReached,
                     "retained live reconfiguration plan capacity is exhausted".into(),
@@ -2809,6 +2810,9 @@ fn apply_new_authority_command(
                 _ => unreachable!("matched only live proposal variants"),
             }
             .map_err(invalid_command)?;
+            if target.catalog.values().any(|node| !control.members.values().any(|member| member.public_key == node.identity_public_key && member.state == ClusterMemberState::Active)) {
+                return Err(invalid_command("live transport target identity is not an active challenged authority member"));
+            }
             crate::cluster_runtime::validate_live_membership_transition(membership, &target)
                 .map_err(invalid_command)?;
             let plan = crate::cluster_reconfiguration::ClusterReconfigurationPlan {
@@ -2819,6 +2823,11 @@ fn apply_new_authority_command(
                 reason: reason.clone(),
                 proposed_at: at,
             };
+            let retained_bytes = crate::cluster_reconfiguration::retained_plan_bytes(&control.reconfiguration_plans).map_err(invalid_command)?;
+            let new_bytes = serde_json::to_vec(&plan).map_err(invalid_command)?.len();
+            if retained_bytes.checked_add(new_bytes).is_none_or(|total| total > crate::cluster_reconfiguration::MAX_RECONFIGURATION_PLAN_BYTES) {
+                return Err((AuthorityRejection::CapacityReached, "retained live reconfiguration plan byte capacity is exhausted".into()));
+            }
             // No clock or target change occurs until all bounded validation passes.
             control.logical_time = at;
             control.reconfiguration_plans.push(plan.clone());

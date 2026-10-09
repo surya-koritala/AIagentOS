@@ -20,6 +20,62 @@ const MAX_UPDATE_VERSION_BYTES: usize = 128;
 const MAX_UPDATE_TARGET_BYTES: usize = 128;
 const MAX_UPDATE_NOTES_BYTES: usize = 64 * 1024;
 
+fn require_native_peripheral_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let url = window
+        .url()
+        .map_err(|_| "peripheral operator window is unavailable".to_string())?;
+    let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+    if let Some(port) = url.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || !crate::trusted_peripheral_window(window.label(), &origin)
+    {
+        return Err("peripheral approval requires the trusted main window".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_peripheral_requests(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Vec<kernel::PeripheralOperatorRequest>, String> {
+    require_native_peripheral_window(&window)?;
+    state.peripheral_requests()
+}
+
+#[tauri::command]
+pub fn approve_peripheral_request(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    require_native_peripheral_window(&window)?;
+    state.approve_peripheral_request(&request_id)
+}
+
+#[tauri::command]
+pub fn deny_peripheral_request(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    require_native_peripheral_window(&window)?;
+    state.deny_peripheral_request(&request_id)
+}
+
+#[tauri::command]
+pub fn revoke_peripheral_request(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<crate::DesktopPeripheralRevocation, String> {
+    require_native_peripheral_window(&window)?;
+    state.revoke_peripheral_request(&request_id)
+}
+
 /// Non-secret configuration that may cross the desktop IPC boundary.
 ///
 /// `Config` intentionally cannot be serialized directly here because it owns

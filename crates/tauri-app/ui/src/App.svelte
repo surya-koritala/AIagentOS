@@ -8,6 +8,7 @@
   import AgentDetail from './lib/AgentDetail.svelte';
   import Settings from './lib/Settings.svelte';
   import AgentStatus from './lib/AgentStatus.svelte';
+  import PeripheralApprovals from './lib/PeripheralApprovals.svelte';
   import {
     applyOperatorView,
     beginOperation,
@@ -100,6 +101,7 @@
             <button on:click={refreshOperator} disabled={operatorState.refreshing}>Retry now</button>
           {/if}
         </div>
+        <PeripheralApprovals />
         {#if view === 'dashboard'}
           <Dashboard {agents} {metrics} on:select={onSelectAgent} />
         {:else if view === 'chat'}

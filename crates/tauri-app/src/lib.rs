@@ -3,7 +3,8 @@
 //! The desktop UI is a client of the public syscall service. Even though the
 //! packaged application hosts its kernel in the same process, it reaches that
 //! kernel through an authenticated loopback server so lifecycle and tool calls
-//! cannot bypass the canonical authorization path.
+//! cannot bypass the canonical authorization path. Human peripheral decisions
+//! use a separate native-only handle; no wire client receives that authority.
 
 use std::sync::Arc;
 
@@ -933,6 +934,69 @@ impl DesktopClient {
 /// State managed by Tauri for every backend command.
 pub struct AppState {
     pub client: DesktopClient,
+    pub peripheral_operator: Option<kernel::LocalPeripheralOperator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopPeripheralRevocation {
+    pub pending_grant_revoked: bool,
+    pub active_uses_cancelled: usize,
+}
+
+impl AppState {
+    pub fn peripheral_requests(&self) -> Result<Vec<kernel::PeripheralOperatorRequest>, String> {
+        Ok(self.local_peripheral_operator()?.requests())
+    }
+
+    pub fn approve_peripheral_request(&self, request_id: &str) -> Result<(), String> {
+        self.local_peripheral_operator()?
+            .approve(parse_peripheral_request(request_id)?)
+            .map_err(|_| "peripheral request cannot be approved".into())
+    }
+
+    pub fn deny_peripheral_request(&self, request_id: &str) -> Result<(), String> {
+        self.local_peripheral_operator()?
+            .deny(parse_peripheral_request(request_id)?)
+            .map_err(|_| "peripheral request cannot be denied".into())
+    }
+
+    pub fn revoke_peripheral_request(
+        &self,
+        request_id: &str,
+    ) -> Result<DesktopPeripheralRevocation, String> {
+        let result = self
+            .local_peripheral_operator()?
+            .revoke(parse_peripheral_request(request_id)?)
+            .map_err(|_| "peripheral request cannot be revoked".to_string())?;
+        Ok(DesktopPeripheralRevocation {
+            pending_grant_revoked: result.pending_grant_revoked,
+            active_uses_cancelled: result.active_uses_cancelled,
+        })
+    }
+
+    fn local_peripheral_operator(&self) -> Result<&kernel::LocalPeripheralOperator, String> {
+        self.peripheral_operator
+            .as_ref()
+            .ok_or_else(|| "peripheral approval requires the embedded desktop kernel".into())
+    }
+}
+
+fn parse_peripheral_request(request_id: &str) -> Result<uuid::Uuid, String> {
+    if request_id.len() != 36 {
+        return Err("invalid peripheral request identity".into());
+    }
+    uuid::Uuid::parse_str(request_id).map_err(|_| "invalid peripheral request identity".into())
+}
+
+/// Decisions are accepted only from the packaged main webview, never a remote
+/// navigation or auxiliary window. Development has the explicit configured
+/// localhost origin; production does not accept it.
+pub fn trusted_peripheral_window(label: &str, origin: &str) -> bool {
+    label == "main"
+        && (matches!(
+            origin,
+            "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+        ) || cfg!(debug_assertions) && origin == "http://localhost:1420")
 }
 
 /// Process-local guard preventing concurrent native updater installations.
@@ -963,6 +1027,9 @@ impl Drop for DesktopUpdateInstallGuard<'_> {
         self.state.installing.store(false, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod peripheral_tests;
 
 #[cfg(test)]
 mod tests {

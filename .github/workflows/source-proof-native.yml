@@ -56,7 +56,6 @@ jobs:
     env:
       CARGO_INCREMENTAL: 0
       RUST_BACKTRACE: 1
-      AGENTOS_SOURCE_PROOF_NATIVE_RECEIPT_FILE: ${{ runner.temp }}/source-proof-native.prom
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -68,6 +67,8 @@ jobs:
           save-if: false
       - name: Actual Git proofs and output-alias refusal
         shell: bash
+        env:
+          AGENTOS_SOURCE_PROOF_NATIVE_RECEIPT_FILE: ${{ runner.temp }}/source-proof-native.prom
         run: |
           set -euo pipefail
           git rev-parse HEAD > source-proof-native-source.txt

@@ -5579,10 +5579,25 @@ mod tests {
                 let state: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
                 assert_eq!(state["receipts"].as_object().unwrap().len(), 1);
             }
+            let weak = contexts.iter().map(Arc::downgrade).collect::<Vec<_>>();
             for runtime in runtimes.into_iter().flatten() {
                 runtime.shutdown().await.unwrap();
             }
             drop(contexts);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while weak.iter().any(|context| context.strong_count() != 0) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "shutdown retained actual Context owners: {:?}",
+                    weak.iter()
+                        .map(std::sync::Weak::strong_count)
+                        .collect::<Vec<_>>()
+                )
+            });
             root.close().unwrap();
         })
         .await

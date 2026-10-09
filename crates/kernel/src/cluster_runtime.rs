@@ -110,7 +110,12 @@ fn authority_command_actor(command: &AuthorityCommand) -> Option<&str> {
         | AuthorityCommand::SetMemberState { actor, .. }
         | AuthorityCommand::ClaimOwnership { actor, .. }
         | AuthorityCommand::RenewOwnership { actor, .. }
-        | AuthorityCommand::ReleaseOwnership { actor, .. } => Some(actor),
+        | AuthorityCommand::ReleaseOwnership { actor, .. }
+        | AuthorityCommand::PrepareAgentIdentity { actor, .. }
+        | AuthorityCommand::RecordAgentCreation { actor, .. }
+        | AuthorityCommand::PublishAgentIdentity { actor, .. }
+        | AuthorityCommand::AbortAgentIdentity { actor, .. }
+        | AuthorityCommand::DeleteAgentIdentity { actor, .. } => Some(actor),
         AuthorityCommand::Authorized { .. }
         | AuthorityCommand::Initialize { .. }
         | AuthorityCommand::Barrier { .. }
@@ -3396,7 +3401,12 @@ fn normalize_forwarded_authority_command(command: &mut AuthorityCommand) -> io::
         | AuthorityCommand::SetMemberState { proposed_at, .. }
         | AuthorityCommand::ClaimOwnership { proposed_at, .. }
         | AuthorityCommand::RenewOwnership { proposed_at, .. }
-        | AuthorityCommand::ReleaseOwnership { proposed_at, .. } => proposed_at,
+        | AuthorityCommand::ReleaseOwnership { proposed_at, .. }
+        | AuthorityCommand::PrepareAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::RecordAgentCreation { proposed_at, .. }
+        | AuthorityCommand::PublishAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::AbortAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::DeleteAgentIdentity { proposed_at, .. } => proposed_at,
         AuthorityCommand::Authorized { .. }
         | AuthorityCommand::Initialize { .. }
         | AuthorityCommand::Barrier { .. }
@@ -3576,6 +3586,7 @@ mod tests {
             principals: crate::cluster_principal::fixture_registry(),
             principal_audit: Vec::new(),
             ownership_tenant_scopes: BTreeMap::new(),
+            agent_identities: BTreeMap::new(),
             genesis: AuthorityGenesis {
                 operator_principals: vec![crate::cluster_principal::fixture_operator()],
                 cluster_id: cluster_id.clone(),
@@ -3748,6 +3759,7 @@ mod tests {
             principals: crate::cluster_principal::fixture_registry(),
             principal_audit: Vec::new(),
             ownership_tenant_scopes: BTreeMap::new(),
+            agent_identities: BTreeMap::new(),
             genesis: genesis.clone(),
             membership: ClusterMembershipSnapshot {
                 cluster_id,

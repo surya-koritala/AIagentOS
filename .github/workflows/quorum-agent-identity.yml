@@ -1,0 +1,109 @@
+name: Immutable quorum agent identity
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Format, compiler diagnostics, or quorum identity evidence
+        required: true
+        default: format
+        type: choice
+        options: [format, compiler, focused]
+  pull_request:
+    branches: [main, 'codex/**']
+    paths:
+      - '.github/workflows/quorum-agent-identity.yml'
+      - 'crates/kernel/src/cluster_*.rs'
+      - 'crates/kernel/src/context.rs'
+      - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/lib.rs'
+      - 'crates/sdk/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-identity-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  format:
+    name: Immutable identity formatter preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Retain exact source and formatting repair
+        run: |
+          mkdir -p target/qualification/agent-identity-format
+          git rev-parse HEAD > target/qualification/agent-identity-format/source-commit.txt
+          if ! cargo fmt --all -- --check; then
+            cargo fmt --all
+            git diff --binary > target/qualification/agent-identity-format/rustfmt.patch
+          fi
+          if ! rustfmt --edition 2021 --check crates/kernel/src/cluster_agent_identity_tests.rs; then
+            rustfmt --edition 2021 crates/kernel/src/cluster_agent_identity_tests.rs
+            git diff --binary > target/qualification/agent-identity-format/rustfmt.patch
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: agent-identity-format-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/qualification/agent-identity-format
+          retention-days: 30
+      - name: Require formatted source before compilation
+        run: test ! -s target/qualification/agent-identity-format/rustfmt.patch
+  evidence:
+    name: Immutable identity protocol and quorum evidence
+    needs: format
+    if: github.event_name == 'pull_request' || inputs.stage != 'format'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: quorum-agent-identity
+      - name: Retain source identity
+        run: |
+          mkdir -p target/qualification/agent-identity
+          git rev-parse HEAD > target/qualification/agent-identity/source-commit.txt
+      - name: Compile all owned targets
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p kernel -p agent-sdk --all-targets 2>&1 | tee target/qualification/agent-identity/compiler.txt
+      - name: Immutable identity transitions and corruption refusal
+        if: github.event_name == 'pull_request' || inputs.stage == 'focused'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p kernel immutable_identity --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/identity.txt
+          cargo test -p kernel cluster_consensus::tests --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/consensus.txt
+          cargo test -p kernel data_inventory --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/inventory.txt
+      - name: Strict lint
+        run: cargo clippy -p kernel -p agent-sdk --all-targets -- -D warnings
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: agent-identity-proof-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/qualification/agent-identity
+          retention-days: 30

@@ -7783,6 +7783,7 @@ mod tests {
             principals: crate::cluster_principal::fixture_registry(),
             principal_audit: Vec::new(),
             ownership_tenant_scopes: std::collections::BTreeMap::new(),
+            agent_identities: std::collections::BTreeMap::new(),
             genesis: crate::cluster_consensus::AuthorityGenesis {
                 operator_principals: vec![crate::cluster_principal::fixture_operator()],
                 cluster_id: cluster_id.clone(),

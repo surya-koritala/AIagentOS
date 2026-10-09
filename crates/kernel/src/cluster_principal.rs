@@ -182,7 +182,12 @@ pub fn authority_command_class(
         | AuthorityCommand::SetMemberState { .. } => Ok(AuthorityCommandClass::Membership),
         AuthorityCommand::ClaimOwnership { .. }
         | AuthorityCommand::RenewOwnership { .. }
-        | AuthorityCommand::ReleaseOwnership { .. } => Ok(AuthorityCommandClass::Ownership),
+        | AuthorityCommand::ReleaseOwnership { .. }
+        | AuthorityCommand::PrepareAgentIdentity { .. }
+        | AuthorityCommand::RecordAgentCreation { .. }
+        | AuthorityCommand::PublishAgentIdentity { .. }
+        | AuthorityCommand::AbortAgentIdentity { .. }
+        | AuthorityCommand::DeleteAgentIdentity { .. } => Ok(AuthorityCommandClass::Ownership),
         AuthorityCommand::EnrollPrincipal { .. } | AuthorityCommand::RevokePrincipal { .. } => {
             Ok(AuthorityCommandClass::PrincipalAdmin)
         }
@@ -410,6 +415,11 @@ pub(crate) fn command_proposed_at(command: &AuthorityCommand) -> Option<DateTime
         | AuthorityCommand::ReleaseOwnership { proposed_at, .. }
         | AuthorityCommand::EnrollPrincipal { proposed_at, .. }
         | AuthorityCommand::RevokePrincipal { proposed_at, .. } => Some(*proposed_at),
+        AuthorityCommand::PrepareAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::RecordAgentCreation { proposed_at, .. }
+        | AuthorityCommand::PublishAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::AbortAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::DeleteAgentIdentity { proposed_at, .. } => Some(*proposed_at),
         _ => None,
     }
 }
@@ -431,6 +441,11 @@ pub(crate) fn set_committed_command_time(command: &mut AuthorityCommand, at: Dat
         | AuthorityCommand::ReleaseOwnership { proposed_at, .. }
         | AuthorityCommand::EnrollPrincipal { proposed_at, .. }
         | AuthorityCommand::RevokePrincipal { proposed_at, .. } => *proposed_at = at,
+        AuthorityCommand::PrepareAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::RecordAgentCreation { proposed_at, .. }
+        | AuthorityCommand::PublishAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::AbortAgentIdentity { proposed_at, .. }
+        | AuthorityCommand::DeleteAgentIdentity { proposed_at, .. } => *proposed_at = at,
         _ => {}
     }
 }
@@ -445,6 +460,11 @@ pub(crate) fn set_verified_audit_actor(command: &mut AuthorityCommand, principal
         | AuthorityCommand::ClaimOwnership { actor, .. }
         | AuthorityCommand::RenewOwnership { actor, .. }
         | AuthorityCommand::ReleaseOwnership { actor, .. }
+        | AuthorityCommand::PrepareAgentIdentity { actor, .. }
+        | AuthorityCommand::RecordAgentCreation { actor, .. }
+        | AuthorityCommand::PublishAgentIdentity { actor, .. }
+        | AuthorityCommand::AbortAgentIdentity { actor, .. }
+        | AuthorityCommand::DeleteAgentIdentity { actor, .. }
         | AuthorityCommand::EnrollPrincipal { actor, .. }
         | AuthorityCommand::RevokePrincipal { actor, .. } => {
             *actor = format!("principal:{principal_id}")
@@ -468,7 +488,11 @@ pub fn verify_authority_principal_view(
     let inner = unsigned_authority_command(command)?;
     let existing = ownership_agent(inner)
         .is_some_and(|agent| view.ownerships.iter().any(|row| row.agent_id == agent));
-    verify_tenant_ownership_scope(principal, inner, &view.ownership_tenant_scopes, existing)?;
+    if crate::cluster_agent_identity::identity_command_agent(inner).is_some() {
+        crate::cluster_agent_identity::verify_identity_command_scope(principal, inner, &view.agent_identities)?;
+    } else {
+        verify_tenant_ownership_scope(principal, inner, &view.ownership_tenant_scopes, existing)?;
+    }
     verify_member_key_separation(inner, &view.principals)?;
     Ok(principal.clone())
 }

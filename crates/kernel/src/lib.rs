@@ -11,6 +11,7 @@ pub mod budget;
 pub mod cfs;
 pub mod cgroups;
 pub mod cloning;
+pub mod cluster_agent_identity;
 pub mod cluster_consensus;
 pub mod cluster_control;
 mod cluster_operation_receipts;

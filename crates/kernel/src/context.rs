@@ -392,6 +392,11 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         deletion: "retain completed and unresolved operation tombstones",
     },
     DurableDataClassification {
+        table: "cluster_agent_creation_journal",
+        owner: "system; immutable cluster identity and request digests only",
+        deletion: "retain exact creation receipts and abort/delete tombstones",
+    },
+    DurableDataClassification {
         table: "cluster_membership_authority",
         owner: "system",
         deletion: "retain",
@@ -1989,6 +1994,28 @@ impl SqliteContextManager {
                 admitted_at TEXT NOT NULL,
                 CHECK ((phase = 'pending' AND reply_json IS NULL) OR (phase = 'complete' AND reply_json IS NOT NULL))
             );
+            CREATE TABLE IF NOT EXISTS cluster_agent_creation_journal (
+                agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
+                reservation_json BLOB NOT NULL CHECK (length(reservation_json) <= 16384),
+                reservation_sha256 TEXT NOT NULL CHECK (length(reservation_sha256) = 64),
+                creation_operation_id TEXT NOT NULL UNIQUE CHECK (length(creation_operation_id) = 36),
+                installation_id TEXT NOT NULL CHECK (length(installation_id) = 36),
+                local_receipt_id TEXT NOT NULL UNIQUE CHECK (length(local_receipt_id) = 36),
+                state TEXT NOT NULL CHECK (state IN ('preparing', 'created', 'published', 'aborted', 'deleted')),
+                created_row_sha256 TEXT CHECK (created_row_sha256 IS NULL OR length(created_row_sha256) = 64),
+                receipt_json BLOB CHECK (receipt_json IS NULL OR length(receipt_json) <= 32768),
+                updated_at TEXT NOT NULL,
+                CHECK ((state = 'preparing' AND created_row_sha256 IS NULL AND receipt_json IS NULL)
+                    OR (state IN ('created', 'published', 'deleted') AND created_row_sha256 IS NOT NULL AND receipt_json IS NOT NULL)
+                    OR state = 'aborted')
+            );
+            CREATE TRIGGER IF NOT EXISTS cluster_agent_creation_identity_immutable
+            BEFORE UPDATE OF agent_id, reservation_json, reservation_sha256,
+                creation_operation_id, installation_id, local_receipt_id ON cluster_agent_creation_journal
+            BEGIN SELECT RAISE(ABORT, 'immutable destination identity cannot be replaced'); END;
+            CREATE TRIGGER IF NOT EXISTS cluster_agent_creation_tombstone_retained
+            BEFORE DELETE ON cluster_agent_creation_journal
+            BEGIN SELECT RAISE(ABORT, 'destination identity tombstones must be retained'); END;
             CREATE TABLE IF NOT EXISTS cluster_node_control_audit (
                 generation INTEGER PRIMARY KEY,
                 previous_availability TEXT NOT NULL,

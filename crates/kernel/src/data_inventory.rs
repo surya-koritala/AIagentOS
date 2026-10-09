@@ -573,6 +573,15 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "retain fencing tombstone until cluster retirement"
     ),
     sqlite_entry!(
+        "cluster_agent_creation_journal",
+        "system",
+        "explicit immutable System or Tenant scope; no legacy inference",
+        "identity UUIDs, request digests, signed destination receipts and terminal tombstones; no prompt content",
+        "for cluster lifetime",
+        "not confidential; database integrity and file permissions",
+        "retain exact creation evidence and abort/delete tombstones after agent or tenant erasure"
+    ),
+    sqlite_entry!(
         "cluster_agent_mutation_fence_audit",
         "system",
         "agent UUID and durable node UUID",

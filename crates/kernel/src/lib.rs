@@ -31,6 +31,21 @@ pub mod ipc;
 pub mod learning;
 pub mod llm_sched;
 pub mod mac;
+mod managed_workspace;
+
+/// Bounded local maintenance output; no wire or tool grants this authority.
+#[derive(Debug, Serialize)]
+pub struct WorkspaceOwnershipStatus {
+    pub admitted_agents: Vec<AgentId>,
+    pub unresolved: Vec<WorkspaceOwnershipIssue>,
+    pub truncated: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct WorkspaceOwnershipIssue {
+    pub agent_id: AgentId,
+    pub recorded_workspace: std::path::PathBuf,
+    pub reason: &'static str,
+}
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory_manager;
@@ -1329,6 +1344,12 @@ pub struct PeripheralRevocation {
     pub active_uses_cancelled: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ConfigStartupMode {
+    Runtime,
+    WorkspaceMaintenance,
+}
+
 impl AgentKernelImpl {
     /// Attach the trusted, process-local human approval surface. This handle is
     /// never transported by the syscall server, SDK, MCP, or packages.
@@ -1391,6 +1412,22 @@ impl AgentKernelImpl {
     /// Create a kernel from config (uses config.data_dir for persistence and
     /// config.budgets for cgroup/rate-limit quotas).
     pub fn from_config(config: &crate::config::Config) -> Result<Self, KernelError> {
+        Self::from_config_mode(config, ConfigStartupMode::Runtime)
+    }
+
+    /// Open leased storage for trusted local workspace maintenance without
+    /// loading or retiring service definitions. Call `rehydrate_agents` to
+    /// verify and admit recorded ownership before inspecting maintenance status.
+    pub fn from_config_for_workspace_maintenance(
+        config: &crate::config::Config,
+    ) -> Result<Self, KernelError> {
+        Self::from_config_mode(config, ConfigStartupMode::WorkspaceMaintenance)
+    }
+
+    fn from_config_mode(
+        config: &crate::config::Config,
+        mode: ConfigStartupMode,
+    ) -> Result<Self, KernelError> {
         Self::validate_storage_boot_config(config)?;
         let db_path = config.data_dir.join("agent_os.db");
         if let Some(parent) = db_path.parent() {
@@ -1398,7 +1435,7 @@ impl AgentKernelImpl {
         }
         let storage_lease =
             crate::storage::acquire_storage_lease(&db_path).map_err(KernelError::Context)?;
-        Self::from_validated_config_with_storage_lease(config, storage_lease)
+        Self::from_validated_config_with_storage_lease(config, storage_lease, mode)
     }
 
     fn validate_storage_boot_config(config: &crate::config::Config) -> Result<(), KernelError> {
@@ -1419,12 +1456,17 @@ impl AgentKernelImpl {
         storage_lease: crate::storage::StorageLease,
     ) -> Result<Self, KernelError> {
         Self::validate_storage_boot_config(config)?;
-        Self::from_validated_config_with_storage_lease(config, storage_lease)
+        Self::from_validated_config_with_storage_lease(
+            config,
+            storage_lease,
+            ConfigStartupMode::Runtime,
+        )
     }
 
     fn from_validated_config_with_storage_lease(
         config: &crate::config::Config,
         storage_lease: crate::storage::StorageLease,
+        mode: ConfigStartupMode,
     ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
@@ -1502,7 +1544,11 @@ impl AgentKernelImpl {
                 .connector
                 .set_routing_policy(provider, policy.clone());
         }
-        if let Some(service_dir) = &config.service_dir {
+        if let Some(service_dir) = config
+            .service_dir
+            .as_ref()
+            .filter(|_| matches!(mode, ConfigStartupMode::Runtime))
+        {
             *kernel
                 .service_directory
                 .write()
@@ -1518,8 +1564,10 @@ impl AgentKernelImpl {
         }
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
-        kernel.rehydrate_agents_blocking();
-        kernel.restore_service_runtime_from_store()?;
+        if matches!(mode, ConfigStartupMode::Runtime) {
+            kernel.rehydrate_agents_blocking();
+            kernel.restore_service_runtime_from_store()?;
+        }
         Ok(kernel)
     }
 
@@ -1593,7 +1641,12 @@ impl AgentKernelImpl {
         )?);
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
-        let sandbox_manager = Arc::new(SandboxManagerImpl::new());
+        let store_identity = context_manager.workspace_store_identity(storage_lease.is_some())?;
+        let sandbox_manager = Arc::new(SandboxManagerImpl::for_datastore(
+            store_identity
+                .as_ref()
+                .map(|(path, store)| (path.as_path(), *store)),
+        )?);
         let resource_broker = Arc::new(ResourceBrokerImpl::new(
             permission_manager.clone(),
             sandbox_manager.clone(),
@@ -1811,10 +1864,112 @@ impl AgentKernelImpl {
                 "managed application bootstrap requires an isolated backend".into(),
             ));
         }
-        sandbox.workspace_dir = SandboxManagerImpl::default_config().workspace_dir;
+        sandbox.workspace_dir = self.sandbox_manager.default_managed_config().workspace_dir;
         config.sandbox_config = Some(sandbox);
         self.create_agent_grouped_owned(config, None, crate::context::DEFAULT_TENANT, None, true)
             .await
+    }
+
+    /// Trusted local operator resolution for an unverified legacy/restored
+    /// workspace. Preserve its bytes and identity as an explicit operator
+    /// workspace; never adopt automatic deletion ownership. No wire/tool
+    /// operation exposes this authority. The record must not be live.
+    pub async fn retain_legacy_workspace_as_operator(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<(), KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        if self.agent_manager.get_agent_state(agent_id).is_some() {
+            return Err(KernelError::Policy(
+                "workspace ownership resolution requires a non-admitted agent".into(),
+            ));
+        }
+        let record = self
+            .context_manager
+            .load_all_agents()?
+            .into_iter()
+            .find(|record| record.id == agent_id)
+            .ok_or_else(|| KernelError::Policy("workspace ownership record is unknown".into()))?;
+        let serialized = record.sandbox_config_json.as_deref().ok_or_else(|| {
+            KernelError::Policy("legacy workspace record has no path to preserve".into())
+        })?;
+        let config: SandboxConfig = serde_json::from_str(serialized)
+            .map_err(|error| KernelError::Policy(error.to_string()))?;
+        self.sandbox_manager
+            .retain_legacy_workspace(&config.workspace_dir, agent_id)?;
+        Ok(())
+    }
+
+    /// Inspect recorded paths locally while the datastore lease is held.
+    /// Output remains bounded; callers can resolve a recorded UUID explicitly.
+    pub fn workspace_ownership_status(&self) -> Result<WorkspaceOwnershipStatus, KernelError> {
+        let mut admitted_agents = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut truncated = false;
+        let mut records = self.context_manager.load_all_agents()?;
+        records.sort_by_key(|record| record.id);
+        for record in records {
+            match serde_json::from_str::<AgentState>(&record.status) {
+                Ok(AgentState::Running | AgentState::Paused) => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    if unresolved.len() == 256 {
+                        truncated = true;
+                        break;
+                    }
+                    let path = record
+                        .sandbox_config_json
+                        .as_deref()
+                        .and_then(|serialized| {
+                            serde_json::from_str::<SandboxConfig>(serialized).ok()
+                        })
+                        .map(|config| config.workspace_dir)
+                        .unwrap_or_default();
+                    unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:path,
+                        reason:"recorded lifecycle status is malformed; original status, identity and owned data were preserved; repair the record before admission" });
+                    continue;
+                }
+            }
+            if self.agent_manager.get_agent_state(record.id).is_some() {
+                if admitted_agents.len() < 256 {
+                    admitted_agents.push(record.id);
+                } else {
+                    truncated = true;
+                }
+            }
+            let Some(serialized) = record.sandbox_config_json.as_deref() else {
+                continue;
+            };
+            let config = match serde_json::from_str::<SandboxConfig>(serialized) {
+                Ok(config) => config,
+                Err(_) => {
+                    if unresolved.len() == 256 {
+                        truncated = true;
+                        break;
+                    }
+                    unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:std::path::PathBuf::new(),
+                        reason:"recorded sandbox configuration is malformed; original JSON, status and data were preserved; repair the record before admission" });
+                    continue;
+                }
+            };
+            if self
+                .sandbox_manager
+                .restored_workspace_is_managed(&config, record.id)
+                .is_err()
+            {
+                if unresolved.len() == 256 {
+                    truncated = true;
+                    break;
+                }
+                unresolved.push(WorkspaceOwnershipIssue { agent_id: record.id, recorded_workspace: config.workspace_dir,
+                    reason: "recorded workspace ownership is unresolved; data and identity were preserved" });
+            }
+        }
+        Ok(WorkspaceOwnershipStatus {
+            admitted_agents,
+            unresolved,
+            truncated,
+        })
     }
 
     /// Create an agent with an authority-reserved identifier.
@@ -2383,7 +2538,7 @@ impl AgentKernelImpl {
         // the wire and package formats do not expose that bypass.
         let managed_sandbox = config.sandbox_config.is_none() || owned_sandbox;
         if config.sandbox_config.is_none() {
-            config.sandbox_config = Some(SandboxManagerImpl::default_config());
+            config.sandbox_config = Some(self.sandbox_manager.default_managed_config());
         }
         // 1. Create agent via agent manager
         let handle = match requested_agent_id {
@@ -2601,24 +2756,53 @@ impl AgentKernelImpl {
             .context_manager
             .load_all_agents()
             .map_err(KernelError::Context)?;
-        let active_managed_workspaces = persisted
-            .iter()
-            .filter(|record| {
-                matches!(
-                    serde_json::from_str::<AgentState>(&record.status),
-                    Ok(AgentState::Running | AgentState::Paused)
-                )
-            })
-            .filter_map(|record| record.sandbox_config_json.as_deref())
-            .filter_map(|serialized| serde_json::from_str::<SandboxConfig>(serialized).ok())
-            .filter(SandboxManagerImpl::is_managed_config)
-            .map(|config| config.workspace_dir)
-            .collect::<std::collections::HashSet<_>>();
+        let mut active_managed_workspaces = std::collections::HashSet::new();
+        let mut unresolved_workspaces = std::collections::HashSet::new();
+        let mut protected_workspace_agents = std::collections::HashSet::new();
+        for record in &persisted {
+            if serde_json::from_str::<AgentState>(&record.status).is_err() {
+                protected_workspace_agents.insert(record.id);
+                unresolved_workspaces.insert(record.id);
+                continue;
+            }
+            if matches!(
+                serde_json::from_str::<AgentState>(&record.status),
+                Ok(AgentState::Running | AgentState::Paused)
+            ) {
+                protected_workspace_agents.insert(record.id);
+                if let Some(serialized) = &record.sandbox_config_json {
+                    match serde_json::from_str::<SandboxConfig>(serialized) {
+                        Ok(config) => match self
+                            .sandbox_manager
+                            .restored_workspace_is_managed(&config, record.id)
+                        {
+                            Ok(true) => {
+                                active_managed_workspaces.insert(config.workspace_dir);
+                            }
+                            Ok(false) => {}
+                            Err(_) => {
+                                unresolved_workspaces.insert(record.id);
+                            }
+                        },
+                        Err(_) => {
+                            unresolved_workspaces.insert(record.id);
+                        }
+                    }
+                }
+            }
+        }
         self.sandbox_manager
-            .reconcile_managed_workspaces(&active_managed_workspaces)
+            .reconcile_recorded_managed_workspaces(
+                &active_managed_workspaces,
+                &protected_workspace_agents,
+            )
             .map_err(KernelError::Sandbox)?;
         let mut restored = Vec::new();
         for p in persisted {
+            if unresolved_workspaces.contains(&p.id) {
+                tracing::warn!(agent_id = %p.id, "Recorded workspace ownership is unresolved; agent remains unadmitted and its durable status and data are preserved");
+                continue;
+            }
             // An explicit reconciliation pass may run after boot. Treat an
             // identity already present in the live registry as successfully
             // reconciled instead of trying to create a second sandbox and
@@ -2632,7 +2816,7 @@ impl AgentKernelImpl {
                 .sandbox_config_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<SandboxConfig>(s).ok())
-                .unwrap_or_else(SandboxManagerImpl::default_config);
+                .unwrap_or_else(|| self.sandbox_manager.default_managed_config());
             let config = AgentConfig {
                 name: p.name.clone(),
                 task: p.task.clone(),
@@ -2699,7 +2883,11 @@ impl AgentKernelImpl {
                     continue;
                 }
             };
-            let sandbox_result = if SandboxManagerImpl::is_managed_config(&sandbox_config) {
+            let sandbox_result = if p.sandbox_config_json.is_none()
+                || self
+                    .sandbox_manager
+                    .restored_workspace_is_managed(&sandbox_config, p.id)?
+            {
                 self.sandbox_manager
                     .create_managed_sandbox(p.id, &sandbox_config)
             } else {

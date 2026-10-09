@@ -104,8 +104,14 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
             .unwrap();
         let conn = manager.locked_conn();
         let metadata = crate::schema::read_storage_metadata(&conn).unwrap();
-        assert_eq!(metadata.schema_version, crate::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(metadata.min_reader_schema_version, crate::schema::MIN_READER_SCHEMA_VERSION);
+        assert_eq!(
+            metadata.schema_version,
+            crate::schema::CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            metadata.min_reader_schema_version,
+            crate::schema::MIN_READER_SCHEMA_VERSION
+        );
         assert!(matches!(
             crate::schema::preflight_for_reader(&conn, 12),
             Err(ContextError::DatabaseTooNew {
@@ -295,9 +301,13 @@ fn image_input_every_durable_writer_refuses_schema_and_min_reader_downgrades() {
                 .unwrap(),
             0
         );
-        conn.pragma_update(None, "user_version", crate::schema::CURRENT_SCHEMA_VERSION).unwrap();
-        conn.execute("UPDATE storage_meta SET min_reader_schema_version=?1", [crate::schema::MIN_READER_SCHEMA_VERSION])
+        conn.pragma_update(None, "user_version", crate::schema::CURRENT_SCHEMA_VERSION)
             .unwrap();
+        conn.execute(
+            "UPDATE storage_meta SET min_reader_schema_version=?1",
+            [crate::schema::MIN_READER_SCHEMA_VERSION],
+        )
+        .unwrap();
     }
 }
 

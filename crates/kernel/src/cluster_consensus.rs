@@ -246,6 +246,7 @@ pub enum AuthorityCommand {
     ProposeClusterTrustChange {
         operation_id: String,
         prior: crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+        #[serde(with = "crate::cluster_reconfiguration::canonical_node_catalog")]
         target_catalog: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
         expected_generation: u64,
         target_generation: u64,

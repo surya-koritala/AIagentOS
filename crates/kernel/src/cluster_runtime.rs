@@ -1260,6 +1260,10 @@ fn validated_durable_transport_catalog(
         });
     if configured_transport_catalog_sha256(&nodes) != digest
         && !exact_generation_zero_desired_subset
+        && !(configs_are_uniform_voters(&stored, desired)
+            && stored.nodes().all(|(_, node)| node.voter_set_generation > 0)
+            && desired.values().all(|node| node.transport_catalog_sha256 == digest)
+            && stored.nodes().all(|(_, prior)| desired.values().all(|node| node.voter_set_generation == prior.voter_set_generation && node.voter_set_sha256 == prior.voter_set_sha256)))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2963,19 +2967,40 @@ async fn converge_membership_target(
                 }
             }
             DurableMembershipProgress::NeedsCatalog if observed.current_leader == Some(node_id) => {
+                let restoring = target.voter_generation > 0 && observed.membership_config.nodes().count() < target.catalog.len();
+                if restoring {
+                    let mut caught_up = true;
+                    for (id, node) in &target.catalog {
+                        if target.voter_ids.contains(id) { continue; }
+                        match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), raft.add_learner(*id, node.clone(), true)).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => { last_failure = Some(format!("restore removed voter as learner {id}: {error}")); caught_up = false; break; }
+                            Err(_) => { last_failure = Some(format!("restore removed voter as learner {id} timed out")); caught_up = false; break; }
+                        }
+                    }
+                    if caught_up {
+                        match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), raft.change_membership(ChangeMembers::SetNodes(target.catalog.clone()), true)).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => last_failure = Some(format!("restore exact prepared learner catalog: {error}")),
+                            Err(_) => last_failure = Some("restore exact prepared learner catalog timed out".into()),
+                        }
+                    }
+                } else {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
                     raft.change_membership(ChangeMembers::SetNodes(target.catalog.clone()), true),
                 )
                 .await
                 {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                    }
                     Ok(Err(error)) => {
                         last_failure = Some(format!("commit trusted transport catalog: {error}"));
                     }
                     Err(_) => {
                         last_failure = Some("commit trusted transport catalog timed out".into());
                     }
+                }
                 }
             }
             DurableMembershipProgress::NeedsTransportTrust
@@ -3050,7 +3075,7 @@ async fn converge_membership_target(
                 if !failed {
                     match tokio::time::timeout(
                         deadline.saturating_duration_since(Instant::now()),
-                        raft.change_membership(target.voter_ids.clone(), true),
+                        raft.change_membership(target.voter_ids.clone(), false),
                     )
                     .await
                     {
@@ -3069,7 +3094,7 @@ async fn converge_membership_target(
             DurableMembershipProgress::Joint if observed.current_leader == Some(node_id) => {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
-                    raft.change_membership(target.voter_ids.clone(), true),
+                    raft.change_membership(target.voter_ids.clone(), false),
                 )
                 .await
                 {
@@ -3111,6 +3136,15 @@ enum DurableMembershipProgress {
     NeedsIntent,
     IntentCommitted,
     Joint,
+}
+
+fn configs_are_uniform_voters(
+    stored: &openraft::StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
+    trusted: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+) -> bool {
+    stored.membership().get_joint_config().len() == 1
+        && stored.nodes().map(|(id, _)| *id).collect::<BTreeSet<_>>() == stored.voter_ids().collect::<BTreeSet<_>>()
+        && stored.nodes().all(|(id, node)| trusted.get(id).is_some_and(|entry| entry == node))
 }
 
 fn inspect_durable_membership(
@@ -3173,6 +3207,14 @@ fn inspect_membership_target(
             .is_some_and(|expected| same_transport_trust_entry(expected, node))
     });
     let nodes_match_trusted = nodes.len() == trusted.len() && nodes_are_trusted_subset;
+    let complete_voter_catalog_restoration = configs_are_uniform_voters(stored, trusted)
+        && voters == *desired_voters
+        && nodes_are_trusted_subset
+        && nodes.values().all(|node| node.transport_trust_generation == desired_transport_trust_generation
+            && node.transport_catalog_sha256 == desired_transport_catalog_sha256
+            && node.voter_set_generation == desired_generation
+            && node.voter_set_sha256 == desired_sha256)
+        && desired_generation > 0;
     let mut catalog_digests = nodes
         .values()
         .map(|node| node.transport_catalog_sha256.as_str())
@@ -3236,6 +3278,7 @@ fn inspect_membership_target(
             && nodes_are_trusted_subset;
         if configured_transport_catalog_sha256(&nodes) != stored_transport_catalog_sha256
             && !generation_zero_catalog_intent
+            && !complete_voter_catalog_restoration
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3417,6 +3460,9 @@ fn inspect_membership_target(
         if voters == *desired_voters {
             if nodes_match_trusted {
                 return Ok(DurableMembershipProgress::Settled);
+            }
+            if complete_voter_catalog_restoration {
+                return Ok(DurableMembershipProgress::NeedsCatalog);
             }
             if stored_transport_trust_generation == 0 && nodes_are_trusted_subset {
                 return Ok(DurableMembershipProgress::NeedsCatalog);

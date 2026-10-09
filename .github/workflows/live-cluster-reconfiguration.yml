@@ -76,7 +76,7 @@ jobs:
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 5
         run: |
-          cargo test -p kernel --lib --locked live_reconfiguration:: -- --nocapture
+          cargo test -p kernel --lib --locked cluster_runtime::tests -- --nocapture
       - name: Preserve generated protocol fixtures and principal storage fences
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 5

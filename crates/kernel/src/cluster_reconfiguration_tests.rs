@@ -496,9 +496,8 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
             matches!(
                 fresh_leaf_client
                     .call(vote_probe(), RPCOption::new(Duration::from_secs(3)))
-                    .await
-                    .unwrap(),
-                RpcResponse::Vote(Ok(_))
+                    .await,
+                Ok(RpcResponse::Vote(Ok(_)))
             ),
             "the running listener must admit the exact newly authorized overlap leaf"
         );

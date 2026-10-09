@@ -441,8 +441,13 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
                 "list" if args.next().is_none() => None,
                 "retain" => {
                     let id = args.next().unwrap_or_else(|| usage());
-                    let id = id.parse::<kernel::AgentId>().unwrap_or_else(|_| fail_operator("workspace ownership requires a recorded agent UUID"));
-                    if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() { usage(); }
+                    let id = id.parse::<kernel::AgentId>().unwrap_or_else(|_| {
+                        fail_operator("workspace ownership requires a recorded agent UUID")
+                    });
+                    if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some()
+                    {
+                        usage();
+                    }
                     Some(id)
                 }
                 _ => usage(),
@@ -451,15 +456,29 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
             if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
                 fail_operator("workspace ownership requires an existing configuration file");
             }
-            let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| fail_operator(format!("invalid local configuration: {error}")));
+            let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| {
+                fail_operator(format!("invalid local configuration: {error}"))
+            });
             // Startup acquires the existing exclusive database lease; a live
             // runtime cannot race this purely local maintenance command.
-            let kernel = kernel::AgentKernelImpl::from_config(&config).unwrap_or_else(|error| fail_operator(format!("local workspace ownership maintenance failed: {error}")));
+            let kernel = kernel::AgentKernelImpl::from_config(&config).unwrap_or_else(|error| {
+                fail_operator(format!(
+                    "local workspace ownership maintenance failed: {error}"
+                ))
+            });
             if let Some(id) = target {
-                kernel.retain_legacy_workspace_as_operator(id).await.unwrap_or_else(|error| fail_operator(error.to_string()));
-                print_json(&serde_json::json!({"agent_id":id,"resolution":"retain_as_operator_workspace","automatic_deletion":false}), "workspace ownership resolution");
+                kernel
+                    .retain_legacy_workspace_as_operator(id)
+                    .await
+                    .unwrap_or_else(|error| fail_operator(error.to_string()));
+                print_json(
+                    &serde_json::json!({"agent_id":id,"resolution":"retain_as_operator_workspace","automatic_deletion":false}),
+                    "workspace ownership resolution",
+                );
             } else {
-                let status = kernel.workspace_ownership_status().unwrap_or_else(|error| fail_operator(error.to_string()));
+                let status = kernel
+                    .workspace_ownership_status()
+                    .unwrap_or_else(|error| fail_operator(error.to_string()));
                 print_json(&status, "workspace ownership status");
             }
             true

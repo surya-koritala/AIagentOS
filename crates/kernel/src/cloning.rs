@@ -4,7 +4,7 @@ use crate::agent::AgentKernel;
 use crate::agent_struct::CapabilitySet;
 use crate::context::{ExecutionSnapshotMetadata, PersistedAgent};
 use crate::permissions::PermissionSystem;
-use crate::sandbox::{SandboxManager, SandboxManagerImpl};
+use crate::sandbox::SandboxManager;
 use crate::{AgentError, AgentId, AgentKernelImpl, AgentState, KernelError, KernelEvent};
 use serde::{Deserialize, Serialize};
 
@@ -846,7 +846,7 @@ impl AgentKernelImpl {
             .sandbox_manager
             .sandbox_config(source_sandbox)
             .ok_or_else(|| policy("clone parent sandbox policy is unavailable"))?;
-        sandbox_config.workspace_dir = SandboxManagerImpl::default_config().workspace_dir;
+        sandbox_config.workspace_dir = self.sandbox_manager.default_managed_config().workspace_dir;
         let sandbox = self
             .sandbox_manager
             .create_managed_sandbox(child, &sandbox_config)?;

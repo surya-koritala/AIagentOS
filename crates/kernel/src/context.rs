@@ -1017,7 +1017,10 @@ pub struct SqliteContextManager {
 impl SqliteContextManager {
     /// Store ownership is read only after schema initialization under the
     /// Context or kernel's existing exclusive database lease.
-    pub(crate) fn workspace_store_identity(&self, external_lease: bool) -> Result<Option<(std::path::PathBuf, uuid::Uuid)>, ContextError> {
+    pub(crate) fn workspace_store_identity(
+        &self,
+        external_lease: bool,
+    ) -> Result<Option<(std::path::PathBuf, uuid::Uuid)>, ContextError> {
         let connection = self.locked_conn();
         let Some(path) = connection.path().filter(|path| !path.is_empty()) else {
             if self._storage_lease.is_some() || external_lease {
@@ -1026,10 +1029,14 @@ impl SqliteContextManager {
             return Ok(None);
         };
         if self._storage_lease.is_none() && !external_lease {
-            return Err(ContextError::StorageError("durable workspace namespace requires the database lease".into()));
+            return Err(ContextError::StorageError(
+                "durable workspace namespace requires the database lease".into(),
+            ));
         }
         let metadata = crate::schema::read_storage_metadata(&connection)?;
-        let id = uuid::Uuid::parse_str(&metadata.installation_id).map_err(|_| ContextError::StorageError("workspace store identity is not an immutable UUID".into()))?;
+        let id = uuid::Uuid::parse_str(&metadata.installation_id).map_err(|_| {
+            ContextError::StorageError("workspace store identity is not an immutable UUID".into())
+        })?;
         Ok(Some((std::path::PathBuf::from(path), id)))
     }
 

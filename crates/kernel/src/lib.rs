@@ -1573,7 +1573,11 @@ impl AgentKernelImpl {
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
         let store_identity = context_manager.workspace_store_identity(storage_lease.is_some())?;
-        let sandbox_manager = Arc::new(SandboxManagerImpl::for_datastore(store_identity.as_ref().map(|(path, store)| (path.as_path(), *store)))?);
+        let sandbox_manager = Arc::new(SandboxManagerImpl::for_datastore(
+            store_identity
+                .as_ref()
+                .map(|(path, store)| (path.as_path(), *store)),
+        )?);
         let resource_broker = Arc::new(ResourceBrokerImpl::new(
             permission_manager.clone(),
             sandbox_manager.clone(),
@@ -1800,16 +1804,29 @@ impl AgentKernelImpl {
     /// workspace. Preserve its bytes and identity as an explicit operator
     /// workspace; never adopt automatic deletion ownership. No wire/tool
     /// operation exposes this authority. The record must not be live.
-    pub async fn retain_legacy_workspace_as_operator(&self, agent_id: AgentId) -> Result<(), KernelError> {
+    pub async fn retain_legacy_workspace_as_operator(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<(), KernelError> {
         let _operator = self.operator_control.mutation_guard().await;
         if self.agent_manager.get_agent_state(agent_id).is_some() {
-            return Err(KernelError::Policy("workspace ownership resolution requires a non-admitted agent".into()));
+            return Err(KernelError::Policy(
+                "workspace ownership resolution requires a non-admitted agent".into(),
+            ));
         }
-        let record = self.context_manager.load_all_agents()?.into_iter().find(|record| record.id == agent_id)
+        let record = self
+            .context_manager
+            .load_all_agents()?
+            .into_iter()
+            .find(|record| record.id == agent_id)
             .ok_or_else(|| KernelError::Policy("workspace ownership record is unknown".into()))?;
-        let serialized = record.sandbox_config_json.as_deref().ok_or_else(|| KernelError::Policy("legacy workspace record has no path to preserve".into()))?;
-        let config: SandboxConfig = serde_json::from_str(serialized).map_err(|error| KernelError::Policy(error.to_string()))?;
-        self.sandbox_manager.retain_legacy_workspace(&config.workspace_dir, agent_id)?;
+        let serialized = record.sandbox_config_json.as_deref().ok_or_else(|| {
+            KernelError::Policy("legacy workspace record has no path to preserve".into())
+        })?;
+        let config: SandboxConfig = serde_json::from_str(serialized)
+            .map_err(|error| KernelError::Policy(error.to_string()))?;
+        self.sandbox_manager
+            .retain_legacy_workspace(&config.workspace_dir, agent_id)?;
         Ok(())
     }
 
@@ -1823,36 +1840,66 @@ impl AgentKernelImpl {
         records.sort_by_key(|record| record.id);
         for record in records {
             match serde_json::from_str::<AgentState>(&record.status) {
-                Ok(AgentState::Running | AgentState::Paused) => {},
+                Ok(AgentState::Running | AgentState::Paused) => {}
                 Ok(_) => continue,
                 Err(_) => {
-                    if unresolved.len() == 256 { truncated = true; break; }
-                    let path = record.sandbox_config_json.as_deref().and_then(|serialized| serde_json::from_str::<SandboxConfig>(serialized).ok()).map(|config| config.workspace_dir).unwrap_or_default();
+                    if unresolved.len() == 256 {
+                        truncated = true;
+                        break;
+                    }
+                    let path = record
+                        .sandbox_config_json
+                        .as_deref()
+                        .and_then(|serialized| {
+                            serde_json::from_str::<SandboxConfig>(serialized).ok()
+                        })
+                        .map(|config| config.workspace_dir)
+                        .unwrap_or_default();
                     unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:path,
                         reason:"recorded lifecycle status is malformed; original status, identity and owned data were preserved; repair the record before admission" });
                     continue;
                 }
             }
             if self.agent_manager.get_agent_state(record.id).is_some() {
-                if admitted_agents.len() < 256 { admitted_agents.push(record.id); } else { truncated = true; }
+                if admitted_agents.len() < 256 {
+                    admitted_agents.push(record.id);
+                } else {
+                    truncated = true;
+                }
             }
-            let Some(serialized) = record.sandbox_config_json.as_deref() else { continue; };
+            let Some(serialized) = record.sandbox_config_json.as_deref() else {
+                continue;
+            };
             let config = match serde_json::from_str::<SandboxConfig>(serialized) {
                 Ok(config) => config,
                 Err(_) => {
-                    if unresolved.len() == 256 { truncated = true; break; }
+                    if unresolved.len() == 256 {
+                        truncated = true;
+                        break;
+                    }
                     unresolved.push(WorkspaceOwnershipIssue { agent_id:record.id,recorded_workspace:std::path::PathBuf::new(),
                         reason:"recorded sandbox configuration is malformed; original JSON, status and data were preserved; repair the record before admission" });
                     continue;
                 }
             };
-            if self.sandbox_manager.restored_workspace_is_managed(&config, record.id).is_err() {
-                if unresolved.len() == 256 { truncated = true; break; }
+            if self
+                .sandbox_manager
+                .restored_workspace_is_managed(&config, record.id)
+                .is_err()
+            {
+                if unresolved.len() == 256 {
+                    truncated = true;
+                    break;
+                }
                 unresolved.push(WorkspaceOwnershipIssue { agent_id: record.id, recorded_workspace: config.workspace_dir,
                     reason: "recorded workspace ownership is unresolved; data and identity were preserved" });
             }
         }
-        Ok(WorkspaceOwnershipStatus { admitted_agents, unresolved, truncated })
+        Ok(WorkspaceOwnershipStatus {
+            admitted_agents,
+            unresolved,
+            truncated,
+        })
     }
 
     /// Create an agent with an authority-reserved identifier.
@@ -2648,22 +2695,37 @@ impl AgentKernelImpl {
                 unresolved_workspaces.insert(record.id);
                 continue;
             }
-            if matches!(serde_json::from_str::<AgentState>(&record.status), Ok(AgentState::Running | AgentState::Paused)) {
+            if matches!(
+                serde_json::from_str::<AgentState>(&record.status),
+                Ok(AgentState::Running | AgentState::Paused)
+            ) {
                 protected_workspace_agents.insert(record.id);
                 if let Some(serialized) = &record.sandbox_config_json {
                     match serde_json::from_str::<SandboxConfig>(serialized) {
-                        Ok(config) => match self.sandbox_manager.restored_workspace_is_managed(&config, record.id) {
-                            Ok(true) => { active_managed_workspaces.insert(config.workspace_dir); },
-                            Ok(false) => {},
-                            Err(_) => { unresolved_workspaces.insert(record.id); },
+                        Ok(config) => match self
+                            .sandbox_manager
+                            .restored_workspace_is_managed(&config, record.id)
+                        {
+                            Ok(true) => {
+                                active_managed_workspaces.insert(config.workspace_dir);
+                            }
+                            Ok(false) => {}
+                            Err(_) => {
+                                unresolved_workspaces.insert(record.id);
+                            }
                         },
-                        Err(_) => { unresolved_workspaces.insert(record.id); },
+                        Err(_) => {
+                            unresolved_workspaces.insert(record.id);
+                        }
                     }
                 }
             }
         }
         self.sandbox_manager
-            .reconcile_recorded_managed_workspaces(&active_managed_workspaces, &protected_workspace_agents)
+            .reconcile_recorded_managed_workspaces(
+                &active_managed_workspaces,
+                &protected_workspace_agents,
+            )
             .map_err(KernelError::Sandbox)?;
         let mut restored = Vec::new();
         for p in persisted {
@@ -2751,7 +2813,11 @@ impl AgentKernelImpl {
                     continue;
                 }
             };
-            let sandbox_result = if p.sandbox_config_json.is_none() || self.sandbox_manager.restored_workspace_is_managed(&sandbox_config, p.id)? {
+            let sandbox_result = if p.sandbox_config_json.is_none()
+                || self
+                    .sandbox_manager
+                    .restored_workspace_is_managed(&sandbox_config, p.id)?
+            {
                 self.sandbox_manager
                     .create_managed_sandbox(p.id, &sandbox_config)
             } else {

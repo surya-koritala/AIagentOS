@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_sdk::KernelClient;
+use kernel::agent::AgentKernel;
 use kernel::syscall_server::SyscallServer;
 use kernel::{AgentConfig, AgentKernelImpl, Priority, SandboxConfig};
 use serde_json::{json, Value};
@@ -56,9 +57,19 @@ fn process(root: &Path, role: &str) -> Process {
         child.env(name, &temporary);
     }
     match role {
-        "cut-manifest" => { child.env("AIAGENTOS_TEST_WORKSPACE_ALLOCATION_EXIT", "manifest_published"); },
-        "cut-directory" => { child.env("AIAGENTOS_TEST_WORKSPACE_ALLOCATION_EXIT", "directory_created"); },
-        _ => {},
+        "cut-manifest" => {
+            child.env(
+                "AIAGENTOS_TEST_WORKSPACE_ALLOCATION_EXIT",
+                "manifest_published",
+            );
+        }
+        "cut-directory" => {
+            child.env(
+                "AIAGENTOS_TEST_WORKSPACE_ALLOCATION_EXIT",
+                "directory_created",
+            );
+        }
+        _ => {}
     }
     Process(child.spawn().unwrap())
 }
@@ -126,12 +137,37 @@ async fn two_live_stores_do_not_reconcile_each_others_workspace() {
         std::fs::read_to_string(workspace.join("sentinel.txt")).unwrap(),
         SENTINEL
     );
-    let control = workspace.parent().unwrap().parent().unwrap().join("control");
-    let owner_manifest = control.join(format!("{}.json", workspace.file_name().unwrap().to_str().unwrap()));
+    let control = workspace
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("control");
+    let owner_manifest = control.join(format!(
+        "{}.json",
+        workspace.file_name().unwrap().to_str().unwrap()
+    ));
     let manifest = std::fs::read(&owner_manifest).unwrap();
-    for path in [owner_manifest.to_string_lossy().into_owned(), format!("../../control/{}.json", workspace.file_name().unwrap().to_str().unwrap())] {
-        assert!(client.call_tool(id.clone(), "write_file", json!({"path":path,"content":"forged store owner"})).await.is_err());
-        assert_eq!(std::fs::read(&owner_manifest).unwrap(), manifest, "an agent changed its control-plane owner manifest");
+    for path in [
+        owner_manifest.to_string_lossy().into_owned(),
+        format!(
+            "../../control/{}.json",
+            workspace.file_name().unwrap().to_str().unwrap()
+        ),
+    ] {
+        assert!(client
+            .call_tool(
+                id.clone(),
+                "write_file",
+                json!({"path":path,"content":"forged store owner"})
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(&owner_manifest).unwrap(),
+            manifest,
+            "an agent changed its control-plane owner manifest"
+        );
     }
     #[cfg(windows)]
     {
@@ -179,10 +215,19 @@ async fn two_live_stores_do_not_reconcile_each_others_workspace() {
         read.to_string().contains(SENTINEL),
         "fresh authorized I/O lost the first store's sentinel"
     );
-    let mut b_client = KernelClient::connect(b["address"].as_str().unwrap()).await.unwrap();
+    let mut b_client = KernelClient::connect(b["address"].as_str().unwrap())
+        .await
+        .unwrap();
     b_client.authenticate(TOKEN).await.unwrap();
     let b_id = b["agent_id"].as_str().unwrap().to_string();
-    b_client.call_tool(b_id.clone(), "write_file", json!({"path":"restart.txt","content":"second store restart identity"})).await.unwrap();
+    b_client
+        .call_tool(
+            b_id.clone(),
+            "write_file",
+            json!({"path":"restart.txt","content":"second store restart identity"}),
+        )
+        .await
+        .unwrap();
     b_client.close().await.unwrap();
     second.0.kill().unwrap();
     second.0.wait().unwrap();
@@ -191,14 +236,34 @@ async fn two_live_stores_do_not_reconcile_each_others_workspace() {
     assert_eq!(resumed["reconciled"], true);
     assert_eq!(resumed["agent_id"], b["agent_id"]);
     assert_eq!(resumed["workspace"], b["workspace"]);
-    assert_eq!(resumed["store"], b["store"], "store ownership changed on real process restart");
-    let mut resumed_client = KernelClient::connect(resumed["address"].as_str().unwrap()).await.unwrap();
+    assert_eq!(
+        resumed["store"], b["store"],
+        "store ownership changed on real process restart"
+    );
+    let mut resumed_client = KernelClient::connect(resumed["address"].as_str().unwrap())
+        .await
+        .unwrap();
     resumed_client.authenticate(TOKEN).await.unwrap();
-    let restored = resumed_client.call_tool(b_id, "read_file", json!({"path":"restart.txt"})).await.unwrap();
-    assert!(restored.to_string().contains("second store restart identity"));
+    let restored = resumed_client
+        .call_tool(b_id, "read_file", json!({"path":"restart.txt"}))
+        .await
+        .unwrap();
+    assert!(restored
+        .to_string()
+        .contains("second store restart identity"));
     resumed_client.close().await.unwrap();
-    let read = client.call_tool(a["agent_id"].as_str().unwrap(), "read_file", json!({"path":"sentinel.txt"})).await.unwrap();
-    assert!(read.to_string().contains(SENTINEL), "B restart corrupted A's fresh authorized I/O");
+    let read = client
+        .call_tool(
+            a["agent_id"].as_str().unwrap(),
+            "read_file",
+            json!({"path":"sentinel.txt"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        read.to_string().contains(SENTINEL),
+        "B restart corrupted A's fresh authorized I/O"
+    );
     client.close().await.unwrap();
     std::fs::write(root.0.join("release"), []).unwrap();
     assert!(first.0.wait().unwrap().success());
@@ -213,7 +278,10 @@ async fn ownership_process_child() {
     };
     let root = PathBuf::from(root);
     let role = std::env::var("AIAGENTOS_MANAGED_STORE_PROBE_ROLE").unwrap();
-    assert!(matches!(role.as_str(), "a" | "b" | "b-restart" | "cut-manifest" | "cut-directory" | "repair"));
+    assert!(matches!(
+        role.as_str(),
+        "a" | "b" | "b-restart" | "cut-manifest" | "cut-directory" | "repair"
+    ));
     let kernel = Arc::new(AgentKernelImpl::from_config(&config(&root, &role)).unwrap());
     let reconciled = kernel.rehydrate_agents().await;
     if let Err(error) = reconciled {
@@ -226,10 +294,18 @@ async fn ownership_process_child() {
         );
     } else {
         let id = if role == "b-restart" {
-            let record = kernel.context_manager.load_all_agents().unwrap().into_iter().find(|record| record.name == "managed store owner").unwrap();
+            let record = kernel
+                .context_manager
+                .load_all_agents()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.name == "managed store owner")
+                .unwrap();
             assert!(kernel.agent_manager.get_agent_state(record.id).is_some());
             record.id
-        } else { kernel.create_agent_full(agent()).await.unwrap().id };
+        } else {
+            kernel.create_agent_full(agent()).await.unwrap().id
+        };
         let record = kernel
             .context_manager
             .load_all_agents()
@@ -273,33 +349,65 @@ async fn allocation_crash_retires_only_verified_current_store_orphan_pairs() {
         let mut allocation = process(&root.0, role);
         let status = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Some(status) = allocation.0.try_wait().unwrap() { break status; }
+                if let Some(status) = allocation.0.try_wait().unwrap() {
+                    break status;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.unwrap();
-        assert_eq!(status.code(), Some(89), "allocation did not reach its real durability cutpoint");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(89),
+            "allocation did not reach its real durability cutpoint"
+        );
         let prefix = root.0.join("store-b/.aiagentos-workspace-stores");
-        let stores = std::fs::read_dir(&prefix).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        let stores = std::fs::read_dir(&prefix)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
         assert_eq!(stores.len(), 1);
         let namespace = &stores[0];
         let control = namespace.join("control");
-        let orphans = std::fs::read_dir(&control).unwrap().filter_map(|entry| {
-            let path = entry.unwrap().path();
-            path.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| uuid::Uuid::parse_str(stem).ok())
-        }).collect::<Vec<_>>();
-        assert_eq!(orphans.len(), 1, "verified ownership was not durably published before the cutpoint");
+        let orphans = std::fs::read_dir(&control)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            orphans.len(),
+            1,
+            "verified ownership was not durably published before the cutpoint"
+        );
         let owned_data = namespace.join("data").join(orphans[0].to_string());
         assert_eq!(owned_data.exists(), role == "cut-directory");
-        let unknown = namespace.join("data").join(uuid::Uuid::new_v4().to_string());
+        let unknown = namespace
+            .join("data")
+            .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir(&unknown).unwrap();
         std::fs::write(unknown.join(".aiagentos-managed"), []).unwrap();
-        std::fs::write(unknown.join("sentinel.txt"), "unverified ownership is never cleanup authority").unwrap();
+        std::fs::write(
+            unknown.join("sentinel.txt"),
+            "unverified ownership is never cleanup authority",
+        )
+        .unwrap();
         let mut recovered = process(&root.0, "repair");
         let restored = report(&root.0.join("repair.json"), &mut recovered).await;
         assert_eq!(restored["reconciled"], true);
         assert!(!control.join(format!("{}.json", orphans[0])).exists());
-        assert!(!owned_data.exists(), "verified allocation orphan survived current-store recovery");
-        assert_eq!(std::fs::read_to_string(unknown.join("sentinel.txt")).unwrap(), "unverified ownership is never cleanup authority");
+        assert!(
+            !owned_data.exists(),
+            "verified allocation orphan survived current-store recovery"
+        );
+        assert_eq!(
+            std::fs::read_to_string(unknown.join("sentinel.txt")).unwrap(),
+            "unverified ownership is never cleanup authority"
+        );
         std::fs::write(root.0.join("release"), []).unwrap();
         assert!(recovered.0.wait().unwrap().success());
     }

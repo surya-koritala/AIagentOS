@@ -46,6 +46,7 @@ jobs:
       - name: Require committed formatting
         run: git diff --exit-code
   processes:
+    needs: formatting
     name: Two real processes and independent stores (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -71,6 +72,7 @@ jobs:
           git rev-parse HEAD > managed-store-source.txt
           test -z "$(git status --porcelain --untracked-files=no)"
           cargo test -p kernel --lib --locked managed_workspace -- --nocapture 2>&1 | tee managed-store-control.log
+          cargo test -p kernel --locked cloning:: -- --nocapture 2>&1 | tee managed-store-cloning.log
           cargo test -p integration-tests --lib --features kernel/qualification --locked managed_workspace_ownership -- --nocapture --test-threads=1 2>&1 | tee managed-store-processes.log
           cargo test -p agent-cli --test workspace_ownership_commands --locked -- --nocapture 2>&1 | tee managed-store-maintenance.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -82,5 +84,6 @@ jobs:
             managed-store-processes.log
             managed-store-maintenance.log
             managed-store-control.log
+            managed-store-cloning.log
           if-no-files-found: error
           retention-days: 30

@@ -2844,11 +2844,25 @@ impl KernelClient {
         signer: AuthoritySigner,
     ) -> Result<ClusterAgentOwnership, SdkError> {
         if self.cluster_membership().await?.cluster_id != signer.cluster_id {
-            return Err(SdkError::Configuration("current authority differs from caller-selected signing domain".into()));
+            return Err(SdkError::Configuration(
+                "current authority differs from caller-selected signing domain".into(),
+            ));
         }
-        let enrolled = self.authority_principal_registry().await?.into_iter().find(|principal| principal.principal_id == signer.principal_id);
-        if enrolled.as_ref().is_none_or(|principal| principal.revoked || principal.generation != signer.principal_generation || !principal.allowed_command_classes.contains(&AuthorityCommandClass::Ownership)) {
-            return Err(SdkError::Configuration("current principal registry does not authorize this ownership signer".into()));
+        let enrolled = self
+            .authority_principal_registry()
+            .await?
+            .into_iter()
+            .find(|principal| principal.principal_id == signer.principal_id);
+        if enrolled.as_ref().is_none_or(|principal| {
+            principal.revoked
+                || principal.generation != signer.principal_generation
+                || !principal
+                    .allowed_command_classes
+                    .contains(&AuthorityCommandClass::Ownership)
+        }) {
+            return Err(SdkError::Configuration(
+                "current principal registry does not authorize this ownership signer".into(),
+            ));
         }
         match self
             .submit_authority_command_with_signer(

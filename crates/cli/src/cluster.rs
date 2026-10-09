@@ -39,7 +39,7 @@ Two-endpoint operations accept --node-token TOKEN, --node-ca PATH and --node-ser
 The authority uses the common AGENTOS_TLS_CA/AGENTOS_TLS_SERVER_NAME profile.
 The node inherits that secure profile unless its own verified TLS profile is supplied.
 Replicated membership writes require --principal-id UUID --principal-generation N
-and --principal-key PATH to a bounded owner-only Ed25519 PKCS#8 DER file.
+--principal-cluster-id UUID and --principal-key PATH to a bounded owner-only Ed25519 PKCS#8 DER file.
 The principal key signs on this client; API credentials and node keys cannot replace it.
 Certificate activation connects to the candidate leaf and re-admits the exact member generation.
 Draining rejects new work; it does not report completed migration or safe-to-stop status.

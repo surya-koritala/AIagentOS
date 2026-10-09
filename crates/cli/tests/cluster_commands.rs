@@ -23,7 +23,7 @@ struct Server {
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     reload: Option<kernel::syscall_server::TlsReloadHandle>,
     fingerprint: Option<String>,
-    principal: Option<(String, std::path::PathBuf)>,
+    principal: Option<(String, String, std::path::PathBuf)>,
 }
 
 fn ca() -> CertifiedIssuer<'static, KeyPair> {
@@ -468,11 +468,12 @@ async fn replicated_authority(
         kernel::config::write_owner_only_atomic(path, material.as_bytes()).unwrap();
     }
     let identity = server.kernel.cluster_control.identity();
+    let authority_cluster_id = Uuid::new_v4().to_string();
     let config = ClusterRaftConfig {
         enabled: true,
         bootstrap: true,
         node_id: 1,
-        authority_cluster_id: Uuid::new_v4().to_string(),
+        authority_cluster_id: authority_cluster_id.clone(),
         authority_genesis_principals: vec![principal],
         listen_addr: address.to_string(),
         cluster_name: "offline-cli-certificate-proof".into(),
@@ -511,7 +512,7 @@ async fn replicated_authority(
         .kernel
         .install_cluster_authority(runtime.authority_handle())
         .unwrap();
-    server.principal = Some((principal_id, principal_path));
+    server.principal = Some((authority_cluster_id, principal_id, principal_path));
     runtime
 }
 
@@ -536,6 +537,15 @@ async fn actual_cli_drives_certificate_prepare_abort_activate_and_finalize_on_li
     .await;
     let runtime = replicated_authority(root.path(), &mut authority, &issuer).await;
     let before_denial = runtime.authority_handle().linearizable_view().await.unwrap();
+    let (_, principal_id, principal_path) = authority.principal.as_ref().unwrap();
+    let wrong_cluster = binary(&authority.address, TOKEN, Some(&ca_path), Some(&authority.hostname), &args(&[
+        "cluster", "join", "--authority", &authority.address, "--node", &node.address,
+        "--node-server-name", &node.hostname, "--reason", "explicit cluster identity refusal",
+        "--principal-id", principal_id, "--principal-generation", "1", "--principal-key", principal_path.to_str().unwrap(),
+        "--principal-cluster-id", &Uuid::new_v4().to_string(),
+    ])).await;
+    assert!(!wrong_cluster.success);
+    assert!(String::from_utf8_lossy(&wrong_cluster.stderr).contains("authority cluster does not match the explicit principal signing profile"));
     let denied = binary(&authority.address, TOKEN, Some(&ca_path), Some(&authority.hostname), &args(&[
         "cluster", "join", "--authority", &authority.address, "--node", &node.address,
         "--node-server-name", &node.hostname, "--reason", "node-token-only must fail closed",
@@ -546,6 +556,7 @@ async fn actual_cli_drives_certificate_prepare_abort_activate_and_finalize_on_li
     assert_eq!(after_denial.membership.members, before_denial.membership.members);
     assert_eq!(after_denial.membership.generation, before_denial.membership.generation);
     assert_eq!(after_denial.membership_audit, before_denial.membership_audit);
+    assert!(after_denial.principal_audit.is_empty());
     let admitted = run(
         &authority,
         &ca_path,
@@ -738,8 +749,8 @@ async fn actual_cli_drives_certificate_prepare_abort_activate_and_finalize_on_li
 async fn run(server: &Server, ca: &std::path::Path, values: &[String]) -> Value {
     let mut values = values.to_vec();
     if matches!(values.get(1).map(String::as_str), Some("join" | "cert-activate" | "cert-prepare" | "cert-abort" | "cert-finalize" | "member-state")) {
-        if let Some((id, path)) = &server.principal {
-            values.extend(["--principal-id".into(), id.clone(), "--principal-generation".into(), "1".into(), "--principal-key".into(), path.to_str().unwrap().into()]);
+        if let Some((cluster_id, id, path)) = &server.principal {
+            values.extend(["--principal-id".into(), id.clone(), "--principal-generation".into(), "1".into(), "--principal-cluster-id".into(), cluster_id.clone(), "--principal-key".into(), path.to_str().unwrap().into()]);
         }
     }
     let output = binary(

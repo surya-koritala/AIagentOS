@@ -15,6 +15,7 @@ use super::Join;
 use crate::OperatorClient;
 
 pub(super) struct PrincipalOptions {
+    cluster_id: String,
     id: String,
     generation: u64,
     key_path: PathBuf,
@@ -25,10 +26,15 @@ impl PrincipalOptions {
         let id = options.remove("--principal-id");
         let generation = options.remove("--principal-generation");
         let key_path = options.remove("--principal-key");
-        if id.is_none() && generation.is_none() && key_path.is_none() {
+        let cluster_id = options.remove("--principal-cluster-id");
+        if id.is_none() && generation.is_none() && key_path.is_none() && cluster_id.is_none() {
             return Ok(None);
         }
         let id = id.ok_or("missing --principal-id")?;
+        let cluster_id = cluster_id.ok_or("missing --principal-cluster-id")?;
+        if Uuid::parse_str(&cluster_id).ok().is_none_or(|uuid| uuid.to_string() != cluster_id) {
+            return Err("principal cluster ID must be a canonical UUID".into());
+        }
         if Uuid::parse_str(&id).ok().is_none_or(|uuid| uuid.to_string() != id) {
             return Err("principal ID must be a canonical UUID".into());
         }
@@ -39,7 +45,7 @@ impl PrincipalOptions {
             .filter(|value| *value > 0)
             .ok_or("principal generation must be positive")?;
         let key_path = key_path.filter(|value| !value.is_empty()).ok_or("missing --principal-key")?;
-        Ok(Some(Self { id, generation, key_path: key_path.into() }))
+        Ok(Some(Self { cluster_id, id, generation, key_path: key_path.into() }))
     }
 }
 
@@ -70,7 +76,11 @@ impl PrincipalSigner {
 
     pub(super) async fn submit(&mut self, client: &mut OperatorClient, command: AuthorityCommand) -> Result<AuthorityResponse, SdkError> {
         if self.cluster_id.is_none() {
-            self.cluster_id = Some(client.cluster_membership().await?.cluster_id);
+            let actual = client.cluster_membership().await?.cluster_id;
+            if actual != self.options.cluster_id {
+                return Err(SdkError::Configuration("authority cluster does not match the explicit principal signing profile".into()));
+            }
+            self.cluster_id = Some(actual);
         }
         client.submit_authority_command_with_signer(
             command,
@@ -149,7 +159,7 @@ mod tests {
     use super::*;
 
     fn options(path: PathBuf) -> PrincipalOptions {
-        PrincipalOptions { id: "00000000-0000-0000-0000-000000000900".into(), generation: 1, key_path: path }
+        PrincipalOptions { cluster_id: "00000000-0000-0000-0000-000000000100".into(), id: "00000000-0000-0000-0000-000000000900".into(), generation: 1, key_path: path }
     }
 
     #[test]
@@ -186,6 +196,7 @@ mod tests {
                 ("--principal-id".into(), "00000000-0000-0000-0000-000000000900".into()),
                 ("--principal-key".into(), "key.pk8".into()),
                 ("--principal-generation".into(), generation.into()),
+                ("--principal-cluster-id".into(), "00000000-0000-0000-0000-000000000100".into()),
             ])).is_err());
         }
     }

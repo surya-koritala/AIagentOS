@@ -164,7 +164,9 @@ compatibility path.
 
 For `agentctl cluster join`, `member-state`, and certificate mutations in
 replicated mode, provide `--principal-id UUID --principal-generation N
---principal-key PATH`. The explicitly supplied file is Ed25519 PKCS#8 DER,
+--principal-cluster-id UUID --principal-key PATH`. The explicit cluster UUID
+must match the authority before any signing or mutation, so a target cannot
+select a different cluster for a reused principal key. The file is Ed25519 PKCS#8 DER,
 limited to 4 KiB and verified as a current-owner-only regular file through the
 same no-follow Unix or Windows ACL/reparse boundary as private operator
 storage. Key bytes are read only by the client, never sent to a node or printed.

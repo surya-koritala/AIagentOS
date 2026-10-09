@@ -3143,7 +3143,7 @@ fn configs_are_uniform_voters(
     trusted: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
 ) -> bool {
     stored.membership().get_joint_config().len() == 1
-        && stored.nodes().map(|(id, _)| *id).collect::<BTreeSet<_>>() == stored.voter_ids().collect::<BTreeSet<_>>()
+        && stored.voter_ids().all(|id| stored.nodes().any(|(known, _)| id == *known))
         && stored.nodes().all(|(id, node)| trusted.get(id).is_some_and(|entry| entry == node))
 }
 

@@ -23,6 +23,7 @@ pub mod context_paging;
 pub mod custom_tools;
 pub mod data_inventory;
 pub mod database;
+pub mod destination_authority;
 pub mod docker_sandbox;
 pub mod editing;
 pub mod execution;

@@ -214,6 +214,24 @@ struct MaintainedRoute {
 }
 
 impl ClusterClient {
+    /// Discover managed quorum ownership with an explicit independent signer.
+    pub async fn connect_discovered_with_signer(authority_addr: impl AsRef<str>, token: impl Into<String>, signer: crate::AuthoritySigner) -> Result<Self, SdkError> {
+        Self::connect_discovered_inner(authority_addr.as_ref(), token.into(), Some(signer)).await
+    }
+
+    /// Install a signer only after verifying the retained discovery domain.
+    pub fn set_authority_signer(&mut self, signer: crate::AuthoritySigner) -> Result<(), SdkError> {
+        let authority = self.authority.as_mut().ok_or_else(|| SdkError::Configuration("principal signer requires an authority-discovered cluster".into()))?;
+        if authority.cluster_id != signer.cluster_id {
+            return Err(SdkError::Configuration("retained cluster differs from caller-selected signing domain".into()));
+        }
+        if authority.maintenance.is_some() {
+            return Err(SdkError::Configuration("install the principal signer before starting automatic ownership maintenance".into()));
+        }
+        authority.client.set_authority_signer(signer);
+        Ok(())
+    }
+
     /// Admit one connected node through an authority-issued, one-time challenge.
     ///
     /// The node signs a domain-separated payload covering its durable identity,
@@ -444,11 +462,17 @@ impl ClusterClient {
         authority_addr: impl AsRef<str>,
         token: impl Into<String>,
     ) -> Result<Self, SdkError> {
-        let authority_addr = authority_addr.as_ref();
-        let token = token.into();
+        Self::connect_discovered_inner(authority_addr.as_ref(), token.into(), None).await
+    }
+
+    async fn connect_discovered_inner(authority_addr: &str, token: String, signer: Option<crate::AuthoritySigner>) -> Result<Self, SdkError> {
         let mut authority = KernelClient::connect(authority_addr).await?;
         authority.authenticate(&token).await?;
         let snapshot = authority.cluster_membership().await?;
+        if let Some(signer) = signer {
+            if snapshot.cluster_id != signer.cluster_id { return Err(SdkError::Configuration("discovered cluster differs from caller-selected signing domain".into())); }
+            authority.set_authority_signer(signer);
+        }
         let addrs = active_member_endpoints(&snapshot)?;
         let mut cluster = Self::connect_authenticated(&addrs, token).await?;
         cluster.validate_membership(&snapshot)?;
@@ -485,6 +509,16 @@ impl ClusterClient {
             .as_mut()
             .expect("discovered cluster retains authority")
             .lease_ttl_seconds = maintenance.lease_ttl_seconds;
+        cluster.start_automatic_maintenance(connector, maintenance)?;
+        Ok(cluster)
+    }
+
+    pub async fn connect_discovered_with_signer_and_maintenance(authority_addr: impl AsRef<str>, token: impl Into<String>, signer: crate::AuthoritySigner, maintenance: ClusterMaintenanceConfig) -> Result<Self, SdkError> {
+        validate_maintenance_config(&maintenance)?;
+        let authority_address = authority_addr.as_ref().to_string(); let token = token.into();
+        let connector = MaintenanceConnector::Plaintext { authority_address: authority_address.clone(), token: token.clone() };
+        let mut cluster = Self::connect_discovered_with_signer(&authority_address, token, signer).await?;
+        cluster.authority.as_mut().expect("discovered authority").lease_ttl_seconds = maintenance.lease_ttl_seconds;
         cluster.start_automatic_maintenance(connector, maintenance)?;
         Ok(cluster)
     }
@@ -702,12 +736,14 @@ impl ClusterClient {
             .expect("automatic maintenance requires authority")
             .cluster_id
             .clone();
+        let signer = self.authority.as_ref().and_then(|authority| authority.client.authority_signer.clone());
         let task = tokio::spawn(automatic_maintenance_loop(
             connector,
             cluster_id,
             config,
             worker_routes,
             worker_status,
+            signer,
         ));
         self.authority
             .as_mut()
@@ -1764,6 +1800,7 @@ async fn automatic_maintenance_loop(
     config: ClusterMaintenanceConfig,
     routes: Arc<Mutex<HashMap<String, MaintainedRoute>>>,
     status: Arc<Mutex<ClusterMaintenanceStatus>>,
+    signer: Option<crate::AuthoritySigner>,
 ) {
     let mut interval = tokio::time::interval(config.renew_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1787,6 +1824,17 @@ async fn automatic_maintenance_loop(
         let mut last_error = None;
         match connector.connect(connector.authority_address()).await {
             Ok(mut authority) => {
+                if let Some(signer) = signer.clone() {
+                    match authority.cluster_membership().await {
+                        Ok(snapshot) if snapshot.cluster_id == signer.cluster_id && snapshot.cluster_id == cluster_id => authority.set_authority_signer(signer),
+                        _ => {
+                            let mut current = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            current.failed_cycles = current.failed_cycles.saturating_add(1);
+                            current.last_error = Some("maintenance authority differs from caller-selected signing domain".into());
+                            continue;
+                        }
+                    }
+                }
                 for route in &route_snapshot {
                     match maintain_route(
                         &connector,

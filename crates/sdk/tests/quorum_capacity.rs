@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_sdk::{
-    AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind, ClusterClient, KernelClient,
+    AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind, AuthoritySigner, ClusterClient, KernelClient,
     Placement, SdkError, WireErrorCode,
 };
 use kernel::cluster_runtime::{ClusterRaftRuntime, ClusterRaftRuntimeConfig, ClusterRaftTls};
@@ -26,7 +26,7 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         let root = tempfile::tempdir().unwrap();
         let operator_document =
             Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
-        let operator = Ed25519KeyPair::from_pkcs8(operator_document.as_ref()).unwrap();
+        let operator = Arc::new(Ed25519KeyPair::from_pkcs8(operator_document.as_ref()).unwrap());
         let principal_id = Uuid::new_v4().to_string();
         let cluster_id = Uuid::new_v4().to_string();
         let principal = AuthorityPrincipal {
@@ -37,6 +37,7 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
             allowed_command_classes: BTreeSet::from([
                 AuthorityCommandClass::PrincipalAdmin,
                 AuthorityCommandClass::TransportAdmin,
+                AuthorityCommandClass::Ownership,
             ]),
             generation: 1,
             revoked: false,
@@ -204,15 +205,12 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
             );
             clients.push(client);
         }
-        let mut placement = ClusterClient::connect_authenticated(
-            &addresses
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            TOKEN,
-        )
+        let own_key = operator.clone();
+        let signer = AuthoritySigner::new(cluster_id.clone(), principal_id.clone(), 1, move |payload| Ok(own_key.sign(payload).as_ref().to_vec()));
+        let mut placement = ClusterClient::connect_discovered_with_signer(addresses[0].to_string(), TOKEN, signer)
         .await
         .unwrap();
+        assert!(placement.is_authority_managed());
         let fresh = placement
             .create_agent(
                 "fresh signed placement",
@@ -227,8 +225,19 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         assert!(kernels
             .iter()
             .any(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id));
+        let ownership = clients[1].active_cluster_agent_ownership(&fresh.agent_id).await.unwrap();
+        assert_eq!(ownership.owner_node_id, fresh.node_id);
+        let owner_index = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id).unwrap();
+        let fence = clients[owner_index].agent_mutation_fence(&fresh.agent_id).await.unwrap().unwrap();
+        assert_eq!(fence.fencing_token, ownership.fencing_token); assert_eq!(fence.authority_generation, ownership.generation);
+        let audit = clients[2].cluster_agent_ownership_audit(Some(fresh.agent_id.clone()), 10).await.unwrap();
+        assert_eq!(audit[0].actor, format!("principal:{principal_id}"));
+        placement.renew_agent_ownership(&fresh.agent_id, 60).await.unwrap();
         let owner = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id).unwrap();
-        clients[owner].pause_agent(&fresh.agent_id).await.unwrap();
+        let renewed = clients[1].active_cluster_agent_ownership(&fresh.agent_id).await.unwrap();
+        let paused_proof = agent_sdk::AgentMutationFenceProof { cluster_id: cluster_id.clone(), owner_node_id: renewed.owner_node_id.clone(), authority_term: renewed.authority_term,
+            authority_generation: renewed.generation, fencing_token: renewed.fencing_token, proof_expires_at: renewed.lease_expires_at };
+        clients[owner].pause_agent_fenced(&fresh.agent_id, &paused_proof).await.unwrap();
         // No reporters run here. A new any-member quorum barrier must advance time
         // independently; the client's clock is never consulted for eligibility.
         tokio::time::sleep(Duration::from_secs(16)).await;
@@ -335,7 +344,10 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
                 .iter()
                 .position(|kernel| kernel.cluster_control.identity().node_id == agent.node_id)
                 .unwrap();
-            clients[owner].stop_agent(&agent.agent_id).await.unwrap();
+            let owned = clients[1].active_cluster_agent_ownership(&agent.agent_id).await.unwrap();
+            let proof = agent_sdk::AgentMutationFenceProof { cluster_id: cluster_id.clone(), owner_node_id: owned.owner_node_id, authority_term: owned.authority_term,
+                authority_generation: owned.generation, fencing_token: owned.fencing_token, proof_expires_at: owned.lease_expires_at };
+            clients[owner].stop_agent_fenced(&agent.agent_id, &proof).await.unwrap();
         }
         for client in &mut clients {
             client.close().await.unwrap();

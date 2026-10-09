@@ -279,18 +279,21 @@ async fn public_sdk_live_voter_proposal_replays_and_denies_token_only_authority(
         first.shutdown().await.unwrap();
         let weak = kernels.iter().map(Arc::downgrade).collect::<Vec<_>>();
         let stores = kernels.iter().map(|kernel| Arc::downgrade(&kernel.context_manager)).collect::<Vec<_>>();
+        let sandboxes = kernels.iter().map(|kernel| Arc::downgrade(&kernel.sandbox_manager)).collect::<Vec<_>>();
+        let brokers = kernels.iter().map(|kernel| Arc::downgrade(&kernel.resource_broker)).collect::<Vec<_>>();
         for task in serving {
             task.abort();
             let _ = task.await;
         }
         drop(kernels);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while weak.iter().any(|kernel| kernel.upgrade().is_some()) || stores.iter().any(|store| store.upgrade().is_some()) {
+            while weak.iter().any(|kernel| kernel.upgrade().is_some()) || stores.iter().any(|store| store.upgrade().is_some()) || sandboxes.iter().any(|owner| owner.upgrade().is_some()) || brokers.iter().any(|owner| owner.upgrade().is_some()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("public handlers and Raft storage tasks release all kernel and durable context references");
+        assert_no_native_delete_holders(root.path());
         root.close().unwrap();
     })
     .await
@@ -299,4 +302,32 @@ async fn public_sdk_live_voter_proposal_replays_and_denies_token_only_authority(
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(not(windows))]
+fn assert_no_native_delete_holders(_path: &std::path::Path) {}
+
+#[cfg(windows)]
+fn assert_no_native_delete_holders(path: &std::path::Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+    let mut paths = vec![path.to_owned()];
+    let mut cursor = 0;
+    while cursor < paths.len() {
+        assert!(paths.len() <= 64, "native fixture inventory is bounded");
+        if paths[cursor].is_dir() {
+            let children = std::fs::read_dir(&paths[cursor]).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+            paths.extend(children);
+        }
+        cursor += 1;
+    }
+    for target in paths.into_iter().rev() {
+        // Requesting DELETE access without a delete disposition identifies an
+        // outstanding incompatible native holder; it never retries deletion.
+        let probe = std::fs::OpenOptions::new().access_mode(DELETE).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(&target);
+        match probe {
+            Ok(handle) => drop(handle),
+            Err(error) => panic!("native fixture target still has an incompatible deletion holder: {target:?}; {error}; holder identity requires further qualification"),
+        }
+    }
 }

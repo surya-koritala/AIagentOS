@@ -669,7 +669,9 @@ fn publish_reconfiguration_projection(context: &SqliteContextManager, state: &Pe
     context
         .cluster_reconfiguration_projection
         .send_if_modified(|current| {
-            if current.as_deref().is_some_and(|old| old.membership == projection.membership && old.plan == projection.plan) {
+            if current.as_deref().is_some_and(|old| {
+                old.membership == projection.membership && old.plan == projection.plan
+            }) {
                 *current = Some(projection);
                 return false;
             }

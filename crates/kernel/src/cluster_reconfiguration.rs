@@ -149,7 +149,10 @@ pub struct ClusterReconfigurationStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ClusterReconfigurationObservation { LocalApplied, QuorumVerified }
+pub enum ClusterReconfigurationObservation {
+    LocalApplied,
+    QuorumVerified,
+}
 
 impl ClusterReconfigurationTarget {
     pub(crate) fn from_membership(

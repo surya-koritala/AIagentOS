@@ -254,15 +254,24 @@ async fn public_sdk_live_voter_proposal_replays_and_denies_token_only_authority(
             "an invalid current signature must not retrieve a cached plan"
         );
         let first = runtimes.remove(0);
-        for runtime in runtimes { runtime.shutdown().await.unwrap(); }
+        for runtime in runtimes {
+            runtime.shutdown().await.unwrap();
+        }
         let local = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let status = client.cluster_reconfiguration_status().await.unwrap();
-                if !status.quorum_verified { break status; }
+                if !status.quorum_verified {
+                    break status;
+                }
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
-        }).await.expect("no-quorum local progress observation is bounded");
-        assert_eq!(local.observation, agent_sdk::ClusterReconfigurationObservation::LocalApplied);
+        })
+        .await
+        .expect("no-quorum local progress observation is bounded");
+        assert_eq!(
+            local.observation,
+            agent_sdk::ClusterReconfigurationObservation::LocalApplied
+        );
         assert_eq!(local.operation_id.as_deref(), Some(operation_id.as_str()));
         assert_eq!(local.current, plan.target);
         assert!(local.applied_frontier.is_some());

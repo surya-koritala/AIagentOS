@@ -896,192 +896,220 @@ impl ClusterRaftRuntimeConfig {
             ));
         }
 
-        let mut endpoints = BTreeSet::new();
-        let mut server_fingerprints = BTreeSet::new();
-        let mut client_fingerprints = BTreeSet::new();
-        let mut certificate_owners = BTreeMap::new();
-        let mut identity_keys = BTreeSet::new();
-        let expected_peer_ca_sha256 = self
-            .members
-            .values()
-            .next()
-            .map(|node| node.transport_peer_ca_sha256.as_slice())
-            .unwrap_or_default();
-        for (node_id, node) in &self.members {
-            if *node_id == 0 {
-                return Err(invalid_input("Raft node id 0 is reserved"));
-            }
-            validate_endpoint(&node.endpoint)?;
-            ServerName::try_from(node.server_name.clone()).map_err(invalid_input)?;
-            validate_sha256(&node.tls_certificate_sha256, "server certificate")?;
-            validate_sha256(&node.tls_client_certificate_sha256, "client certificate")?;
-            if node.tls_certificate_sha256_overlap.len() > 7
-                || node.tls_client_certificate_sha256_overlap.len() > 7
-            {
-                return Err(invalid_input(
-                    "Raft transport certificate overlap cannot contain more than 7 additional leaves",
-                ));
-            }
-            if node.transport_trust_generation == 0
-                && (!node.tls_certificate_sha256_overlap.is_empty()
-                    || !node.tls_client_certificate_sha256_overlap.is_empty()
-                    || !node.transport_peer_ca_sha256.is_empty()
-                    || node.transport_trust_overlap_not_after.is_some())
-            {
-                return Err(invalid_input(
-                    "Raft generation-zero transport trust cannot contain overlap leaves, CA fingerprints, or an overlap expiration",
-                ));
-            }
-            if node.transport_trust_generation > 0
-                && (node.transport_peer_ca_sha256.is_empty()
-                    || node.transport_peer_ca_sha256.len() > 32)
-            {
-                return Err(invalid_input(
-                    "versioned Raft transport trust must contain 1 to 32 CA fingerprints",
-                ));
-            }
-            if node.transport_peer_ca_sha256.as_slice() != expected_peer_ca_sha256 {
-                return Err(invalid_input(
-                    "Raft trusted catalog contains inconsistent peer CA fingerprints",
-                ));
-            }
-            if !node
-                .transport_peer_ca_sha256
+        validate_reconfiguration_target(
+            &crate::cluster_reconfiguration::ClusterReconfigurationTarget {
+                catalog: self.members.clone(),
+                voter_ids: self.voter_ids.clone(),
+                voter_generation: self.voter_set_generation,
+                voter_set_sha256: self.voter_set_sha256.clone(),
+                trust_generation: self.transport_trust_generation,
+                catalog_sha256: self.transport_catalog_sha256.clone(),
+                overlap_not_after: self.transport_trust_overlap_not_after,
+            },
+            now,
+        )
+    }
+}
+
+pub(crate) fn validate_reconfiguration_target(
+    target: &crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+    now: chrono::DateTime<chrono::Utc>,
+) -> io::Result<()> {
+    if target.catalog.is_empty() || target.catalog.len() > 31 || target.voter_ids.is_empty()
+        || target.voter_ids.iter().any(|id| !target.catalog.contains_key(id))
+    {
+        return Err(invalid_input("live Raft target must contain 1 to 31 nodes and a nonempty catalog-backed voter set"));
+    }
+    if configured_voter_set_sha256(target.voter_generation, &target.voter_ids) != target.voter_set_sha256
+        || configured_transport_catalog_sha256(&target.catalog) != target.catalog_sha256
+    {
+        return Err(invalid_input("live Raft target digest does not authenticate its catalog and voter set"));
+    }
+    let mut endpoints = BTreeSet::new();
+    let mut server_fingerprints = BTreeSet::new();
+    let mut client_fingerprints = BTreeSet::new();
+    let mut certificate_owners = BTreeMap::new();
+    let mut identity_keys = BTreeSet::new();
+    let expected_peer_ca_sha256 = target
+        .catalog
+        .values()
+        .next()
+        .map(|node| node.transport_peer_ca_sha256.as_slice())
+        .unwrap_or_default();
+    for (node_id, node) in &target.catalog {
+        if *node_id == 0 {
+            return Err(invalid_input("Raft node id 0 is reserved"));
+        }
+        validate_endpoint(&node.endpoint)?;
+        ServerName::try_from(node.server_name.clone()).map_err(invalid_input)?;
+        validate_sha256(&node.tls_certificate_sha256, "server certificate")?;
+        validate_sha256(&node.tls_client_certificate_sha256, "client certificate")?;
+        if node.tls_certificate_sha256_overlap.len() > 7
+            || node.tls_client_certificate_sha256_overlap.len() > 7
+        {
+            return Err(invalid_input(
+                "Raft transport certificate overlap cannot contain more than 7 additional leaves",
+            ));
+        }
+        if node.transport_trust_generation == 0
+            && (!node.tls_certificate_sha256_overlap.is_empty()
+                || !node.tls_client_certificate_sha256_overlap.is_empty()
+                || !node.transport_peer_ca_sha256.is_empty()
+                || node.transport_trust_overlap_not_after.is_some())
+        {
+            return Err(invalid_input(
+                "Raft generation-zero transport trust cannot contain overlap leaves, CA fingerprints, or an overlap expiration",
+            ));
+        }
+        if node.transport_trust_generation > 0
+            && (node.transport_peer_ca_sha256.is_empty()
+                || node.transport_peer_ca_sha256.len() > 32)
+        {
+            return Err(invalid_input(
+                "versioned Raft transport trust must contain 1 to 32 CA fingerprints",
+            ));
+        }
+        if node.transport_peer_ca_sha256.as_slice() != expected_peer_ca_sha256 {
+            return Err(invalid_input(
+                "Raft trusted catalog contains inconsistent peer CA fingerprints",
+            ));
+        }
+        if !node
+            .transport_peer_ca_sha256
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+            || !node
+                .tls_certificate_sha256_overlap
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
-                || !node
-                    .tls_certificate_sha256_overlap
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1])
-                || !node
-                    .tls_client_certificate_sha256_overlap
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1])
-            {
+            || !node
+                .tls_client_certificate_sha256_overlap
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            return Err(invalid_input(
+                "Raft transport trust fingerprint lists must be sorted and unique",
+            ));
+        }
+        let has_overlap = !node.tls_certificate_sha256_overlap.is_empty()
+            || !node.tls_client_certificate_sha256_overlap.is_empty()
+            || node.transport_peer_ca_sha256.len() > 1;
+        match (has_overlap, node.transport_trust_overlap_not_after) {
+            (true, Some(not_after))
+                if not_after > now && not_after <= now + chrono::Duration::days(30) => {}
+            (true, Some(_)) => {
                 return Err(invalid_input(
-                    "Raft transport trust fingerprint lists must be sorted and unique",
-                ));
+                    "Raft transport trust overlap expiration must be in the next 30 days",
+                ))
             }
-            let has_overlap = !node.tls_certificate_sha256_overlap.is_empty()
-                || !node.tls_client_certificate_sha256_overlap.is_empty()
-                || node.transport_peer_ca_sha256.len() > 1;
-            match (has_overlap, node.transport_trust_overlap_not_after) {
-                (true, Some(not_after))
-                    if not_after > now && not_after <= now + chrono::Duration::days(30) => {}
-                (true, Some(_)) => {
-                    return Err(invalid_input(
-                        "Raft transport trust overlap expiration must be in the next 30 days",
-                    ))
-                }
-                (true, None) => {
-                    return Err(invalid_input(
-                        "Raft transport trust overlap requires an absolute expiration",
-                    ))
-                }
-                (false, Some(_)) => return Err(invalid_input(
-                    "Raft transport trust overlap expiration exists without overlap credentials",
-                )),
-                (false, None) => {}
-            }
-            let mut member_server_fingerprints = BTreeSet::new();
-            for fingerprint in std::iter::once(&node.tls_certificate_sha256)
-                .chain(node.tls_certificate_sha256_overlap.iter())
-            {
-                validate_sha256(fingerprint, "server certificate")?;
-                if !member_server_fingerprints.insert(fingerprint) {
-                    return Err(invalid_input(
-                        "duplicate Raft peer server certificate fingerprint",
-                    ));
-                }
-            }
-            let mut member_client_fingerprints = BTreeSet::new();
-            for fingerprint in std::iter::once(&node.tls_client_certificate_sha256)
-                .chain(node.tls_client_certificate_sha256_overlap.iter())
-            {
-                validate_sha256(fingerprint, "client certificate")?;
-                if !member_client_fingerprints.insert(fingerprint) {
-                    return Err(invalid_input(
-                        "duplicate Raft peer client certificate fingerprint",
-                    ));
-                }
-            }
-            let mut ca_fingerprints = BTreeSet::new();
-            for fingerprint in &node.transport_peer_ca_sha256 {
-                validate_sha256(fingerprint, "peer CA certificate")?;
-                if !ca_fingerprints.insert(fingerprint) {
-                    return Err(invalid_input(
-                        "duplicate Raft peer CA certificate fingerprint",
-                    ));
-                }
-            }
-            if node.identity_public_key.len() != 64
-                || !node
-                    .identity_public_key
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
+            (true, None) => {
                 return Err(invalid_input(
-                    "Raft member identity public key must be 64 lowercase hexadecimal characters",
-                ));
+                    "Raft transport trust overlap requires an absolute expiration",
+                ))
             }
-            if !endpoints.insert(node.endpoint.clone()) {
-                return Err(invalid_input("duplicate Raft peer endpoint"));
-            }
-            for fingerprint in member_server_fingerprints {
-                if !server_fingerprints.insert(fingerprint.clone()) {
-                    return Err(invalid_input(
-                        "duplicate Raft peer server certificate fingerprint",
-                    ));
-                }
-                if certificate_owners
-                    .insert(fingerprint.clone(), *node_id)
-                    .is_some_and(|owner| owner != *node_id)
-                {
-                    return Err(invalid_input(
-                        "Raft certificate fingerprint is assigned to multiple node identities",
-                    ));
-                }
-            }
-            for fingerprint in member_client_fingerprints {
-                if !client_fingerprints.insert(fingerprint.clone()) {
-                    return Err(invalid_input(
-                        "duplicate Raft peer client certificate fingerprint",
-                    ));
-                }
-                if certificate_owners
-                    .insert(fingerprint.clone(), *node_id)
-                    .is_some_and(|owner| owner != *node_id)
-                {
-                    return Err(invalid_input(
-                        "Raft certificate fingerprint is assigned to multiple node identities",
-                    ));
-                }
-            }
-            if !identity_keys.insert(node.identity_public_key.clone()) {
-                return Err(invalid_input("duplicate Raft peer identity public key"));
-            }
-            if node.voter_set_generation != self.voter_set_generation
-                || node.voter_set_sha256 != self.voter_set_sha256
-            {
+            (false, Some(_)) => return Err(invalid_input(
+                "Raft transport trust overlap expiration exists without overlap credentials",
+            )),
+            (false, None) => {}
+        }
+        let mut member_server_fingerprints = BTreeSet::new();
+        for fingerprint in std::iter::once(&node.tls_certificate_sha256)
+            .chain(node.tls_certificate_sha256_overlap.iter())
+        {
+            validate_sha256(fingerprint, "server certificate")?;
+            if !member_server_fingerprints.insert(fingerprint) {
                 return Err(invalid_input(
-                    "Raft trusted catalog contains inconsistent voter-set intent metadata",
-                ));
-            }
-            if node.transport_catalog_sha256 != self.transport_catalog_sha256 {
-                return Err(invalid_input(
-                    "Raft trusted catalog contains inconsistent transport-catalog metadata",
-                ));
-            }
-            if node.transport_trust_generation != self.transport_trust_generation
-                || node.transport_trust_overlap_not_after != self.transport_trust_overlap_not_after
-            {
-                return Err(invalid_input(
-                    "Raft trusted catalog contains inconsistent transport-trust metadata",
+                    "duplicate Raft peer server certificate fingerprint",
                 ));
             }
         }
-        Ok(())
+        let mut member_client_fingerprints = BTreeSet::new();
+        for fingerprint in std::iter::once(&node.tls_client_certificate_sha256)
+            .chain(node.tls_client_certificate_sha256_overlap.iter())
+        {
+            validate_sha256(fingerprint, "client certificate")?;
+            if !member_client_fingerprints.insert(fingerprint) {
+                return Err(invalid_input(
+                    "duplicate Raft peer client certificate fingerprint",
+                ));
+            }
+        }
+        let mut ca_fingerprints = BTreeSet::new();
+        for fingerprint in &node.transport_peer_ca_sha256 {
+            validate_sha256(fingerprint, "peer CA certificate")?;
+            if !ca_fingerprints.insert(fingerprint) {
+                return Err(invalid_input(
+                    "duplicate Raft peer CA certificate fingerprint",
+                ));
+            }
+        }
+        if node.identity_public_key.len() != 64
+            || !node
+                .identity_public_key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid_input(
+                "Raft member identity public key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        if !endpoints.insert(node.endpoint.clone()) {
+            return Err(invalid_input("duplicate Raft peer endpoint"));
+        }
+        for fingerprint in member_server_fingerprints {
+            if !server_fingerprints.insert(fingerprint.clone()) {
+                return Err(invalid_input(
+                    "duplicate Raft peer server certificate fingerprint",
+                ));
+            }
+            if certificate_owners
+                .insert(fingerprint.clone(), *node_id)
+                .is_some_and(|owner| owner != *node_id)
+            {
+                return Err(invalid_input(
+                    "Raft certificate fingerprint is assigned to multiple node identities",
+                ));
+            }
+        }
+        for fingerprint in member_client_fingerprints {
+            if !client_fingerprints.insert(fingerprint.clone()) {
+                return Err(invalid_input(
+                    "duplicate Raft peer client certificate fingerprint",
+                ));
+            }
+            if certificate_owners
+                .insert(fingerprint.clone(), *node_id)
+                .is_some_and(|owner| owner != *node_id)
+            {
+                return Err(invalid_input(
+                    "Raft certificate fingerprint is assigned to multiple node identities",
+                ));
+            }
+        }
+        if !identity_keys.insert(node.identity_public_key.clone()) {
+            return Err(invalid_input("duplicate Raft peer identity public key"));
+        }
+        if node.voter_set_generation != target.voter_generation
+            || node.voter_set_sha256 != target.voter_set_sha256
+        {
+            return Err(invalid_input(
+                "Raft trusted catalog contains inconsistent voter-set intent metadata",
+            ));
+        }
+        if node.transport_catalog_sha256 != target.catalog_sha256 {
+            return Err(invalid_input(
+                "Raft trusted catalog contains inconsistent transport-catalog metadata",
+            ));
+        }
+        if node.transport_trust_generation != target.trust_generation
+            || node.transport_trust_overlap_not_after != target.overlap_not_after
+        {
+            return Err(invalid_input(
+                "Raft trusted catalog contains inconsistent transport-trust metadata",
+            ));
+        }
     }
+    Ok(())
 }
 
 fn accepts_server_certificate(
@@ -1119,7 +1147,7 @@ fn append_digest_field(payload: &mut Vec<u8>, value: &str) {
     payload.extend_from_slice(value.as_bytes());
 }
 
-fn configured_transport_catalog_sha256(
+pub(crate) fn configured_transport_catalog_sha256(
     members: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
 ) -> String {
     let trust_generation = members
@@ -1254,7 +1282,7 @@ fn validated_durable_transport_catalog(
     Ok(nodes)
 }
 
-fn configured_voter_set_sha256(generation: u64, voters: &BTreeSet<ClusterRaftNodeId>) -> String {
+pub(crate) fn configured_voter_set_sha256(generation: u64, voters: &BTreeSet<ClusterRaftNodeId>) -> String {
     if generation == 0 {
         return String::new();
     }
@@ -2769,7 +2797,21 @@ fn inspect_durable_membership(
             "OpenRaft is not running while membership is validated: {error}"
         ))
     })?;
-    let stored = metrics.membership_config.as_ref();
+    inspect_membership_target(
+        metrics.membership_config.as_ref(), trusted, desired_transport_catalog_sha256,
+        desired_transport_trust_generation, desired_voters, desired_generation, desired_sha256,
+    )
+}
+
+fn inspect_membership_target(
+    stored: &openraft::StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
+    trusted: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+    desired_transport_catalog_sha256: &str,
+    desired_transport_trust_generation: u64,
+    desired_voters: &BTreeSet<ClusterRaftNodeId>,
+    desired_generation: u64,
+    desired_sha256: &str,
+) -> io::Result<DurableMembershipProgress> {
     let nodes = stored
         .nodes()
         .map(|(node_id, node)| (*node_id, node.clone()))
@@ -3088,6 +3130,19 @@ fn inspect_durable_membership(
         ));
     }
     Ok(DurableMembershipProgress::NeedsIntent)
+}
+
+pub(crate) fn validate_live_membership_transition(
+    membership: &openraft::StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
+    target: &crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+) -> io::Result<()> {
+    match inspect_membership_target(
+        membership, &target.catalog, &target.catalog_sha256, target.trust_generation,
+        &target.voter_ids, target.voter_generation, &target.voter_set_sha256,
+    )? {
+        DurableMembershipProgress::NeedsIntent | DurableMembershipProgress::NeedsTransportTrust => Ok(()),
+        _ => Err(invalid_input("live proposal requires a settled prior generation and one new voter or trust generation")),
+    }
 }
 
 /// Start the operator-configured runtime and establish its exact voter plan.

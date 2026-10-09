@@ -10,9 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cluster_consensus::ReplicatedAuthorityView;
 use crate::cluster_control::{ClusterMemberState, ClusterOwnershipState};
-use crate::cluster_principal::{
-    AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind,
-};
+use crate::cluster_principal::{AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind};
 
 pub const FEATURE: &str = "destination-authority-online-v1";
 const DOMAIN: &[u8] = b"AIagentOS independent destination admission v1\0";
@@ -47,7 +45,10 @@ impl DestinationRequestBinding {
             || !canonical_uuid(&self.agent_id)
             || !canonical_uuid(&self.owner_node_id)
             || !canonical_uuid(&self.operation_id)
-            || self.tenant_id.as_deref().is_some_and(|id| !canonical_uuid(id))
+            || self
+                .tenant_id
+                .as_deref()
+                .is_some_and(|id| !canonical_uuid(id))
             || self.authority_term == 0
             || self.authority_generation == 0
             || self.fencing_token == 0
@@ -93,21 +94,23 @@ fn canonical_uuid(value: &str) -> bool {
 
 fn canonical_hex(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn payload(proof: &DestinationPrincipalProof) -> Result<Vec<u8>, DestinationAdmissionError> {
     proof.binding.validate()?;
-    if proof.version != 1
-        || !canonical_uuid(&proof.principal_id)
-        || proof.principal_generation == 0
+    if proof.version != 1 || !canonical_uuid(&proof.principal_id) || proof.principal_generation == 0
     {
         return Err(DestinationAdmissionError::InvalidProof);
     }
     let mut unsigned = proof.clone();
     unsigned.signature_hex.clear();
     let mut output = DOMAIN.to_vec();
-    output.extend(serde_json::to_vec(&unsigned).map_err(|_| DestinationAdmissionError::InvalidProof)?);
+    output.extend(
+        serde_json::to_vec(&unsigned).map_err(|_| DestinationAdmissionError::InvalidProof)?,
+    );
     Ok(output)
 }
 
@@ -166,33 +169,46 @@ pub fn verify_destination_request<'a>(
         || proof.expires_at <= at
         || proof.expires_at <= proof.issued_at
         || proof.expires_at > actual.lease_expires_at
-        || proof.expires_at > proof.issued_at
-            .checked_add_signed(chrono::Duration::seconds(MAX_PROOF_TTL_SECONDS))
-            .ok_or(DestinationAdmissionError::InvalidProof)?
+        || proof.expires_at
+            > proof
+                .issued_at
+                .checked_add_signed(chrono::Duration::seconds(MAX_PROOF_TTL_SECONDS))
+                .ok_or(DestinationAdmissionError::InvalidProof)?
     {
         return Err(DestinationAdmissionError::Expired);
     }
-    let principal = view.principals.get(&proof.principal_id)
+    let principal = view
+        .principals
+        .get(&proof.principal_id)
         .ok_or(DestinationAdmissionError::Unauthorized)?;
-    principal.validate().map_err(|_| DestinationAdmissionError::Unauthorized)?;
+    principal
+        .validate()
+        .map_err(|_| DestinationAdmissionError::Unauthorized)?;
     if principal.revoked
         || principal.generation != proof.principal_generation
         || principal.expires_at.is_some_and(|expiry| expiry <= at)
-        || !principal.allowed_command_classes.contains(&AuthorityCommandClass::Ownership)
+        || !principal
+            .allowed_command_classes
+            .contains(&AuthorityCommandClass::Ownership)
     {
         return Err(DestinationAdmissionError::Unauthorized);
     }
-    let scope = view.ownership_tenant_scopes.get(&actual.agent_id).map(String::as_str);
+    let scope = view
+        .ownership_tenant_scopes
+        .get(&actual.agent_id)
+        .map(String::as_str);
     if scope.is_none()
         || scope != actual.tenant_id.as_deref()
         || authenticated_tenant.is_some_and(|tenant| scope != Some(tenant))
         || (principal.kind == AuthorityPrincipalKind::Tenant
-            && (principal.tenant_id.as_deref() != scope
-                || authenticated_tenant != scope))
+            && (principal.tenant_id.as_deref() != scope || authenticated_tenant != scope))
     {
         return Err(DestinationAdmissionError::TenantScope);
     }
-    let ownership = view.ownerships.iter().find(|row| row.agent_id == actual.agent_id)
+    let ownership = view
+        .ownerships
+        .iter()
+        .find(|row| row.agent_id == actual.agent_id)
         .ok_or(DestinationAdmissionError::Ownership)?;
     if ownership.owner_node_id != actual.owner_node_id
         || ownership.authority_term != actual.authority_term
@@ -202,9 +218,9 @@ pub fn verify_destination_request<'a>(
         || ownership.state != ClusterOwnershipState::Active
         || ownership.updated_at > at
         || ownership.lease_expires_at <= at
-        || !view.membership.members.iter().any(|member|
-            member.node_id == actual.owner_node_id
-                && member.state == ClusterMemberState::Active)
+        || !view.membership.members.iter().any(|member| {
+            member.node_id == actual.owner_node_id && member.state == ClusterMemberState::Active
+        })
     {
         return Err(DestinationAdmissionError::Ownership);
     }
@@ -214,7 +230,9 @@ pub fn verify_destination_request<'a>(
     let signature = crate::cluster_control::hex_decode(&proof.signature_hex)
         .ok_or(DestinationAdmissionError::InvalidSignature)?;
     if !crate::cluster_control::ClusterControl::verify_challenge(
-        &principal.public_key, &signed_payload, &signature,
+        &principal.public_key,
+        &signed_payload,
+        &signature,
     ) {
         return Err(DestinationAdmissionError::InvalidSignature);
     }
@@ -237,7 +255,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+            let document =
+                Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
             let key = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
             let now = Utc::now();
             let binding = DestinationRequestBinding {
@@ -263,7 +282,8 @@ mod tests {
                 revoked: false,
                 expires_at: None,
             };
-            let owner_document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+            let owner_document =
+                Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
             let owner_key = Ed25519KeyPair::from_pkcs8(owner_document.as_ref()).unwrap();
             let owner = ClusterMember {
                 node_id: binding.owner_node_id.clone(),
@@ -299,9 +319,10 @@ mod tests {
                 },
                 principals: BTreeMap::from([(principal.principal_id.clone(), principal)]),
                 principal_audit: Vec::new(),
-                ownership_tenant_scopes: BTreeMap::from([
-                    (binding.agent_id.clone(), binding.tenant_id.clone().unwrap()),
-                ]),
+                ownership_tenant_scopes: BTreeMap::from([(
+                    binding.agent_id.clone(),
+                    binding.tenant_id.clone().unwrap(),
+                )]),
                 membership: ClusterMembershipSnapshot {
                     cluster_id: binding.cluster_id.clone(),
                     generation: 1,
@@ -322,16 +343,28 @@ mod tests {
         fn signed(&self) -> DestinationPrincipalProof {
             let principal = self.view.principals.values().next().unwrap();
             sign_destination_request(
-                self.binding.clone(), &principal.principal_id, principal.generation,
-                self.view.logical_time, |bytes| Ok(self.key.sign(bytes).as_ref().to_vec()),
-            ).unwrap()
+                self.binding.clone(),
+                &principal.principal_id,
+                principal.generation,
+                self.view.logical_time,
+                |bytes| Ok(self.key.sign(bytes).as_ref().to_vec()),
+            )
+            .unwrap()
         }
 
-        fn verify(&self, proof: &DestinationPrincipalProof) -> Result<(), DestinationAdmissionError> {
+        fn verify(
+            &self,
+            proof: &DestinationPrincipalProof,
+        ) -> Result<(), DestinationAdmissionError> {
             verify_destination_request(
-                proof, &self.binding, &self.view, self.binding.tenant_id.as_deref(),
-                &self.binding.owner_node_id, self.view.logical_time,
-            ).map(|_| ())
+                proof,
+                &self.binding,
+                &self.view,
+                self.binding.tenant_id.as_deref(),
+                &self.binding.owner_node_id,
+                self.view.logical_time,
+            )
+            .map(|_| ())
         }
     }
 
@@ -342,16 +375,28 @@ mod tests {
         assert_eq!(fixture.verify(&proof), Ok(()));
         let mut wrong = proof.clone();
         wrong.binding.command_sha256 = crate::cluster_control::sha256_hex(b"other mutation");
-        assert_eq!(fixture.verify(&wrong), Err(DestinationAdmissionError::Ownership));
+        assert_eq!(
+            fixture.verify(&wrong),
+            Err(DestinationAdmissionError::Ownership)
+        );
         wrong = proof.clone();
         wrong.binding.agent_id = uuid::Uuid::new_v4().to_string();
-        assert_eq!(fixture.verify(&wrong), Err(DestinationAdmissionError::Ownership));
+        assert_eq!(
+            fixture.verify(&wrong),
+            Err(DestinationAdmissionError::Ownership)
+        );
         wrong = proof.clone();
         wrong.binding.cluster_id = uuid::Uuid::new_v4().to_string();
-        assert_eq!(fixture.verify(&wrong), Err(DestinationAdmissionError::Ownership));
+        assert_eq!(
+            fixture.verify(&wrong),
+            Err(DestinationAdmissionError::Ownership)
+        );
         wrong = proof;
         wrong.signature_hex = "00".repeat(64);
-        assert_eq!(fixture.verify(&wrong), Err(DestinationAdmissionError::InvalidSignature));
+        assert_eq!(
+            fixture.verify(&wrong),
+            Err(DestinationAdmissionError::InvalidSignature)
+        );
     }
 
     #[test]
@@ -360,22 +405,43 @@ mod tests {
         let proof = fixture.signed();
         let id = proof.principal_id.clone();
         fixture.view.principals.get_mut(&id).unwrap().revoked = true;
-        assert_eq!(fixture.verify(&proof), Err(DestinationAdmissionError::Unauthorized));
+        assert_eq!(
+            fixture.verify(&proof),
+            Err(DestinationAdmissionError::Unauthorized)
+        );
         fixture.view.principals.get_mut(&id).unwrap().revoked = false;
         fixture.view.principals.get_mut(&id).unwrap().generation += 1;
-        assert_eq!(fixture.verify(&proof), Err(DestinationAdmissionError::Unauthorized));
+        assert_eq!(
+            fixture.verify(&proof),
+            Err(DestinationAdmissionError::Unauthorized)
+        );
         fixture.view.principals.get_mut(&id).unwrap().generation -= 1;
         fixture.view.ownerships[0].state = ClusterOwnershipState::Released;
-        assert_eq!(fixture.verify(&proof), Err(DestinationAdmissionError::Ownership));
+        assert_eq!(
+            fixture.verify(&proof),
+            Err(DestinationAdmissionError::Ownership)
+        );
         fixture.view.ownerships[0].state = ClusterOwnershipState::Active;
         fixture.view.ownerships[0].authority_term += 1;
-        assert_eq!(fixture.verify(&proof), Err(DestinationAdmissionError::Ownership));
+        assert_eq!(
+            fixture.verify(&proof),
+            Err(DestinationAdmissionError::Ownership)
+        );
         fixture.view.ownerships[0].authority_term -= 1;
         fixture.view.membership.members[0].state = ClusterMemberState::Revoked;
-        assert_eq!(fixture.verify(&proof), Err(DestinationAdmissionError::Ownership));
+        assert_eq!(
+            fixture.verify(&proof),
+            Err(DestinationAdmissionError::Ownership)
+        );
         fixture.view.membership.members[0].state = ClusterMemberState::Active;
-        fixture.view.ownership_tenant_scopes.remove(&fixture.binding.agent_id);
-        assert_eq!(fixture.verify(&proof), Err(DestinationAdmissionError::TenantScope));
+        fixture
+            .view
+            .ownership_tenant_scopes
+            .remove(&fixture.binding.agent_id);
+        assert_eq!(
+            fixture.verify(&proof),
+            Err(DestinationAdmissionError::TenantScope)
+        );
     }
 
     #[test]
@@ -384,19 +450,33 @@ mod tests {
         let proof = fixture.signed();
         for tenant in [None, Some("00000000-0000-0000-0000-000000000001")] {
             assert!(verify_destination_request(
-                &proof, &fixture.binding, &fixture.view, tenant,
-                &fixture.binding.owner_node_id, fixture.view.logical_time,
-            ).is_err());
+                &proof,
+                &fixture.binding,
+                &fixture.view,
+                tenant,
+                &fixture.binding.owner_node_id,
+                fixture.view.logical_time,
+            )
+            .is_err());
         }
         let mut wrong = proof.clone();
         wrong.issued_at = fixture.view.logical_time + chrono::Duration::seconds(1);
-        assert_eq!(fixture.verify(&wrong), Err(DestinationAdmissionError::Expired));
+        assert_eq!(
+            fixture.verify(&wrong),
+            Err(DestinationAdmissionError::Expired)
+        );
         wrong = proof.clone();
         wrong.expires_at = fixture.view.logical_time;
-        assert_eq!(fixture.verify(&wrong), Err(DestinationAdmissionError::Expired));
+        assert_eq!(
+            fixture.verify(&wrong),
+            Err(DestinationAdmissionError::Expired)
+        );
         wrong = proof;
         wrong.expires_at = wrong.issued_at + chrono::Duration::seconds(31);
-        assert_eq!(fixture.verify(&wrong), Err(DestinationAdmissionError::Expired));
+        assert_eq!(
+            fixture.verify(&wrong),
+            Err(DestinationAdmissionError::Expired)
+        );
         let unknown = serde_json::from_str::<DestinationAuthorityMode>("\"offline_legacy\"");
         assert!(unknown.is_err());
     }

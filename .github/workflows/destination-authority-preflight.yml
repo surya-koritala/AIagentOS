@@ -61,6 +61,7 @@ jobs:
           set -euo pipefail
           cargo test -p kernel --lib --locked destination_ -- --nocapture 2>&1 | tee destination-proof.log
           cargo test -p agent-sdk --test destination_contract --locked -- --nocapture 2>&1 | tee destination-sdk.log
+          cargo test -p agent-cli --test destination_contract_commands --locked -- --nocapture 2>&1 | tee destination-cli.log
           cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture 2>&1 | tee destination-wire.log
           python -m unittest scripts.tests.test_verify_wire_fixtures 2>&1 | tee destination-python.log
           cargo test -p integration-tests --locked capability_registry -- --nocapture 2>&1 | tee destination-registry.log
@@ -74,6 +75,7 @@ jobs:
             destination-check.log
             destination-proof.log
             destination-sdk.log
+            destination-cli.log
             destination-wire.log
             destination-python.log
             destination-registry.log

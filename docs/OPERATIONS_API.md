@@ -24,6 +24,25 @@ Each reply contains:
 `total_visible_agents` and `agents_truncated` make response bounding explicit.
 The default maximum is 10,000 agent records per snapshot.
 
+## Destination authority discovery
+
+Enabled quorum configurations must select
+`cluster_raft.destination_authority_mode = "online_quorum_v1"`. Normal startup
+retains this choice with the installation and cluster identity. Removing the
+choice, disabling quorum or selecting another cluster cannot turn that
+installation into a legacy authority.
+
+Use `agentctl --addr HOST:PORT destination-contract` or
+`KernelClient::destination_contract()` on protocol v2 before provisioning
+managed work. The command prints the same typed description as JSON and needs
+no authentication token. Check the required mode, exact cluster UUID and installation
+binding. `quorum_configured` describes configuration, not current majority
+availability. The current `admission_supported = false` means the signed
+destination dispatcher is incomplete; discovery is not production admission.
+The [destination authority contract](DESTINATION_AUTHORITY.md) specifies proof,
+renewal, revocation, cancellation, partition and restart rules, plus the required
+remaining CI and external qualification.
+
 ## Scope and authorization
 
 Tenant credentials receive only identities and package instances owned by that

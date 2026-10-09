@@ -59,6 +59,7 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] models PROVIDER_ID\n\
            agentctl [SERVER OPTIONS] metrics\n\
            agentctl [SERVER OPTIONS] protocol\n\
+           agentctl [SERVER OPTIONS] destination-contract\n\
          \n\
          policy authoring commands (offline, machine-readable):\n\
            agentctl policy-validate POLICY_FILE\n\
@@ -1752,6 +1753,17 @@ async fn run_online(
             }
             let protocol = client.hello().await.unwrap_or_else(|error| fail(error));
             print_json(&protocol, "protocol description");
+            return;
+        }
+        "destination-contract" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let description = client
+                .destination_contract()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&description, "destination authority contract");
             return;
         }
         "gate-stats" => {

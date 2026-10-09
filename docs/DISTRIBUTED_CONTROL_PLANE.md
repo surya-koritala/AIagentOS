@@ -270,6 +270,15 @@ quorum verification, not a self-contained offline quorum certificate:
 installation fails when no majority can serve the read, and a standalone
 authority retains the legacy trusted-system path.
 
+Issue #432 selects the explicit `online_quorum_v1` destination contract. Its
+normative proof fields, new-admission quorum requirement, admitted-work ownership,
+cancellation bounds and failure rules are in
+[the destination authority contract](DESTINATION_AUTHORITY.md). Configuration and
+durable mode binding require this selection; public discovery currently reports
+`admission_supported = false` while signed dispatch and immutable identity
+integration remain incomplete. Existing ownership fencing does not establish
+that complete admission contract.
+
 Each workload node owns a separate SQLite database under the existing
 single-process storage lease. Agent state is not replicated between nodes.
 An explicitly addressed `ClusterClient` remains an unmanaged compatibility
@@ -312,6 +321,7 @@ owner-only files on Unix and no TLS input may be a symbolic link.
 ```toml
 [cluster_raft]
 enabled = true
+destination_authority_mode = "online_quorum_v1"
 bootstrap = true
 node_id = 1
 authority_cluster_id = "2d1b98c1-6caf-4ed4-b87f-55acde52d1ee"

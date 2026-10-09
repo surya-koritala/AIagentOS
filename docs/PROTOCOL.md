@@ -12,6 +12,19 @@ generation, class, scope, expiration, replay and genesis rules. Old token-only
 quorum mutation methods fail closed; the separately disabled single-node
 authority retains its legacy behavior.
 
+Protocol v2 also advertises `destination-contract-discovery-v1`.
+`get_destination_contract` returns a versioned description of the supported and
+required mode, cluster UUID, durable installation binding, configured quorum
+handle and signed-admission availability. It is a pre-authentication read and
+is absent from v1; it neither grants credentials nor proves a live quorum.
+`KernelClient::destination_contract()` verifies the advertised feature and the
+description; `agentctl destination-contract` prints that same typed JSON.
+The current implementation returns `admission_supported = false`.
+Clients must refuse a destination whose required mode or cluster differs from
+their contract. The [destination authority contract](DESTINATION_AUTHORITY.md)
+defines the selected `online_quorum_v1` rules; complete signed admission and
+immutable reservation integration are still required by #432/#434.
+
 AI Agent OS has one canonical remote ABI:
 `kernel::syscall_server::Syscall` / `SyscallReply` as UTF-8,
 newline-delimited JSON. The Rust SDK, CLI, TUI backend, and raw clients must use

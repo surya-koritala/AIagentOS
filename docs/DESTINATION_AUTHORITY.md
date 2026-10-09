@@ -2,9 +2,9 @@
 
 This is the destination contract required by #432, coordinated with immutable
 agent reservations in #434. The current branch implements signature and request
-binding, explicit configuration and a durable installation-mode binding.
-Dispatch, protocol discovery, reservation persistence, clients and fault
-qualification remain in progress; compiler and runtime results remain pending.
+binding, explicit configuration, a durable installation-mode binding and public
+SDK/protocol discovery. Focused CI verifies those prerequisites. Signed dispatch,
+immutable reservation integration and fault qualification remain in progress.
 Only `destination-contract-discovery-v1` is advertised by `hello`. Discovery
 reports supported and required modes, cluster binding, installation binding and
 whether a quorum handle is configured. It does not report that quorum is live.
@@ -53,11 +53,14 @@ tool arguments, creation identity or ownership fields cannot be substituted.
 Unknown proof versions and fields are rejected. The caller retains its signing
 key; neither the runtime nor the SDK owns that private key.
 
-Tenant identity is explicit. Ordinary tenants use their canonical UUID. The
-reserved `default` scope identifies system agents and requires an operator key
-and an explicit immutable quorum binding. An absent legacy scope is unknown,
-not evidence of system ownership. Tenant credentials cannot create or use a
-foreign or system identity, even with another caller's proof.
+Tenant identity is explicit. The immutable reservation selects either `System`
+or `Tenant` with a canonical tenant UUID. Only an explicit committed `System`
+reservation may map to the legacy storage sentinel `default`; that sentinel
+alone grants no authority. System admission requires an operator key. An absent
+legacy scope is unknown. Tenant credentials cannot create or use a foreign or
+system identity, even with another caller's proof. The current proof primitive
+uses the existing scope projection; the served admission path must validate the
+typed immutable reservation before it becomes available.
 
 ## Admission, handoff and failure
 

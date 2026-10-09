@@ -257,7 +257,7 @@ impl LlmSession for RestartToolSession {
                         .iter()
                         .rev()
                         .find(|message| message.role == "tool")
-                        .map(|message| message.content.as_str())
+                        .map(|message| &message.content)
                 );
                 self.second_request_started.notify_waiters();
                 std::future::pending::<Result<LlmResponse, ConnectorError>>().await

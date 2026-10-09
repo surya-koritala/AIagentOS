@@ -6,11 +6,15 @@ on:
     paths:
       - 'tests/src/lifecycle_coordinator.rs'
       - 'tests/src/durable_checkpoints.rs'
+      - 'crates/kernel/src/resources.rs'
+      - 'crates/kernel/src/sandbox.rs'
       - '.github/workflows/lifecycle-owner-restart.yml'
   pull_request:
     paths:
       - 'tests/src/lifecycle_coordinator.rs'
       - 'tests/src/durable_checkpoints.rs'
+      - 'crates/kernel/src/resources.rs'
+      - 'crates/kernel/src/sandbox.rs'
       - '.github/workflows/lifecycle-owner-restart.yml'
   workflow_dispatch:
 
@@ -74,6 +78,10 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD > lifecycle-source.txt
+          cargo test -p kernel --lib --locked filesystem_normalization -- --nocapture 2>&1 | tee normalization-controls.log
+          cargo test -p kernel --lib --locked canonical_drive -- --nocapture 2>&1 | tee -a normalization-controls.log
+          cargo test -p kernel --lib --locked unc_device -- --nocapture 2>&1 | tee -a normalization-controls.log
+          cargo test -p kernel --lib --locked extended_drive_prefixes -- --nocapture 2>&1 | tee -a normalization-controls.log
           cargo test -p integration-tests --lib --locked lifecycle_coordinator -- --nocapture 2>&1 | tee lifecycle-controls.log
           cargo test -p integration-tests --lib --locked durable_checkpoints -- --nocapture 2>&1 | tee checkpoint-controls.log
           cargo clippy -p integration-tests --all-targets --locked -- -D warnings 2>&1 | tee lifecycle-clippy.log
@@ -83,6 +91,7 @@ jobs:
           name: lifecycle-owner-${{ runner.os }}-${{ github.run_id }}
           path: |
             lifecycle-source.txt
+            normalization-controls.log
             lifecycle-controls.log
             checkpoint-controls.log
             lifecycle-clippy.log

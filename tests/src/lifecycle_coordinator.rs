@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use kernel::context::{PersistedAgent, SqliteContextManager, DEFAULT_TENANT};
+use kernel::context::{PersistedAgent, DEFAULT_TENANT};
 use kernel::ipc::{AgentIpc, DelegationStatus};
 use kernel::permissions::{AccessDecision, PermissionSystem};
 use kernel::resources::ResourceType;

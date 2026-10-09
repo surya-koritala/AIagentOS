@@ -758,9 +758,41 @@ impl SandboxManagerImpl {
         state: &SandboxState,
         path: &Path,
     ) -> Result<PathBuf, SandboxError> {
+        // Authorization uses a portable absolute DOS spelling on Windows.
+        // Compare the target and both attested workspace spellings through
+        // that same lexical normalization before deriving a relative path.
+        // Execution still uses the existing no-follow directory capability.
+        #[cfg(windows)]
+        let normalized = {
+            let normalize = |path: &Path| {
+                path.to_str()
+                    .ok_or_else(|| SandboxError::BoundaryViolation("filesystem target denied".into()))
+                    .and_then(|path| {
+                        crate::resources::normalize_filesystem_target(path)
+                            .map(PathBuf::from)
+                            .map_err(|_| SandboxError::BoundaryViolation("filesystem target denied".into()))
+                    })
+            };
+            (
+                normalize(path)?,
+                normalize(&state.workspace_dir)?,
+                normalize(&state.workspace_alias)?,
+            )
+        };
+        #[cfg(windows)]
+        let (path, workspace_dir, workspace_alias) = (
+            normalized.0.as_path(),
+            normalized.1.as_path(),
+            normalized.2.as_path(),
+        );
+        #[cfg(not(windows))]
+        let (workspace_dir, workspace_alias) = (
+            state.workspace_dir.as_path(),
+            state.workspace_alias.as_path(),
+        );
         let relative = if path.is_absolute() {
-            path.strip_prefix(&state.workspace_dir)
-                .or_else(|_| path.strip_prefix(&state.workspace_alias))
+            path.strip_prefix(workspace_dir)
+                .or_else(|_| path.strip_prefix(workspace_alias))
                 .map_err(|_| SandboxError::BoundaryViolation("filesystem target denied".into()))?
                 .to_path_buf()
         } else {

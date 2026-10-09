@@ -45,6 +45,11 @@ impl OperatorClient {
     pub async fn rotate_auth(&mut self, token: impl Into<String>) -> Result<(), SdkError> {
         self.inner.authenticate(token).await
     }
+
+    /// Close the owned SDK connection through its bounded graceful handshake.
+    pub async fn close(self) -> Result<(), SdkError> {
+        self.inner.close().await
+    }
 }
 
 impl Deref for OperatorClient {

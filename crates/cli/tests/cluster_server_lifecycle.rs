@@ -303,13 +303,13 @@ fn agent_server_owns_configured_raft_startup_and_sigterm_shutdown() {
         let mut client = KernelClient::connect(application_addr).await.expect("connect SDK to daemon");
         let mut responses = Vec::new();
         for _ in 0..2 {
-            responses.push(client.submit_authority_command_with_signer(
+            responses.push(tokio::time::timeout(Duration::from_secs(5), client.submit_authority_command_with_signer(
                 command.clone(),
                 "00000000-0000-0000-0000-000000000100",
                 "00000000-0000-0000-0000-000000000900",
                 1,
                 |payload| Ok(operator.sign(payload).as_ref().to_vec()),
-            ).await.expect("independent caller authorizes daemon ownership"));
+            )).await.expect("bounded SDK daemon claim").expect("independent caller authorizes daemon ownership"));
         }
         let AuthorityResponse::OwnershipUpdated {ownership: first, replayed: false, ..} = &responses[0] else { panic!("first signed daemon claim was not committed") };
         let AuthorityResponse::OwnershipUpdated {ownership: second, replayed: true, ..} = &responses[1] else { panic!("same signed daemon operation was not replayed") };

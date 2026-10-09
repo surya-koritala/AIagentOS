@@ -1,6 +1,15 @@
 name: Managed workspace store ownership
 
 on:
+  pull_request:
+    paths:
+      - 'tests/src/managed_workspace_ownership.rs'
+      - 'tests/src/lib.rs'
+      - 'tests/Cargo.toml'
+      - 'crates/cli/src/bin/agentctl.rs'
+      - 'crates/cli/tests/workspace_ownership_commands.rs'
+      - 'crates/kernel/src/**'
+      - '.github/workflows/managed-workspace-ownership.yml'
   push:
     branches: [codex/managed-root-ownership]
     paths:
@@ -73,7 +82,7 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=no)"
           cargo test -p kernel --lib --locked managed_workspace -- --nocapture 2>&1 | tee managed-store-control.log
           cargo test -p kernel --locked cloning:: -- --nocapture 2>&1 | tee managed-store-cloning.log
-          cargo test -p integration-tests --lib --features kernel/qualification --locked managed_workspace_ownership -- --nocapture --test-threads=1 2>&1 | tee managed-store-processes.log
+          cargo test -p integration-tests --lib --features workspace-qualification --locked managed_workspace_ownership -- --nocapture --test-threads=1 2>&1 | tee managed-store-processes.log
           cargo test -p agent-cli --test workspace_ownership_commands --locked -- --nocapture 2>&1 | tee managed-store-maintenance.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()

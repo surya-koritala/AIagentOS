@@ -342,6 +342,7 @@ async fn ownership_process_child() {
     }
 }
 
+#[cfg(feature = "workspace-qualification")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn allocation_crash_retires_only_verified_current_store_orphan_pairs() {
     for role in ["cut-manifest", "cut-directory"] {

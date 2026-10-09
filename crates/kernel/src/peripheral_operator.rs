@@ -131,7 +131,7 @@ impl PeripheralRequests {
             }
             if records.len() == MAX_REQUESTS {
                 // Never evict a waiter, an unconsumed grant, or an active use.
-                if let Some(index) = records.iter().position(|record| {
+                let index = records.iter().position(|record| {
                     *record.status.lock().unwrap() != PeripheralRequestStatus::AwaitingApproval
                         && self
                             .gate
@@ -140,11 +140,8 @@ impl PeripheralRequests {
                                 LocalPeripheralAction::Inspect,
                             )
                             .is_none_or(|(pending, active)| !pending && active == 0)
-                }) {
-                    records.remove(index);
-                } else {
-                    return None;
-                }
+                })?;
+                records.remove(index);
             }
             records.push(Arc::clone(&request));
         }

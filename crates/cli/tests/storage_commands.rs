@@ -1,14 +1,18 @@
-use std::process::Command;
-use std::sync::Arc;
 use std::io::Read;
+use std::process::Command;
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kernel::agent::AgentKernel;
 
 fn bounded_storage_command(command: &mut Command) -> Output {
     const MAX_OUTPUT: u64 = 2 * 1024 * 1024;
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let stdout = std::thread::spawn(move || {
@@ -24,7 +28,9 @@ fn bounded_storage_command(command: &mut Command) -> Output {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut timed_out = false;
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() { break status; }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() >= deadline {
             timed_out = true;
             let _ = child.kill();
@@ -34,9 +40,21 @@ fn bounded_storage_command(command: &mut Command) -> Output {
     };
     let stdout = stdout.join().unwrap();
     let stderr = stderr.join().unwrap();
-    assert!(!timed_out, "bounded recovery CLI timed out; stdout={} stderr={}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
-    assert!(stdout.len() as u64 <= MAX_OUTPUT && stderr.len() as u64 <= MAX_OUTPUT, "recovery CLI output exceeded its bound");
-    Output { status, stdout, stderr }
+    assert!(
+        !timed_out,
+        "bounded recovery CLI timed out; stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        stdout.len() as u64 <= MAX_OUTPUT && stderr.len() as u64 <= MAX_OUTPUT,
+        "recovery CLI output exceeded its bound"
+    );
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 struct TestRoot(std::path::PathBuf);
@@ -659,14 +677,33 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
                 .pause_agent(agent.id)
                 .await
                 .expect("pause recovery agent");
-            let record = kernel.context_manager.load_all_agents().unwrap().into_iter()
-                .find(|record| record.id == agent.id).unwrap();
+            let record = kernel
+                .context_manager
+                .load_all_agents()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.id == agent.id)
+                .unwrap();
             let workspace = serde_json::from_str::<kernel::SandboxConfig>(
-                record.sandbox_config_json.as_deref().unwrap()
-            ).unwrap().workspace_dir;
-            std::fs::write(workspace.join("recovery-sentinel.txt"), "source workspace must survive recovery").unwrap();
-            let owner = workspace.parent().unwrap().parent().unwrap().join("control")
-                .join(format!("{}.json", workspace.file_name().unwrap().to_str().unwrap()));
+                record.sandbox_config_json.as_deref().unwrap(),
+            )
+            .unwrap()
+            .workspace_dir;
+            std::fs::write(
+                workspace.join("recovery-sentinel.txt"),
+                "source workspace must survive recovery",
+            )
+            .unwrap();
+            let owner = workspace
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("control")
+                .join(format!(
+                    "{}.json",
+                    workspace.file_name().unwrap().to_str().unwrap()
+                ));
             (agent.id, workspace, owner, record)
         })
     };
@@ -882,71 +919,197 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
     let recovery_report: kernel::storage::DisasterRecoveryReport =
         serde_json::from_slice(&recovery.stdout).expect("disaster recovery report JSON");
     let mut legacy_report: serde_json::Value = serde_json::from_slice(&recovery.stdout).unwrap();
-    for key in ["qualification_version", "qualification", "workspace_resolution"] { legacy_report.as_object_mut().unwrap().remove(key); }
-    assert!(serde_json::from_value::<kernel::storage::DisasterRecoveryReport>(legacy_report).is_err(), "missing qualification must not default to ready");
+    for key in [
+        "qualification_version",
+        "qualification",
+        "workspace_resolution",
+    ] {
+        legacy_report.as_object_mut().unwrap().remove(key);
+    }
+    assert!(
+        serde_json::from_value::<kernel::storage::DisasterRecoveryReport>(legacy_report).is_err(),
+        "missing qualification must not default to ready"
+    );
     assert_eq!(recovery_report.persisted_agent_count, 1);
-    assert_eq!(recovery_report.qualification_version, kernel::storage::STORAGE_RECOVERY_QUALIFICATION_VERSION);
-    assert!(!recovery_report.enforcement_rearmed, "exit0 for database restoration must not imply completed enforcement");
-    assert_eq!(recovery_report.qualification, kernel::storage::RecoveryQualification::WorkspaceResolutionRequired);
+    assert_eq!(
+        recovery_report.qualification_version,
+        kernel::storage::STORAGE_RECOVERY_QUALIFICATION_VERSION
+    );
+    assert!(
+        !recovery_report.enforcement_rearmed,
+        "exit0 for database restoration must not imply completed enforcement"
+    );
+    assert_eq!(
+        recovery_report.qualification,
+        kernel::storage::RecoveryQualification::WorkspaceResolutionRequired
+    );
     assert_eq!(recovery_report.workspace_resolution.len(), 1);
-    assert_eq!(recovery_report.workspace_resolution[0].agent_id, recovered_agent_id);
-    assert_eq!(recovery_report.workspace_resolution[0].kind, kernel::WorkspaceOwnershipKind::ForeignDatastore);
-    assert_eq!(recovery_report.workspace_resolution[0].recorded_workspace, source_workspace);
+    assert_eq!(
+        recovery_report.workspace_resolution[0].agent_id,
+        recovered_agent_id
+    );
+    assert_eq!(
+        recovery_report.workspace_resolution[0].kind,
+        kernel::WorkspaceOwnershipKind::ForeignDatastore
+    );
+    assert_eq!(
+        recovery_report.workspace_resolution[0].recorded_workspace,
+        source_workspace
+    );
     assert!(!recovery_report.restore.replaced_existing);
     let recovered_config =
         kernel::config::Config::try_load_from(&recovery_config).expect("recovery config");
     {
-        let recovered = kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&recovered_config).unwrap();
-        let record = recovered.context_manager.load_all_agents().unwrap().into_iter()
-            .find(|record| record.id == recovered_agent_id).unwrap();
-        assert_eq!(record, original_record, "restoration changed paused identity/status/path before resolution");
+        let recovered =
+            kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&recovered_config)
+                .unwrap();
+        let record = recovered
+            .context_manager
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == recovered_agent_id)
+            .unwrap();
+        assert_eq!(
+            record, original_record,
+            "restoration changed paused identity/status/path before resolution"
+        );
     }
-    assert_eq!(std::fs::read(&source).unwrap(), source_database_before_recovery);
-    assert_eq!(std::fs::read(&source_owner).unwrap(), source_owner_before_recovery);
-    assert_eq!(std::fs::read(backup_dir.join("agent_os.db")).unwrap(), signed_backup_before_recovery);
-    assert_eq!(std::fs::read(backup_dir.join("manifest.json")).unwrap(), signed_manifest_before_recovery);
-    assert_eq!(std::fs::read_to_string(source_workspace.join("recovery-sentinel.txt")).unwrap(), "source workspace must survive recovery");
-    let target_namespaces = std::fs::read_dir(recovery_data_dir.join(".aiagentos-workspace-stores")).unwrap()
-        .map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        source_database_before_recovery
+    );
+    assert_eq!(
+        std::fs::read(&source_owner).unwrap(),
+        source_owner_before_recovery
+    );
+    assert_eq!(
+        std::fs::read(backup_dir.join("agent_os.db")).unwrap(),
+        signed_backup_before_recovery
+    );
+    assert_eq!(
+        std::fs::read(backup_dir.join("manifest.json")).unwrap(),
+        signed_manifest_before_recovery
+    );
+    assert_eq!(
+        std::fs::read_to_string(source_workspace.join("recovery-sentinel.txt")).unwrap(),
+        "source workspace must survive recovery"
+    );
+    let target_namespaces =
+        std::fs::read_dir(recovery_data_dir.join(".aiagentos-workspace-stores"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
     assert_eq!(target_namespaces.len(), 1);
     let target_namespace = &target_namespaces[0];
-    assert_eq!(std::fs::read_dir(target_namespace.join("data")).unwrap().count(), 0, "recovery created a fresh empty substitute workspace");
-    let target_workspace = target_namespace.join("data").join(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        std::fs::read_dir(target_namespace.join("data"))
+            .unwrap()
+            .count(),
+        0,
+        "recovery created a fresh empty substitute workspace"
+    );
+    let target_workspace = target_namespace
+        .join("data")
+        .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir(&target_workspace).unwrap();
-    std::fs::write(target_workspace.join("sentinel"), "unverified target workspace survives").unwrap();
+    std::fs::write(
+        target_workspace.join("sentinel"),
+        "unverified target workspace survives",
+    )
+    .unwrap();
     let target_control = target_namespace.join("control/operator-sentinel");
     std::fs::write(&target_control, "target control survives").unwrap();
     let config_arg = recovery_config.to_str().unwrap();
-    let before = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .args(["workspace-ownership", config_arg, "list"]));
-    assert!(before.status.success(), "{}", String::from_utf8_lossy(&before.stderr));
+    let before = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl")).args([
+        "workspace-ownership",
+        config_arg,
+        "list",
+    ]));
+    assert!(
+        before.status.success(),
+        "{}",
+        String::from_utf8_lossy(&before.stderr)
+    );
     let before: kernel::WorkspaceOwnershipStatus = serde_json::from_slice(&before.stdout).unwrap();
     assert!(!before.admitted_agents.contains(&recovered_agent_id));
-    assert!(before.unresolved.iter().any(|issue| issue.agent_id == recovered_agent_id && issue.kind == kernel::WorkspaceOwnershipKind::ForeignDatastore));
-    let pending = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .args(["backup-recovery-qualify", config_arg, "--confirm-offline"]));
-    assert!(pending.status.success(), "{}", String::from_utf8_lossy(&pending.stderr));
-    let pending: kernel::storage::StorageRecoveryQualificationReport = serde_json::from_slice(&pending.stdout).unwrap();
+    assert!(before
+        .unresolved
+        .iter()
+        .any(|issue| issue.agent_id == recovered_agent_id
+            && issue.kind == kernel::WorkspaceOwnershipKind::ForeignDatastore));
+    let pending = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl")).args([
+        "backup-recovery-qualify",
+        config_arg,
+        "--confirm-offline",
+    ]));
+    assert!(
+        pending.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pending.stderr)
+    );
+    let pending: kernel::storage::StorageRecoveryQualificationReport =
+        serde_json::from_slice(&pending.stdout).unwrap();
     assert!(!pending.enforcement_rearmed);
-    assert_eq!(pending.qualification, kernel::storage::RecoveryQualification::WorkspaceResolutionRequired);
-    assert_eq!(std::fs::read_to_string(target_workspace.join("sentinel")).unwrap(), "unverified target workspace survives");
-    assert_eq!(std::fs::read_to_string(&target_control).unwrap(), "target control survives");
-    assert_eq!(std::fs::read(&source_owner).unwrap(), source_owner_before_recovery);
-    let retained = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .args(["workspace-ownership", config_arg, "retain", &recovered_agent_id.to_string(), "--confirm-offline"]));
-    assert!(retained.status.success(), "{}", String::from_utf8_lossy(&retained.stderr));
-    let restarted = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .args(["workspace-ownership", config_arg, "list"]));
-    assert!(restarted.status.success(), "{}", String::from_utf8_lossy(&restarted.stderr));
-    let restarted: kernel::WorkspaceOwnershipStatus = serde_json::from_slice(&restarted.stdout).unwrap();
+    assert_eq!(
+        pending.qualification,
+        kernel::storage::RecoveryQualification::WorkspaceResolutionRequired
+    );
+    assert_eq!(
+        std::fs::read_to_string(target_workspace.join("sentinel")).unwrap(),
+        "unverified target workspace survives"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_control).unwrap(),
+        "target control survives"
+    );
+    assert_eq!(
+        std::fs::read(&source_owner).unwrap(),
+        source_owner_before_recovery
+    );
+    let retained = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl")).args([
+        "workspace-ownership",
+        config_arg,
+        "retain",
+        &recovered_agent_id.to_string(),
+        "--confirm-offline",
+    ]));
+    assert!(
+        retained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retained.stderr)
+    );
+    let restarted = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl")).args([
+        "workspace-ownership",
+        config_arg,
+        "list",
+    ]));
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: kernel::WorkspaceOwnershipStatus =
+        serde_json::from_slice(&restarted.stdout).unwrap();
     assert!(restarted.admitted_agents.contains(&recovered_agent_id));
     assert!(restarted.unresolved.is_empty());
-    let ready = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .args(["backup-recovery-qualify", config_arg, "--confirm-offline"]));
-    assert!(ready.status.success(), "{}", String::from_utf8_lossy(&ready.stderr));
-    let ready: kernel::storage::StorageRecoveryQualificationReport = serde_json::from_slice(&ready.stdout).unwrap();
+    let ready = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl")).args([
+        "backup-recovery-qualify",
+        config_arg,
+        "--confirm-offline",
+    ]));
+    assert!(
+        ready.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let ready: kernel::storage::StorageRecoveryQualificationReport =
+        serde_json::from_slice(&ready.stdout).unwrap();
     assert!(ready.enforcement_rearmed);
-    assert_eq!(ready.qualification, kernel::storage::RecoveryQualification::EnforcementRearmed);
+    assert_eq!(
+        ready.qualification,
+        kernel::storage::RecoveryQualification::EnforcementRearmed
+    );
     assert!(ready.workspace_resolution.is_empty());
     let recovered_kernel =
         kernel::AgentKernelImpl::from_config(&recovered_config).expect("boot recovered kernel");
@@ -956,11 +1119,26 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
             .expect("recovered agent status"),
         kernel::AgentState::Paused
     );
-    assert!(recovered_kernel.syscall_gate.agent_info(recovered_agent_id).is_some());
-    assert_eq!(std::fs::read_to_string(source_workspace.join("recovery-sentinel.txt")).unwrap(), "source workspace must survive recovery");
-    assert_eq!(std::fs::read(&source_owner).unwrap(), source_owner_before_recovery);
-    assert_eq!(std::fs::read_to_string(target_workspace.join("sentinel")).unwrap(), "unverified target workspace survives");
-    assert_eq!(std::fs::read_to_string(&target_control).unwrap(), "target control survives");
+    assert!(recovered_kernel
+        .syscall_gate
+        .agent_info(recovered_agent_id)
+        .is_some());
+    assert_eq!(
+        std::fs::read_to_string(source_workspace.join("recovery-sentinel.txt")).unwrap(),
+        "source workspace must survive recovery"
+    );
+    assert_eq!(
+        std::fs::read(&source_owner).unwrap(),
+        source_owner_before_recovery
+    );
+    assert_eq!(
+        std::fs::read_to_string(target_workspace.join("sentinel")).unwrap(),
+        "unverified target workspace survives"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_control).unwrap(),
+        "target control survives"
+    );
     drop(recovered_kernel);
 
     let restore = Command::new(env!("CARGO_BIN_EXE_agentctl"))
@@ -1261,8 +1439,13 @@ fn corruption_recovery_preserves_pending_workspace_and_sidecars_until_explicit_q
     let root = TestRoot::new();
     let key = root.0.join("signer.pk8");
     let trust = root.0.join("trust.json");
-    let generated = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .arg("backup-key-generate").arg("pending-corruption").arg(&key).arg(&trust));
+    let generated = bounded_storage_command(
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("backup-key-generate")
+            .arg("pending-corruption")
+            .arg(&key)
+            .arg(&trust),
+    );
     assert!(generated.status.success());
     let signer = kernel::storage::load_backup_signing_key(&key, "pending-corruption").unwrap();
     let source = root.0.join("source.db");
@@ -1272,21 +1455,51 @@ fn corruption_recovery_preserves_pending_workspace_and_sidecars_until_explicit_q
     let (agent_id, workspace, owner, record, manifest) = {
         let source_kernel = kernel::AgentKernelImpl::with_db_path(&source).unwrap();
         let id = runtime.block_on(async {
-            let agent = source_kernel.create_agent_full(kernel::AgentConfig {
-                name:"corrupt recovery paused owner".into(), task:"preserve real workspace".into(),
-                llm_provider:"stub".into(), permission_profile:"standard".into(),
-                priority:kernel::Priority::default(), sandbox_config:None,
-            }).await.unwrap();
+            let agent = source_kernel
+                .create_agent_full(kernel::AgentConfig {
+                    name: "corrupt recovery paused owner".into(),
+                    task: "preserve real workspace".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: kernel::Priority::default(),
+                    sandbox_config: None,
+                })
+                .await
+                .unwrap();
             source_kernel.pause_agent(agent.id).await.unwrap();
             agent.id
         });
-        let record = source_kernel.context_manager.load_all_agents().unwrap().into_iter()
-            .find(|record| record.id == id).unwrap();
-        let workspace = serde_json::from_str::<kernel::SandboxConfig>(record.sandbox_config_json.as_deref().unwrap()).unwrap().workspace_dir;
-        std::fs::write(workspace.join("sentinel"), "corruption must not erase workspace").unwrap();
-        let owner = workspace.parent().unwrap().parent().unwrap().join("control")
-            .join(format!("{}.json", workspace.file_name().unwrap().to_str().unwrap()));
-        let manifest = source_kernel.context_manager.create_signed_backup(&backup_root, "pending", &signer).unwrap();
+        let record = source_kernel
+            .context_manager
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        let workspace = serde_json::from_str::<kernel::SandboxConfig>(
+            record.sandbox_config_json.as_deref().unwrap(),
+        )
+        .unwrap()
+        .workspace_dir;
+        std::fs::write(
+            workspace.join("sentinel"),
+            "corruption must not erase workspace",
+        )
+        .unwrap();
+        let owner = workspace
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("control")
+            .join(format!(
+                "{}.json",
+                workspace.file_name().unwrap().to_str().unwrap()
+            ));
+        let manifest = source_kernel
+            .context_manager
+            .create_signed_backup(&backup_root, "pending", &signer)
+            .unwrap();
         (id, workspace, owner, record, manifest)
     };
     let source_before = std::fs::read(&source).unwrap();
@@ -1294,64 +1507,156 @@ fn corruption_recovery_preserves_pending_workspace_and_sidecars_until_explicit_q
     let backup_before = std::fs::read(backup_dir.join("agent_os.db")).unwrap();
     let anchor = root.0.join("anchors/pending.json");
     std::fs::create_dir(anchor.parent().unwrap()).unwrap();
-    let anchored = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .arg("backup-anchor-create").arg(&backup_dir).arg(&trust).arg(&anchor));
+    let anchored = bounded_storage_command(
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("backup-anchor-create")
+            .arg(&backup_dir)
+            .arg(&trust)
+            .arg(&anchor),
+    );
     assert!(anchored.status.success());
     let data = root.0.join("target");
     std::fs::create_dir(&data).unwrap();
     std::fs::write(data.join("agent_os.db"), b"corrupt original database").unwrap();
     std::fs::write(data.join("agent_os.db-wal"), b"corrupt original WAL").unwrap();
     std::fs::write(data.join("agent_os.db-shm"), b"corrupt original SHM").unwrap();
-    let config = kernel::config::Config {data_dir:data.clone(), ..Default::default()};
+    let config = kernel::config::Config {
+        data_dir: data.clone(),
+        ..Default::default()
+    };
     let config_file = root.0.join("target.toml");
     config.save_to(&config_file).unwrap();
-    let recovered = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .arg("backup-corruption-recover").arg(&backup_dir).arg(&config_file).arg(&trust)
-        .arg(&anchor).arg(&manifest.installation_id).arg("--confirm-offline"));
-    assert!(recovered.status.success(), "{}", String::from_utf8_lossy(&recovered.stderr));
-    let report: kernel::storage::CorruptStorageRecoveryReport = serde_json::from_slice(&recovered.stdout).unwrap();
+    let recovered = bounded_storage_command(
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("backup-corruption-recover")
+            .arg(&backup_dir)
+            .arg(&config_file)
+            .arg(&trust)
+            .arg(&anchor)
+            .arg(&manifest.installation_id)
+            .arg("--confirm-offline"),
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let report: kernel::storage::CorruptStorageRecoveryReport =
+        serde_json::from_slice(&recovered.stdout).unwrap();
     let mut legacy_report: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
-    for key in ["qualification_version", "qualification", "workspace_resolution"] { legacy_report.as_object_mut().unwrap().remove(key); }
-    assert!(serde_json::from_value::<kernel::storage::CorruptStorageRecoveryReport>(legacy_report).is_err());
-    assert!(!report.enforcement_rearmed, "a verified database exit0 is not completed enforcement");
-    assert_eq!(report.qualification, kernel::storage::RecoveryQualification::WorkspaceResolutionRequired);
+    for key in [
+        "qualification_version",
+        "qualification",
+        "workspace_resolution",
+    ] {
+        legacy_report.as_object_mut().unwrap().remove(key);
+    }
+    assert!(
+        serde_json::from_value::<kernel::storage::CorruptStorageRecoveryReport>(legacy_report)
+            .is_err()
+    );
+    assert!(
+        !report.enforcement_rearmed,
+        "a verified database exit0 is not completed enforcement"
+    );
+    assert_eq!(
+        report.qualification,
+        kernel::storage::RecoveryQualification::WorkspaceResolutionRequired
+    );
     assert_eq!(report.workspace_resolution[0].agent_id, agent_id);
-    assert_eq!(report.workspace_resolution[0].kind, kernel::WorkspaceOwnershipKind::ForeignDatastore);
-    for (name, expected) in [("corrupt-database.sqlite3", &b"corrupt original database"[..]),
+    assert_eq!(
+        report.workspace_resolution[0].kind,
+        kernel::WorkspaceOwnershipKind::ForeignDatastore
+    );
+    for (name, expected) in [
+        (
+            "corrupt-database.sqlite3",
+            &b"corrupt original database"[..],
+        ),
         ("corrupt-database.sqlite3-wal", &b"corrupt original WAL"[..]),
-        ("corrupt-database.sqlite3-shm", &b"corrupt original SHM"[..])] {
-        assert_eq!(std::fs::read(report.quarantine_dir.join(name)).unwrap(), expected);
+        ("corrupt-database.sqlite3-shm", &b"corrupt original SHM"[..]),
+    ] {
+        assert_eq!(
+            std::fs::read(report.quarantine_dir.join(name)).unwrap(),
+            expected
+        );
     }
     assert!(report.original_wal_preserved && report.original_shm_preserved);
     assert_eq!(std::fs::read(&source).unwrap(), source_before);
     assert_eq!(std::fs::read(&owner).unwrap(), owner_before);
-    assert_eq!(std::fs::read(backup_dir.join("agent_os.db")).unwrap(), backup_before);
-    assert_eq!(std::fs::read_to_string(workspace.join("sentinel")).unwrap(), "corruption must not erase workspace");
+    assert_eq!(
+        std::fs::read(backup_dir.join("agent_os.db")).unwrap(),
+        backup_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("sentinel")).unwrap(),
+        "corruption must not erase workspace"
+    );
     {
-        let target = kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&config).unwrap();
-        assert_eq!(target.context_manager.load_all_agents().unwrap().into_iter().find(|candidate| candidate.id == agent_id).unwrap(), record);
+        let target =
+            kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&config).unwrap();
+        assert_eq!(
+            target
+                .context_manager
+                .load_all_agents()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == agent_id)
+                .unwrap(),
+            record
+        );
     }
-    let listed = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .arg("workspace-ownership").arg(&config_file).arg("list"));
+    let listed = bounded_storage_command(
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("workspace-ownership")
+            .arg(&config_file)
+            .arg("list"),
+    );
     assert!(listed.status.success());
     let listed: kernel::WorkspaceOwnershipStatus = serde_json::from_slice(&listed.stdout).unwrap();
     assert!(!listed.admitted_agents.contains(&agent_id));
-    let retained = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .arg("workspace-ownership").arg(&config_file).arg("retain").arg(agent_id.to_string()).arg("--confirm-offline"));
+    let retained = bounded_storage_command(
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("workspace-ownership")
+            .arg(&config_file)
+            .arg("retain")
+            .arg(agent_id.to_string())
+            .arg("--confirm-offline"),
+    );
     assert!(retained.status.success());
-    let restarted = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .arg("workspace-ownership").arg(&config_file).arg("list"));
+    let restarted = bounded_storage_command(
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("workspace-ownership")
+            .arg(&config_file)
+            .arg("list"),
+    );
     assert!(restarted.status.success());
-    let restarted: kernel::WorkspaceOwnershipStatus = serde_json::from_slice(&restarted.stdout).unwrap();
+    let restarted: kernel::WorkspaceOwnershipStatus =
+        serde_json::from_slice(&restarted.stdout).unwrap();
     assert!(restarted.admitted_agents.contains(&agent_id));
-    let qualified = bounded_storage_command(Command::new(env!("CARGO_BIN_EXE_agentctl"))
-        .arg("backup-recovery-qualify").arg(&config_file).arg("--confirm-offline"));
-    assert!(qualified.status.success(), "{}", String::from_utf8_lossy(&qualified.stderr));
-    let qualified: kernel::storage::StorageRecoveryQualificationReport = serde_json::from_slice(&qualified.stdout).unwrap();
+    let qualified = bounded_storage_command(
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("backup-recovery-qualify")
+            .arg(&config_file)
+            .arg("--confirm-offline"),
+    );
+    assert!(
+        qualified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&qualified.stderr)
+    );
+    let qualified: kernel::storage::StorageRecoveryQualificationReport =
+        serde_json::from_slice(&qualified.stdout).unwrap();
     assert!(qualified.enforcement_rearmed);
     let target = kernel::AgentKernelImpl::from_config(&config).unwrap();
-    assert_eq!(target.get_agent_status(agent_id).unwrap(), kernel::AgentState::Paused);
+    assert_eq!(
+        target.get_agent_status(agent_id).unwrap(),
+        kernel::AgentState::Paused
+    );
     assert!(target.syscall_gate.agent_info(agent_id).is_some());
     assert_eq!(std::fs::read(&owner).unwrap(), owner_before);
-    assert_eq!(std::fs::read_to_string(workspace.join("sentinel")).unwrap(), "corruption must not erase workspace");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("sentinel")).unwrap(),
+        "corruption must not erase workspace"
+    );
 }

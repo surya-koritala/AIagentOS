@@ -52,10 +52,14 @@ const CORRUPT_RECOVERY_JOURNAL_SUFFIX: &str = ".corrupt-recovery.json";
 const MAX_CORRUPT_RECOVERY_JOURNAL_BYTES: u64 = 64 * 1024;
 pub const STORAGE_RECOVERY_QUALIFICATION_VERSION: u32 = 1;
 
-fn deserialize_recovery_qualification_version<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+fn deserialize_recovery_qualification_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
     let version = u32::deserialize(deserializer)?;
     if version != STORAGE_RECOVERY_QUALIFICATION_VERSION {
-        return Err(serde::de::Error::custom("unsupported recovery qualification report version"));
+        return Err(serde::de::Error::custom(
+            "unsupported recovery qualification report version",
+        ));
     }
     Ok(version)
 }
@@ -3277,57 +3281,105 @@ fn qualify_recovered_database(
     config: &crate::config::Config,
     storage_lease: StorageLease,
 ) -> Result<(StorageRecoveryQualificationReport, crate::AgentKernelImpl), ContextError> {
-    let kernel = crate::AgentKernelImpl::from_config_with_storage_lease_for_recovery(config, storage_lease)
-        .map_err(|error| {
-            storage_error(format!(
-                "restored database failed configured kernel qualification: {error}"
-            ))
-        })?;
+    let kernel =
+        crate::AgentKernelImpl::from_config_with_storage_lease_for_recovery(config, storage_lease)
+            .map_err(|error| {
+                storage_error(format!(
+                    "restored database failed configured kernel qualification: {error}"
+                ))
+            })?;
     let persisted = kernel.context_manager.load_all_agents()?;
     let ownership = kernel.workspace_ownership_status().map_err(|error| {
-        storage_error(format!("restored workspace ownership verification failed: {error}"))
+        storage_error(format!(
+            "restored workspace ownership verification failed: {error}"
+        ))
     })?;
     if ownership.truncated {
-        return Err(storage_error("restored ownership inventory exceeds its bounded qualification output"));
+        return Err(storage_error(
+            "restored ownership inventory exceeds its bounded qualification output",
+        ));
     }
     for issue in &ownership.unresolved {
-        if !matches!(issue.kind, crate::WorkspaceOwnershipKind::LegacyNamespace | crate::WorkspaceOwnershipKind::ForeignDatastore) {
-            return Err(storage_error(format!("restored agent {} has invalid ownership metadata: {:?}", issue.agent_id, issue.kind)));
+        if !matches!(
+            issue.kind,
+            crate::WorkspaceOwnershipKind::LegacyNamespace
+                | crate::WorkspaceOwnershipKind::ForeignDatastore
+        ) {
+            return Err(storage_error(format!(
+                "restored agent {} has invalid ownership metadata: {:?}",
+                issue.agent_id, issue.kind
+            )));
         }
-        if issue.recorded_workspace.as_os_str().as_encoded_bytes().len() > 4096 {
-            return Err(storage_error("restored unresolved workspace path exceeds qualification output bound"));
+        if issue
+            .recorded_workspace
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            > 4096
+        {
+            return Err(storage_error(
+                "restored unresolved workspace path exceeds qualification output bound",
+            ));
         }
     }
     for agent in &persisted {
         let state: crate::AgentState = serde_json::from_str(&agent.status)
             .map_err(|_| storage_error("restored agent lifecycle is malformed"))?;
-        let sandbox = agent.sandbox_config_json.as_deref()
+        let sandbox = agent
+            .sandbox_config_json
+            .as_deref()
             .map(serde_json::from_str::<crate::SandboxConfig>)
             .transpose()
             .map_err(|_| storage_error("restored sandbox configuration is malformed"))?;
-        if matches!(state, crate::AgentState::Running | crate::AgentState::Paused)
-            && agent.sandbox_config_json.is_none()
+        if matches!(
+            state,
+            crate::AgentState::Running | crate::AgentState::Paused
+        ) && agent.sandbox_config_json.is_none()
         {
             return Err(storage_error("restored active agent has no recorded workspace; an empty substitute cannot qualify"));
         }
-        if matches!(state, crate::AgentState::Running | crate::AgentState::Paused) {
-            let path = &sandbox.as_ref().expect("active recorded sandbox was checked").workspace_dir;
-            let pending = ownership.unresolved.iter().any(|issue| issue.agent_id == agent.id);
+        if matches!(
+            state,
+            crate::AgentState::Running | crate::AgentState::Paused
+        ) {
+            let path = &sandbox
+                .as_ref()
+                .expect("active recorded sandbox was checked")
+                .workspace_dir;
+            let pending = ownership
+                .unresolved
+                .iter()
+                .any(|issue| issue.agent_id == agent.id);
             verify_recovery_workspace_path(path, pending)?;
         }
     }
-    kernel.rehydrate_agents_checked_blocking().map_err(|error| {
-        storage_error(format!("restored configured enforcement could not be rehydrated: {error}"))
-    })?;
+    kernel
+        .rehydrate_agents_checked_blocking()
+        .map_err(|error| {
+            storage_error(format!(
+                "restored configured enforcement could not be rehydrated: {error}"
+            ))
+        })?;
     for agent in &persisted {
-        if ownership.unresolved.iter().any(|issue| issue.agent_id == agent.id) {
+        if ownership
+            .unresolved
+            .iter()
+            .any(|issue| issue.agent_id == agent.id)
+        {
             if kernel.get_agent_status(agent.id).is_ok() {
-                return Err(storage_error("unresolved restored workspace was unexpectedly admitted"));
+                return Err(storage_error(
+                    "unresolved restored workspace was unexpectedly admitted",
+                ));
             }
-            let retained = kernel.context_manager.load_all_agents()?.into_iter()
+            let retained = kernel
+                .context_manager
+                .load_all_agents()?
+                .into_iter()
                 .find(|record| record.id == agent.id);
             if retained.as_ref() != Some(agent) {
-                return Err(storage_error("unresolved restored record changed during qualification"));
+                return Err(storage_error(
+                    "unresolved restored record changed during qualification",
+                ));
             }
             continue;
         }
@@ -3337,26 +3389,42 @@ fn qualify_recovered_database(
                 agent.id
             ))
         })?;
-        if matches!(state, crate::AgentState::Running | crate::AgentState::Paused)
-            && (kernel.syscall_gate.agent_info(agent.id).is_none()
-                || kernel.sandbox_manager.get_sandbox_for_agent(agent.id).is_none())
+        if matches!(
+            state,
+            crate::AgentState::Running | crate::AgentState::Paused
+        ) && (kernel.syscall_gate.agent_info(agent.id).is_none()
+            || kernel
+                .sandbox_manager
+                .get_sandbox_for_agent(agent.id)
+                .is_none())
         {
-            return Err(storage_error("restored active agent has no enforcing sandbox or syscall gate"));
+            return Err(storage_error(
+                "restored active agent has no enforcing sandbox or syscall gate",
+            ));
         }
     }
     let enforcement_rearmed = ownership.unresolved.is_empty();
-    Ok((StorageRecoveryQualificationReport {
-        qualification_version: STORAGE_RECOVERY_QUALIFICATION_VERSION,
-        persisted_agent_count: persisted.len(),
-        enforcement_rearmed,
-        qualification: if enforcement_rearmed { RecoveryQualification::EnforcementRearmed } else { RecoveryQualification::WorkspaceResolutionRequired },
-        workspace_resolution: ownership.unresolved,
-    }, kernel))
+    Ok((
+        StorageRecoveryQualificationReport {
+            qualification_version: STORAGE_RECOVERY_QUALIFICATION_VERSION,
+            persisted_agent_count: persisted.len(),
+            enforcement_rearmed,
+            qualification: if enforcement_rearmed {
+                RecoveryQualification::EnforcementRearmed
+            } else {
+                RecoveryQualification::WorkspaceResolutionRequired
+            },
+            workspace_resolution: ownership.unresolved,
+        },
+        kernel,
+    ))
 }
 
 fn verify_recovery_workspace_path(path: &Path, allow_missing: bool) -> Result<(), ContextError> {
     if !path.is_absolute() {
-        return Err(storage_error("restored workspace path must be absolute for qualification"));
+        return Err(storage_error(
+            "restored workspace path must be absolute for qualification",
+        ));
     }
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -3365,15 +3433,23 @@ fn verify_recovery_workspace_path(path: &Path, allow_missing: bool) -> Result<()
                 {
                     use std::os::windows::fs::MetadataExt;
                     if metadata.file_attributes() & 0x0400 != 0 {
-                        return Err(storage_error("restored workspace rejects reparse ancestors"));
+                        return Err(storage_error(
+                            "restored workspace rejects reparse ancestors",
+                        ));
                     }
                 }
                 if metadata.file_type().is_symlink() {
-                    return Err(storage_error("restored workspace rejects symlink ancestors"));
+                    return Err(storage_error(
+                        "restored workspace rejects symlink ancestors",
+                    ));
                 }
             }
             Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(storage_error(format!("restored workspace verification failed: {error}"))),
+            Err(error) => {
+                return Err(storage_error(format!(
+                    "restored workspace verification failed: {error}"
+                )))
+            }
         }
     }
     match fs::symlink_metadata(path) {
@@ -3385,17 +3461,23 @@ fn verify_recovery_workspace_path(path: &Path, allow_missing: bool) -> Result<()
             {
                 use std::os::unix::fs::MetadataExt;
                 if metadata.uid() != unsafe { libc::geteuid() } {
-                    return Err(storage_error("restored workspace is owned by another OS user"));
+                    return Err(storage_error(
+                        "restored workspace is owned by another OS user",
+                    ));
                 }
             }
             #[cfg(windows)]
             crate::windows_private_fs::check_directory_owner(path).map_err(|error| {
-                storage_error(format!("restored workspace owner verification failed: {error}"))
+                storage_error(format!(
+                    "restored workspace owner verification failed: {error}"
+                ))
             })?;
             Ok(())
         }
         Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(storage_error(format!("restored workspace is unavailable: {error}"))),
+        Err(error) => Err(storage_error(format!(
+            "restored workspace is unavailable: {error}"
+        ))),
     }
 }
 
@@ -3405,12 +3487,16 @@ pub fn qualify_storage_recovery_from_config(
     config: &crate::config::Config,
 ) -> Result<StorageRecoveryQualificationReport, ContextError> {
     if !config.data_dir.is_absolute() {
-        return Err(storage_error("recovery qualification requires an absolute data_dir"));
+        return Err(storage_error(
+            "recovery qualification requires an absolute data_dir",
+        ));
     }
     let database = config.data_dir.join(BACKUP_DATABASE_FILE);
     require_real_directory(&config.data_dir, "recovery qualification parent")?;
     if !optional_regular_file_exists(&database, "recovery qualification database")? {
-        return Err(storage_error("recovery qualification requires an existing restored database"));
+        return Err(storage_error(
+            "recovery qualification requires an existing restored database",
+        ));
     }
     let lease = acquire_storage_lease(&database)?;
     let (report, _qualified_kernel) = qualify_recovered_database(config, lease)?;
@@ -5674,41 +5760,75 @@ mod tests {
 
     fn recovery_agent() -> crate::AgentConfig {
         crate::AgentConfig {
-            name:"recovery owner".into(), task:"preserve original recorded workspace".into(),
-            llm_provider:"stub".into(), permission_profile:"standard".into(),
-            priority:crate::Priority::default(), sandbox_config:None,
+            name: "recovery owner".into(),
+            task: "preserve original recorded workspace".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: crate::Priority::default(),
+            sandbox_config: None,
         }
     }
 
     #[tokio::test]
     async fn recovery_pending_is_limited_to_typed_foreign_or_legacy_ambiguity() {
-        for fault in ["lifecycle", "sandbox", "missing_path", "current_manifest", "legacy_symlink", "enforcement"] {
+        for fault in [
+            "lifecycle",
+            "sandbox",
+            "missing_path",
+            "current_manifest",
+            "legacy_symlink",
+            "enforcement",
+        ] {
             let directory = TestDirectory::new(fault);
             let config = recovery_config(&directory.path.join("data"));
             let kernel = crate::AgentKernelImpl::from_config(&config).unwrap();
             let id = kernel.create_agent_full(recovery_agent()).await.unwrap().id;
             kernel.pause_agent(id).await.unwrap();
-            let mut record = kernel.context_manager.load_all_agents().unwrap().into_iter().find(|record|record.id==id).unwrap();
-            let mut sandbox: crate::SandboxConfig = serde_json::from_str(record.sandbox_config_json.as_deref().unwrap()).unwrap();
+            let mut record = kernel
+                .context_manager
+                .load_all_agents()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.id == id)
+                .unwrap();
+            let mut sandbox: crate::SandboxConfig =
+                serde_json::from_str(record.sandbox_config_json.as_deref().unwrap()).unwrap();
             let workspace = sandbox.workspace_dir.clone();
             fs::write(workspace.join("sentinel"), "original workspace must remain").unwrap();
-            let owner = workspace.parent().unwrap().parent().unwrap().join("control")
-                .join(format!("{}.json", workspace.file_name().unwrap().to_str().unwrap()));
+            let owner = workspace
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("control")
+                .join(format!(
+                    "{}.json",
+                    workspace.file_name().unwrap().to_str().unwrap()
+                ));
             match fault {
                 "lifecycle" => record.status = "malformed original lifecycle".into(),
-                "sandbox" => record.sandbox_config_json = Some("{malformed original sandbox".into()),
+                "sandbox" => {
+                    record.sandbox_config_json = Some("{malformed original sandbox".into())
+                }
                 "missing_path" => record.sandbox_config_json = None,
                 "current_manifest" => {
-                    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&owner).unwrap()).unwrap();
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&owner).unwrap()).unwrap();
                     value["store"] = serde_json::json!(uuid::Uuid::new_v4());
-                    crate::config::write_owner_only_atomic(&owner, &serde_json::to_vec(&value).unwrap()).unwrap();
+                    crate::config::write_owner_only_atomic(
+                        &owner,
+                        &serde_json::to_vec(&value).unwrap(),
+                    )
+                    .unwrap();
                 }
                 "legacy_symlink" => {
                     let legacy = directory.path.join("historical/aiagentos-workspaces");
                     fs::create_dir_all(&legacy).unwrap();
                     let linked = legacy.join(uuid::Uuid::new_v4().to_string());
-                    #[cfg(unix)] std::os::unix::fs::symlink(&workspace, &linked).unwrap();
-                    #[cfg(windows)] std::os::windows::fs::symlink_dir(&workspace, &linked).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&workspace, &linked).unwrap();
+                    #[cfg(windows)]
+                    std::os::windows::fs::symlink_dir(&workspace, &linked).unwrap();
                     sandbox.workspace_dir = linked;
                     record.sandbox_config_json = Some(serde_json::to_string(&sandbox).unwrap());
                 }
@@ -5721,16 +5841,31 @@ mod tests {
             kernel.context_manager.save_agent(&record).unwrap();
             let (signer, _) = BackupSigningKey::generate("qualification-negative").unwrap();
             let backups = directory.path.join("backups");
-            kernel.context_manager.create_signed_backup(&backups, "candidate", &signer).unwrap();
+            kernel
+                .context_manager
+                .create_signed_backup(&backups, "candidate", &signer)
+                .unwrap();
             drop(kernel);
             let owner_before = fs::read(&owner).unwrap();
             let destination = config.data_dir.join(BACKUP_DATABASE_FILE);
             let original_database = fs::read(&destination).unwrap();
-            let error = recover_backup_from_config(&backups.join("candidate"), &config, &signer.trust_root()).unwrap_err();
+            let error = recover_backup_from_config(
+                &backups.join("candidate"),
+                &config,
+                &signer.trust_root(),
+            )
+            .unwrap_err();
             assert!(!error.to_string().is_empty());
-            assert_eq!(fs::read(&destination).unwrap(), original_database, "qualification failure did not roll back {fault}");
+            assert_eq!(
+                fs::read(&destination).unwrap(),
+                original_database,
+                "qualification failure did not roll back {fault}"
+            );
             assert_eq!(fs::read(&owner).unwrap(), owner_before);
-            assert_eq!(fs::read_to_string(workspace.join("sentinel")).unwrap(), "original workspace must remain");
+            assert_eq!(
+                fs::read_to_string(workspace.join("sentinel")).unwrap(),
+                "original workspace must remain"
+            );
         }
     }
 
@@ -5739,54 +5874,131 @@ mod tests {
         let directory = TestDirectory::new("service-preservation");
         let source_config = recovery_config(&directory.path.join("source"));
         let source = crate::AgentKernelImpl::from_config(&source_config).unwrap();
-        let definition: crate::init_system::ServiceDef = serde_json::from_value(serde_json::json!({
-            "name":"recovered-service", "description":"offline service preservation",
-            "exec":{"provider":"stub", "system_prompt":"preserve ownership"}
-        })).unwrap();
-        source.os.init.lock().await.replace_definitions(vec![definition]).unwrap();
+        let definition: crate::init_system::ServiceDef =
+            serde_json::from_value(serde_json::json!({
+                "name":"recovered-service", "description":"offline service preservation",
+                "exec":{"provider":"stub", "system_prompt":"preserve ownership"}
+            }))
+            .unwrap();
+        source
+            .os
+            .init
+            .lock()
+            .await
+            .replace_definitions(vec![definition])
+            .unwrap();
         let id = source.start_service("recovered-service").await.unwrap();
-        let record = source.context_manager.load_all_agents().unwrap().into_iter().find(|record|record.id==id).unwrap();
-        let workspace = serde_json::from_str::<crate::SandboxConfig>(record.sandbox_config_json.as_deref().unwrap()).unwrap().workspace_dir;
-        fs::write(workspace.join("sentinel"), "service bytes survive qualification").unwrap();
+        let record = source
+            .context_manager
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        let workspace = serde_json::from_str::<crate::SandboxConfig>(
+            record.sandbox_config_json.as_deref().unwrap(),
+        )
+        .unwrap()
+        .workspace_dir;
+        fs::write(
+            workspace.join("sentinel"),
+            "service bytes survive qualification",
+        )
+        .unwrap();
         let services = source.context_manager.load_service_runtime().unwrap();
-        let history = source.list_service_history(Some("recovered-service"), 256).unwrap();
+        let history = source
+            .list_service_history(Some("recovered-service"), 256)
+            .unwrap();
         let (signer, _) = BackupSigningKey::generate("service-preservation").unwrap();
         let backups = directory.path.join("backups");
-        source.context_manager.create_signed_backup(&backups, "candidate", &signer).unwrap();
+        source
+            .context_manager
+            .create_signed_backup(&backups, "candidate", &signer)
+            .unwrap();
         drop(source);
         let target_config = recovery_config(&directory.path.join("target"));
         assert!(target_config.service_dir.is_none());
-        let report = recover_backup_from_config(&backups.join("candidate"), &target_config, &signer.trust_root()).unwrap();
+        let report = recover_backup_from_config(
+            &backups.join("candidate"),
+            &target_config,
+            &signer.trust_root(),
+        )
+        .unwrap();
         assert!(!report.enforcement_rearmed);
-        assert_eq!(report.qualification, RecoveryQualification::WorkspaceResolutionRequired);
-        let target = crate::AgentKernelImpl::from_config_for_workspace_maintenance(&target_config).unwrap();
-        assert_eq!(target.context_manager.load_service_runtime().unwrap(), services);
-        assert_eq!(target.list_service_history(Some("recovered-service"),256).unwrap(), history);
-        assert_eq!(target.context_manager.load_all_agents().unwrap().into_iter().find(|record|record.id==id).unwrap(), record);
-        assert_eq!(fs::read_to_string(workspace.join("sentinel")).unwrap(), "service bytes survive qualification");
+        assert_eq!(
+            report.qualification,
+            RecoveryQualification::WorkspaceResolutionRequired
+        );
+        let target =
+            crate::AgentKernelImpl::from_config_for_workspace_maintenance(&target_config).unwrap();
+        assert_eq!(
+            target.context_manager.load_service_runtime().unwrap(),
+            services
+        );
+        assert_eq!(
+            target
+                .list_service_history(Some("recovered-service"), 256)
+                .unwrap(),
+            history
+        );
+        assert_eq!(
+            target
+                .context_manager
+                .load_all_agents()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.id == id)
+                .unwrap(),
+            record
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("sentinel")).unwrap(),
+            "service bytes survive qualification"
+        );
         target.rehydrate_agents().await.unwrap();
-        target.retain_legacy_workspace_as_operator(id).await.unwrap();
+        target
+            .retain_legacy_workspace_as_operator(id)
+            .await
+            .unwrap();
         drop(target);
         let report = qualify_storage_recovery_from_config(&target_config).unwrap();
         assert!(report.enforcement_rearmed);
-        let target = crate::AgentKernelImpl::from_config_for_workspace_maintenance(&target_config).unwrap();
-        assert_eq!(target.context_manager.load_service_runtime().unwrap(), services);
-        assert_eq!(target.list_service_history(Some("recovered-service"),256).unwrap(), history);
-        assert_eq!(fs::read_to_string(workspace.join("sentinel")).unwrap(), "service bytes survive qualification");
+        let target =
+            crate::AgentKernelImpl::from_config_for_workspace_maintenance(&target_config).unwrap();
+        assert_eq!(
+            target.context_manager.load_service_runtime().unwrap(),
+            services
+        );
+        assert_eq!(
+            target
+                .list_service_history(Some("recovered-service"), 256)
+                .unwrap(),
+            history
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("sentinel")).unwrap(),
+            "service bytes survive qualification"
+        );
     }
 
     #[test]
     fn legacy_recovery_reports_never_default_missing_qualification_to_ready() {
         let report = StorageRecoveryQualificationReport {
-            qualification_version:STORAGE_RECOVERY_QUALIFICATION_VERSION, persisted_agent_count:0,
-            enforcement_rearmed:true, qualification:RecoveryQualification::EnforcementRearmed,
-            workspace_resolution:Vec::new(),
+            qualification_version: STORAGE_RECOVERY_QUALIFICATION_VERSION,
+            persisted_agent_count: 0,
+            enforcement_rearmed: true,
+            qualification: RecoveryQualification::EnforcementRearmed,
+            workspace_resolution: Vec::new(),
         };
         let mut value = serde_json::to_value(report).unwrap();
         let mut unsupported = value.clone();
         unsupported["qualification_version"] = serde_json::json!(999);
         assert!(serde_json::from_value::<StorageRecoveryQualificationReport>(unsupported).is_err());
-        for key in ["qualification_version", "qualification", "workspace_resolution"] {
+        for key in [
+            "qualification_version",
+            "qualification",
+            "workspace_resolution",
+        ] {
             value.as_object_mut().unwrap().remove(key);
         }
         assert!(serde_json::from_value::<StorageRecoveryQualificationReport>(value).is_err());
@@ -5797,13 +6009,24 @@ mod tests {
         #[cfg(windows)]
         if std::env::var_os("AIAGENTOS_RECOVERY_FOREIGN_OWNER_CHILD").is_none() {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "storage::tests::recovery_foreign_workspace_owner_is_fatal_and_rolls_back", "--nocapture"])
-                .env("AIAGENTOS_RECOVERY_FOREIGN_OWNER_CHILD", "1").spawn().unwrap();
+                .args([
+                    "--exact",
+                    "storage::tests::recovery_foreign_workspace_owner_is_fatal_and_rolls_back",
+                    "--nocapture",
+                ])
+                .env("AIAGENTOS_RECOVERY_FOREIGN_OWNER_CHILD", "1")
+                .spawn()
+                .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); return; }
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill(); let _ = child.wait(); panic!("native recovery ownership child timed out");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("native recovery ownership child timed out");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -5813,31 +6036,73 @@ mod tests {
         let kernel = crate::AgentKernelImpl::from_config(&config).unwrap();
         let id = kernel.create_agent_full(recovery_agent()).await.unwrap().id;
         kernel.pause_agent(id).await.unwrap();
-        let record = kernel.context_manager.load_all_agents().unwrap().into_iter().find(|record|record.id==id).unwrap();
-        let workspace = serde_json::from_str::<crate::SandboxConfig>(record.sandbox_config_json.as_deref().unwrap()).unwrap().workspace_dir;
+        let record = kernel
+            .context_manager
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        let workspace = serde_json::from_str::<crate::SandboxConfig>(
+            record.sandbox_config_json.as_deref().unwrap(),
+        )
+        .unwrap()
+        .workspace_dir;
         fs::write(workspace.join("sentinel"), "foreign owner bytes survive").unwrap();
-        let (signer,_) = BackupSigningKey::generate("foreign-owner-recovery").unwrap();
+        let (signer, _) = BackupSigningKey::generate("foreign-owner-recovery").unwrap();
         let backups = directory.path.join("backups");
-        kernel.context_manager.create_signed_backup(&backups,"candidate",&signer).unwrap();
+        kernel
+            .context_manager
+            .create_signed_backup(&backups, "candidate", &signer)
+            .unwrap();
         drop(kernel);
-        #[cfg(windows)] crate::windows_private_fs::set_system_directory_owner_for_recovery_test(&workspace).unwrap();
-        #[cfg(unix)] {
-            let owner = if unsafe { libc::geteuid() } == 0 { 65534 } else { 0 };
-            let result = std::process::Command::new("sudo").args(["-n","chown",&owner.to_string()]).arg(&workspace).output().unwrap();
-            assert!(result.status.success(), "native owner fixture could not set isolated directory owner");
+        #[cfg(windows)]
+        crate::windows_private_fs::set_system_directory_owner_for_recovery_test(&workspace)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let owner = if unsafe { libc::geteuid() } == 0 {
+                65534
+            } else {
+                0
+            };
+            let result = std::process::Command::new("sudo")
+                .args(["-n", "chown", &owner.to_string()])
+                .arg(&workspace)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "native owner fixture could not set isolated directory owner"
+            );
         }
         let database = config.data_dir.join(BACKUP_DATABASE_FILE);
         let original = fs::read(&database).unwrap();
-        let result = recover_backup_from_config(&backups.join("candidate"),&config,&signer.trust_root());
-        assert!(result.is_err(), "unsafe ownership was reported as an ambiguous pending workspace");
+        let result =
+            recover_backup_from_config(&backups.join("candidate"), &config, &signer.trust_root());
+        assert!(
+            result.is_err(),
+            "unsafe ownership was reported as an ambiguous pending workspace"
+        );
         assert_eq!(fs::read(&database).unwrap(), original);
-        assert!(verify_recovery_workspace_path(&workspace,false).is_err(), "qualification took ownership");
-        #[cfg(unix)] {
+        assert!(
+            verify_recovery_workspace_path(&workspace, false).is_err(),
+            "qualification took ownership"
+        );
+        #[cfg(unix)]
+        {
             let owner = unsafe { libc::geteuid() };
-            let result = std::process::Command::new("sudo").args(["-n","chown",&owner.to_string()]).arg(&workspace).output().unwrap();
+            let result = std::process::Command::new("sudo")
+                .args(["-n", "chown", &owner.to_string()])
+                .arg(&workspace)
+                .output()
+                .unwrap();
             assert!(result.status.success());
         }
-        assert_eq!(fs::read_to_string(workspace.join("sentinel")).unwrap(), "foreign owner bytes survive");
+        assert_eq!(
+            fs::read_to_string(workspace.join("sentinel")).unwrap(),
+            "foreign owner bytes survive"
+        );
     }
 
     #[test]

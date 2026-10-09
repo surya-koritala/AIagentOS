@@ -3638,9 +3638,11 @@ impl AgentKernelImpl {
             })
             .join()
         })
-        .map_err(|_| KernelError::Context(ContextError::StorageError(
-            "agent rehydration thread panicked".into(),
-        )))?
+        .map_err(|_| {
+            KernelError::Context(ContextError::StorageError(
+                "agent rehydration thread panicked".into(),
+            ))
+        })?
     }
 
     /// Rebind durable service ownership only after agent rehydration. A live

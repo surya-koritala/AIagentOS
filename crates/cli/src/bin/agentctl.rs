@@ -702,7 +702,9 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
             }
             let path = std::path::Path::new(&config_file);
             if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-                fail_operator("recovery qualification requires an existing configuration file".into());
+                fail_operator(
+                    "recovery qualification requires an existing configuration file".into(),
+                );
             }
             let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| {
                 fail_operator(format!("failed to load recovery configuration: {error}"))

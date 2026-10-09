@@ -382,6 +382,10 @@ fn verify_canonical_triggers(connection: &Connection) -> Result<(), ContextError
                 .map(|(name, sql)| ((*name).to_string(), "facts", (*sql).to_string())),
         );
     }
+    if schema_version >= crate::cluster_agent_identity::IDENTITY_SCHEMA_VERSION {
+        definitions.extend(crate::cluster_agent_identity::DESTINATION_IDENTITY_TRIGGERS.iter()
+            .map(|(name, sql)| ((*name).to_string(), "cluster_agent_creation_journal", (*sql).to_string())));
+    }
     let expected = definitions
         .into_iter()
         .map(|(name, table, sql)| (name, (table, normalize_sql(&sql))))

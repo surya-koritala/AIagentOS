@@ -873,6 +873,15 @@ pub enum Syscall {
         #[serde(default = "default_tunable_audit_limit")]
         limit: usize,
     },
+    GetClusterAgentIdentity {
+        agent_id: String,
+    },
+    ListClusterAgentIdentities {
+        #[serde(default)]
+        after_agent_id: Option<String>,
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
     /// Inspect bounded ownership claim/transfer/renew/release evidence.
     ListClusterAgentOwnershipAudit {
         #[serde(default)]
@@ -1372,6 +1381,10 @@ pub enum SyscallReply {
     AgentCreated {
         id: String,
     },
+    ReservedAgentCreated {
+        id: String,
+        receipt: Box<crate::cluster_agent_identity::DestinationCreationReceipt>,
+    },
     Agents {
         agents: Vec<AgentSummary>,
     },
@@ -1652,6 +1665,12 @@ pub enum SyscallReply {
     /// Stable page from the durable authority ownership directory.
     ClusterAgentOwnerships {
         ownerships: Vec<crate::cluster_control::ClusterAgentOwnership>,
+    },
+    ClusterAgentIdentity {
+        identity: Option<Box<crate::cluster_agent_identity::AgentIdentityRecord>>,
+    },
+    ClusterAgentIdentities {
+        identities: Vec<crate::cluster_agent_identity::AgentIdentityRecord>,
     },
     /// Durable ownership mutation audit entries.
     ClusterAgentOwnershipAudit {
@@ -2056,6 +2075,9 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::ListClusterAgentOwnershipAudit { .. } => {
             (AccessLevel::System, "cluster.ownership.audit", None)
+        }
+        Syscall::GetClusterAgentIdentity { .. } | Syscall::ListClusterAgentIdentities { .. } => {
+            (AccessLevel::ReadOnly, "cluster.agent_identity.read", None)
         }
         Syscall::InstallAgentMutationFence { .. } => (
             AccessLevel::System,
@@ -2636,6 +2658,10 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
 }
 
 fn enforce_unfenced_agent_mutation(kernel: &AgentKernelImpl, agent_id: &str) -> Result<(), String> {
+    let id = uuid::Uuid::parse_str(agent_id).map_err(|_| "invalid agent identity".to_owned())?;
+    if !crate::cluster_agent_identity::destination_agent_is_published(&kernel.context_manager, id).map_err(|error| error.to_string())? {
+        return Err("immutable agent identity is not published".into());
+    }
     match kernel.cluster_control.agent_mutation_fence(agent_id) {
         Ok(Some(_)) => Err("agent mutation requires an exact destination ownership fence".into()),
         Ok(None) => Ok(()),
@@ -2686,6 +2712,8 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::GetClusterAgentOwnership { .. }
             | Syscall::ListClusterAgentOwnerships { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }
+            | Syscall::GetClusterAgentIdentity { .. }
+            | Syscall::ListClusterAgentIdentities { .. }
             | Syscall::InstallAgentMutationFence { .. }
             | Syscall::RetireAgentMutationFence { .. }
             | Syscall::GetAgentMutationFence { .. }
@@ -3601,20 +3629,15 @@ async fn dispatch_scoped_inner_with_fence(
                     .into_iter()
                     .collect()
             });
-            let agents = kernel
-                .agent_manager
-                .list_agents(None)
-                .into_iter()
-                .filter(|a| match &ids {
-                    Some(set) => set.contains(&a.id),
-                    None => true,
-                })
-                .map(|a| AgentSummary {
-                    id: a.id.to_string(),
-                    name: a.name,
-                    state: format!("{:?}", a.state),
-                })
-                .collect();
+            let mut agents = Vec::new();
+            for agent in kernel.agent_manager.list_agents(None) {
+                if ids.as_ref().is_some_and(|ids| !ids.contains(&agent.id)) { continue; }
+                match crate::cluster_agent_identity::destination_agent_is_published(&kernel.context_manager, agent.id) {
+                    Ok(true) => agents.push(AgentSummary { id: agent.id.to_string(), name: agent.name, state: format!("{:?}", agent.state) }),
+                    Ok(false) => {},
+                    Err(error) => return SyscallReply::Error { message: error.to_string() },
+                }
+            }
             SyscallReply::Agents { agents }
         }
         Syscall::PauseAgent { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
@@ -5482,6 +5505,47 @@ async fn dispatch_scoped_inner_with_fence(
                         message: error.to_string(),
                     },
                 }
+            }
+        }
+        Syscall::GetClusterAgentIdentity { agent_id } => {
+            if !crate::cluster_agent_identity::canonical_uuid(&agent_id) {
+                return SyscallReply::TypedError { code: WireErrorCode::InvalidArgument,
+                    message: "immutable agent identity requires a canonical UUID".into(), retryable: false };
+            }
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(Some(authority)) => authority,
+                Ok(None) => return principal_proof_error(crate::cluster_principal::PrincipalProofError::Missing),
+                Err(error) => return authority_io_error(error),
+            };
+            match authority.linearizable_view().await {
+                Ok(view) => {
+                    let identity = view.agent_identities.get(&agent_id).filter(|identity| {
+                        tenant.is_none_or(|tenant| identity.reservation.scope == crate::cluster_agent_identity::AgentIdentityScope::Tenant { tenant_id: tenant.to_owned() })
+                    }).cloned().map(Box::new);
+                    SyscallReply::ClusterAgentIdentity { identity }
+                }
+                Err(error) => authority_io_error(error),
+            }
+        }
+        Syscall::ListClusterAgentIdentities { after_agent_id, limit } => {
+            if after_agent_id.as_deref().is_some_and(|id| !crate::cluster_agent_identity::canonical_uuid(id)) {
+                return SyscallReply::TypedError { code: WireErrorCode::InvalidArgument,
+                    message: "identity page cursor requires a canonical UUID".into(), retryable: false };
+            }
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(Some(authority)) => authority,
+                Ok(None) => return principal_proof_error(crate::cluster_principal::PrincipalProofError::Missing),
+                Err(error) => return authority_io_error(error),
+            };
+            match authority.linearizable_view().await {
+                Ok(view) => {
+                    let identities = view.agent_identities.into_values().filter(|identity| {
+                        after_agent_id.as_deref().is_none_or(|cursor| identity.reservation.agent_id.as_str() > cursor)
+                            && tenant.is_none_or(|tenant| identity.reservation.scope == crate::cluster_agent_identity::AgentIdentityScope::Tenant { tenant_id: tenant.to_owned() })
+                    }).take(limit.clamp(1, 1000)).collect();
+                    SyscallReply::ClusterAgentIdentities { identities }
+                }
+                Err(error) => authority_io_error(error),
             }
         }
         Syscall::ListClusterAgentOwnershipAudit { agent_id, limit } => {
@@ -7447,6 +7511,8 @@ impl SyscallServer {
                                 | Syscall::GetClusterAgentOwnership { .. }
                                 | Syscall::ListClusterAgentOwnerships { .. }
                                 | Syscall::ListClusterAgentOwnershipAudit { .. }
+                                | Syscall::GetClusterAgentIdentity { .. }
+                                | Syscall::ListClusterAgentIdentities { .. }
                         ) =>
                 {
                     SyscallReply::Error {
@@ -11514,6 +11580,8 @@ memory = ["remember this"]
         let unscoped_calls = unscoped_calls
             .into_iter()
             .chain([
+                (Syscall::GetClusterAgentIdentity { agent_id: uuid::Uuid::new_v4().to_string() }, AccessLevel::ReadOnly),
+                (Syscall::ListClusterAgentIdentities { after_agent_id: None, limit: 10 }, AccessLevel::ReadOnly),
                 (Syscall::GetAuthorityPrincipalRegistry, AccessLevel::System),
                 (
                     Syscall::SubmitSignedAuthorityCommand {
@@ -11584,7 +11652,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 133);
+        assert_eq!(calls.len(), 135);
         assert_eq!(fixture_tags, schema_tags);
     }
 

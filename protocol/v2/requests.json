@@ -636,6 +636,15 @@
   },
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "get_cluster_agent_identity"
+  },
+  {
+    "after_agent_id": null,
+    "limit": 1,
+    "op": "list_cluster_agent_identities"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
     "authority_generation": 1,
     "authority_term": 1,
     "cluster_id": "fixture",

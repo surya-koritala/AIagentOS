@@ -2009,13 +2009,6 @@ impl SqliteContextManager {
                     OR (state IN ('created', 'published', 'deleted') AND created_row_sha256 IS NOT NULL AND receipt_json IS NOT NULL)
                     OR state = 'aborted')
             );
-            CREATE TRIGGER IF NOT EXISTS cluster_agent_creation_identity_immutable
-            BEFORE UPDATE OF agent_id, reservation_json, reservation_sha256,
-                creation_operation_id, installation_id, local_receipt_id ON cluster_agent_creation_journal
-            BEGIN SELECT RAISE(ABORT, 'immutable destination identity cannot be replaced'); END;
-            CREATE TRIGGER IF NOT EXISTS cluster_agent_creation_tombstone_retained
-            BEFORE DELETE ON cluster_agent_creation_journal
-            BEGIN SELECT RAISE(ABORT, 'destination identity tombstones must be retained'); END;
             CREATE TABLE IF NOT EXISTS cluster_node_control_audit (
                 generation INTEGER PRIMARY KEY,
                 previous_availability TEXT NOT NULL,
@@ -2488,6 +2481,9 @@ impl SqliteContextManager {
         }
         branching::init_schema(conn)?;
         fact_index::init_schema(conn)?;
+        for (_, trigger) in crate::cluster_agent_identity::DESTINATION_IDENTITY_TRIGGERS {
+            conn.execute_batch(trigger).map_err(|error| ContextError::StorageError(error.to_string()))?;
+        }
         crate::schema::complete_migration(conn, schema_version)?;
         transaction.commit().map_err(|error| {
             quota_error(format!(
@@ -5567,8 +5563,19 @@ impl SqliteContextManager {
                 "injected agent-registry save failure".into(),
             ));
         }
-        let conn = self.locked_conn();
-        conn.execute(
+        let mut conn = self.locked_conn();
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crate::schema::require_current_writer(&transaction)?;
+        let creation_digest = crate::cluster_agent_identity::creation_command_sha256(
+            &crate::syscall_server::Syscall::CreateAgent {
+                agent_id: Some(agent.id.to_string()), ownership_proof: None,
+                name: agent.name.clone(), task: agent.task.clone(), provider: agent.llm_provider.clone(),
+                profile: agent.permission_profile.clone(), priority: agent.priority,
+            },
+        ).map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crate::cluster_agent_identity::validate_creation_write(&transaction, agent, &creation_digest)?;
+        transaction.execute(
             "INSERT INTO agents
                 (id, session_id, tenant_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at, namespace_group)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -5595,6 +5602,11 @@ impl SqliteContextManager {
             ],
         )
         .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crate::cluster_agent_identity::crash_identity_after_step_for_test("destination_row_inserted");
+        crate::cluster_agent_identity::commit_agent_creation_evidence(&transaction, agent)?;
+        crate::cluster_agent_identity::crash_identity_after_step_for_test("unsigned_receipt_staged");
+        transaction.commit().map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crate::cluster_agent_identity::crash_identity_after_step_for_test("destination_creation_committed");
         Ok(())
     }
 

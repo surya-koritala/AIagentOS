@@ -8,9 +8,16 @@ on:
       - 'crates/kernel/src/cluster_*.rs'
       - 'crates/kernel/src/context.rs'
       - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/accounting_integrity.rs'
+      - 'crates/kernel/src/data_inventory.rs'
+      - 'crates/kernel/src/context/clone_store.rs'
+      - 'crates/kernel/src/cloning.rs'
       - 'crates/kernel/src/syscall_server.rs'
       - 'crates/kernel/src/lib.rs'
       - 'crates/sdk/**'
+      - 'protocol/**'
+      - 'scripts/verify_wire_fixtures.py'
+      - 'scripts/tests/test_verify_wire_fixtures.py'
   workflow_dispatch:
     inputs:
       stage:
@@ -26,9 +33,16 @@ on:
       - 'crates/kernel/src/cluster_*.rs'
       - 'crates/kernel/src/context.rs'
       - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/accounting_integrity.rs'
+      - 'crates/kernel/src/data_inventory.rs'
+      - 'crates/kernel/src/context/clone_store.rs'
+      - 'crates/kernel/src/cloning.rs'
       - 'crates/kernel/src/syscall_server.rs'
       - 'crates/kernel/src/lib.rs'
       - 'crates/sdk/**'
+      - 'protocol/**'
+      - 'scripts/verify_wire_fixtures.py'
+      - 'scripts/tests/test_verify_wire_fixtures.py'
 
 permissions:
   contents: read
@@ -109,6 +123,10 @@ jobs:
           cargo test -p kernel immutable_identity --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/identity.txt
           cargo test -p kernel cluster_consensus::tests --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/consensus.txt
           cargo test -p kernel data_inventory --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/inventory.txt
+          cargo test -p kernel accounting_integrity::tests --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/integrity.txt
+          cargo test -p kernel authorization_policy_classifies_every_syscall_and_agent_resource --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/authorization.txt
+          cargo test -p kernel wire_contract --lib -- --nocapture 2>&1 | tee target/qualification/agent-identity/wire-rust.txt
+          python3 -m unittest discover -s scripts/tests -p test_verify_wire_fixtures.py 2>&1 | tee target/qualification/agent-identity/wire-python.txt
       - name: Strict lint
         run: cargo clippy -p kernel -p agent-sdk --all-targets -- -D warnings
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

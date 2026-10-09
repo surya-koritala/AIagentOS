@@ -412,7 +412,7 @@ mod tests {
             };
             kernel
                 .context_manager
-                .reserve_clone(&record, parent, "unfinished fixture", None, &security, 0)
+                .reserve_clone(&record, parent, "unfinished fixture", None, &security, 0, &std::collections::BTreeSet::new())
                 .unwrap();
             (parent, child)
         };
@@ -820,6 +820,7 @@ impl AgentKernelImpl {
             group.as_deref(),
             &security,
             self.operator_control.max_agents(),
+            &dropped,
         )?;
         let mut rollback = AbortClone {
             kernel: self,

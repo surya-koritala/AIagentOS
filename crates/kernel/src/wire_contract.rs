@@ -23,6 +23,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "authorized_cluster_membership",
     "cluster_principal_auth",
     crate::cluster_operation_receipts::FEATURE,
+    crate::cluster_agent_identity::FEATURE,
     "bounded_certificate_rollout",
     "cluster_ownership_leases",
     "backup_retention",
@@ -828,6 +829,14 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::optional("agent_id", N), Field::optional("limit", I)],
     },
     Variant {
+        tag: "get_cluster_agent_identity",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
+        tag: "list_cluster_agent_identities",
+        fields: &[Field::optional("after_agent_id", N), Field::optional("limit", I)],
+    },
+    Variant {
         tag: "install_agent_mutation_fence",
         fields: &[
             Field::optional("operation_id", S),
@@ -1008,6 +1017,8 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "get_cluster_agent_ownership"
                         | "list_cluster_agent_ownerships"
                         | "list_cluster_agent_ownership_audit"
+                        | "get_cluster_agent_identity"
+                        | "list_cluster_agent_identities"
                         | "install_agent_mutation_fence"
                         | "retire_agent_mutation_fence"
                         | "get_agent_mutation_fence"
@@ -1177,6 +1188,18 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "agent_created",
         fields: &[Field::required("id", S)],
+    },
+    Variant {
+        tag: "reserved_agent_created",
+        fields: &[Field::required("id", S), Field::required("receipt", O)],
+    },
+    Variant {
+        tag: "cluster_agent_identity",
+        fields: &[Field::required("identity", JsonKind::ObjectOrNull)],
+    },
+    Variant {
+        tag: "cluster_agent_identities",
+        fields: &[Field::required("identities", A)],
     },
     Variant {
         tag: "agent_cloned",
@@ -1941,7 +1964,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 133);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 135);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

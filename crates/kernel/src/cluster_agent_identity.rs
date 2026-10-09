@@ -13,6 +13,18 @@ use crate::cluster_principal::{AuthorityPrincipal, AuthorityPrincipalKind, Princ
 
 pub const FEATURE: &str = "quorum-agent-identity-v1";
 pub const IDENTITY_VERSION: u16 = 1;
+pub(crate) const IDENTITY_SCHEMA_VERSION: i64 = 16;
+pub(crate) const DESTINATION_IDENTITY_TRIGGERS: &[(&str, &str)] = &[
+    ("cluster_agent_creation_identity_immutable",
+        "CREATE TRIGGER IF NOT EXISTS cluster_agent_creation_identity_immutable
+         BEFORE UPDATE OF agent_id, reservation_json, reservation_sha256,
+             creation_operation_id, installation_id, local_receipt_id ON cluster_agent_creation_journal
+         BEGIN SELECT RAISE(ABORT, 'immutable destination identity cannot be replaced'); END;"),
+    ("cluster_agent_creation_tombstone_retained",
+        "CREATE TRIGGER IF NOT EXISTS cluster_agent_creation_tombstone_retained
+         BEFORE DELETE ON cluster_agent_creation_journal
+         BEGIN SELECT RAISE(ABORT, 'destination identity tombstones must be retained'); END;"),
+];
 pub const MAX_AGENT_IDENTITIES: usize = 100_000;
 pub const MAX_IDENTITY_REVISION: u64 = i64::MAX as u64;
 const RECEIPT_DOMAIN: &[u8] = b"AIagentOS exact destination creation v1\0";
@@ -150,6 +162,17 @@ impl DestinationCreationReceipt {
         &self,
         reservation: &AgentIdentityReservation,
     ) -> Result<(), AgentIdentityError> {
+        self.validate_binding(reservation)?;
+        if !canonical_hex(&self.signature_hex, 64) {
+            return Err(AgentIdentityError::InvalidReceiptSignature);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_binding(
+        &self,
+        reservation: &AgentIdentityReservation,
+    ) -> Result<(), AgentIdentityError> {
         reservation.validate()?;
         if self.version != IDENTITY_VERSION
             || self.cluster_id != reservation.cluster_id
@@ -165,13 +188,12 @@ impl DestinationCreationReceipt {
             || !canonical_uuid(&self.local_receipt_id)
             || self.created_agent_id != reservation.agent_id
             || !canonical_hex(&self.created_row_sha256, 32)
-            || self.schema_version < 16
-            || self.min_reader_schema_version < 16
+            || self.schema_version < IDENTITY_SCHEMA_VERSION
+            || self.min_reader_schema_version < IDENTITY_SCHEMA_VERSION
             || self.min_reader_schema_version > self.schema_version
             || self.protocol_version < 2
             || self.created_at < reservation.prepared_at
             || self.created_at >= reservation.initial_lease_expires_at
-            || !canonical_hex(&self.signature_hex, 64)
         {
             return Err(AgentIdentityError::ReceiptMismatch);
         }
@@ -238,6 +260,10 @@ impl AgentIdentityRecord {
             AgentIdentityState::Aborted | AgentIdentityState::Deleted
         );
         if !legal
+            || matches!(self.state, AgentIdentityState::Prepared | AgentIdentityState::Created | AgentIdentityState::Published)
+                && self.changed_by_principal_id != self.reservation.creator_principal_id
+            || self.state == AgentIdentityState::Prepared
+                && self.last_operation_id != self.reservation.creation_operation_id
             || tombstone != self.tombstone_reason.is_some()
             || self.tombstone_reason.as_ref().is_some_and(|reason| {
                 reason.is_empty() || reason.len() > 1024 || reason.chars().any(char::is_control)
@@ -378,9 +404,7 @@ pub fn creation_command_sha256(
         {
             let drops = crate::cloning::clone_attenuation(drop_capabilities)
                 .map_err(|_| AgentIdentityError::InvalidIdentity)?;
-            serde_json::json!({ "clone": { "agent_id": agent_id,
-                    "child_agent_id": child_agent_id, "name": name,
-                    "drop_capabilities": drops } })
+                return clone_creation_sha256(agent_id, child_agent_id, name, &drops);
         }
         _ => return Err(AgentIdentityError::InvalidIdentity),
     };
@@ -388,3 +412,27 @@ pub fn creation_command_sha256(
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|_| AgentIdentityError::InvalidIdentity)
 }
+
+pub(crate) fn clone_creation_sha256(
+    parent: &str,
+    child: &str,
+    name: &str,
+    drops: &std::collections::BTreeSet<u64>,
+) -> Result<String, AgentIdentityError> {
+    let value = serde_json::json!({ "clone": { "agent_id": parent,
+        "child_agent_id": child, "name": name, "drop_capabilities": drops } });
+    serde_json::to_vec(&value).map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| AgentIdentityError::InvalidIdentity)
+}
+
+#[path = "cluster_agent_identity_store.rs"]
+mod destination_store;
+
+pub use destination_store::{
+    begin_destination_creation, destination_agent_is_published, destination_creation_receipt,
+    publish_destination_identity, DestinationCreationAdmission,
+};
+pub(crate) use destination_store::{
+    commit_agent_creation_evidence, retain_identity_tombstones, validate_creation_write,
+    validate_destination_identity_store, crash_identity_after_step_for_test,
+};

@@ -449,6 +449,7 @@ pub(crate) fn verify(connection: &Connection) -> Result<(), ContextError> {
         ));
     }
     crate::accounting_integrity::verify(connection)?;
+    crate::cluster_agent_identity::validate_destination_identity_store(connection)?;
     Ok(())
 }
 

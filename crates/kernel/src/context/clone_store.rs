@@ -35,11 +35,17 @@ impl SqliteContextManager {
         group: Option<&str>,
         security: &CloneSecurity,
         max_agents: u64,
+        dropped: &BTreeSet<u64>,
     ) -> Result<(), ContextError> {
         let mut conn = self.locked_conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| failed(error.to_string()))?;
+        crate::schema::require_current_writer(&tx)?;
+        let creation_digest = crate::cluster_agent_identity::clone_creation_sha256(
+            &parent.to_string(), &record.id.to_string(), &record.name, dropped,
+        ).map_err(|error| failed(error.to_string()))?;
+        crate::cluster_agent_identity::validate_creation_write(&tx, record, &creation_digest)?;
         let count: u64 = tx
             .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
             .map_err(|error| failed(error.to_string()))?;
@@ -122,6 +128,7 @@ impl SqliteContextManager {
             .map_err(|error| failed(error.to_string()))?;
         tx.execute("UPDATE agents SET status = ?1,sandbox_config_json = ?2,clone_pending = 0,clone_result_json = ?3 WHERE id = ?4",
             params![serde_json::to_string(&crate::AgentState::Running).map_err(|error|failed(error.to_string()))?,sandbox,serde_json::to_string(&result).map_err(|error|failed(error.to_string()))?,child.to_string()]).map_err(|error|failed(error.to_string()))?;
+        crate::cluster_agent_identity::commit_agent_creation_evidence(&tx, record)?;
         tx.commit().map_err(|error| failed(error.to_string()))?;
         Ok(snapshot)
     }

@@ -44,6 +44,10 @@ use tokio::net::ToSocketAddrs;
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::auth::{ApiKeyDescriptor, IssuedApiKey, Role, Tenant, User};
 pub use kernel::cloning::CloneResult;
+pub use kernel::cluster_agent_identity::{
+    AgentIdentityRecord, AgentIdentityReservation, AgentIdentityScope, AgentIdentityState,
+    DestinationCreationReceipt,
+};
 pub use kernel::cluster_consensus::{AuthorityCommand, AuthorityResponse};
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
@@ -2517,6 +2521,59 @@ impl KernelClient {
         }
     }
 
+    /// Majority-read immutable identity, including incomplete reservations and
+    /// terminal tombstones. Tenant credentials receive only their own scope.
+    pub async fn cluster_agent_identity(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Option<AgentIdentityRecord>, SdkError> {
+        match self.call(Syscall::GetClusterAgentIdentity { agent_id: agent_id.into() }).await? {
+            SyscallReply::ClusterAgentIdentity { identity } => Ok(identity.map(|identity| *identity)),
+            other => Err(unexpected("ClusterAgentIdentity", &other)),
+        }
+    }
+
+    pub async fn cluster_agent_identities(
+        &mut self,
+        after_agent_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<AgentIdentityRecord>, SdkError> {
+        match self.call(Syscall::ListClusterAgentIdentities { after_agent_id, limit }).await? {
+            SyscallReply::ClusterAgentIdentities { identities } => Ok(identities),
+            other => Err(unexpected("ClusterAgentIdentities", &other)),
+        }
+    }
+
+    /// Commit one independently signed identity transition. The caller keeps
+    /// stable operation IDs and retains indeterminate outcomes for reconciliation.
+    pub async fn submit_agent_identity_transition_with_signer(
+        &mut self,
+        command: AuthorityCommand,
+        cluster_id: &str,
+        principal_id: &str,
+        principal_generation: u64,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, PrincipalProofError>,
+    ) -> Result<AgentIdentityRecord, SdkError> {
+        let expected_agent = match &command {
+            AuthorityCommand::PrepareAgentIdentity { agent_id, .. }
+            | AuthorityCommand::RecordAgentCreation { agent_id, .. }
+            | AuthorityCommand::PublishAgentIdentity { agent_id, .. }
+            | AuthorityCommand::AbortAgentIdentity { agent_id, .. }
+            | AuthorityCommand::DeleteAgentIdentity { agent_id, .. } => agent_id.clone(),
+            _ => return Err(SdkError::Configuration("a closed immutable identity transition is required".into())),
+        };
+        match self.submit_authority_command_with_signer(command, cluster_id, principal_id, principal_generation, sign).await? {
+            AuthorityResponse::AgentIdentityUpdated { identity, .. } => {
+                identity.validate().map_err(|error| SdkError::Configuration(error.to_string()))?;
+                if identity.reservation.agent_id != expected_agent || identity.reservation.cluster_id != cluster_id {
+                    return Err(SdkError::Configuration("authority returned a foreign immutable identity".into()));
+                }
+                Ok(identity)
+            }
+            other => Err(SdkError::Configuration(format!("immutable identity transition rejected: {other:?}"))),
+        }
+    }
+
     pub async fn cluster_membership_audit(
         &mut self,
         limit: usize,
@@ -3981,6 +4038,8 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::GetClusterAgentOwnership { .. }
             | Syscall::ListClusterAgentOwnerships { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }
+            | Syscall::GetClusterAgentIdentity { .. }
+            | Syscall::ListClusterAgentIdentities { .. }
             | Syscall::GetAgentMutationFence { .. }
             | Syscall::ListAgentMutationFenceAudit { .. }
             | Syscall::Metrics

@@ -450,9 +450,12 @@ async fn run() {
             eprintln!("agentctl cluster: {error}");
             std::process::exit(2);
         });
-        if let Some(address) = address_override { profile.address = address; }
+        if let Some(address) = address_override {
+            profile.address = address;
+        }
         let record = Box::pin(agent_cli::cluster::run(command, profile, token.as_deref()))
-            .await.unwrap_or_else(|error| fail(error));
+            .await
+            .unwrap_or_else(|error| fail(error));
         print_json(&record, "cluster operation record");
         return;
     }

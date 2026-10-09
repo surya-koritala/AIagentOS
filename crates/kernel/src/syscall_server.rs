@@ -3152,7 +3152,10 @@ async fn dispatch_scoped_inner_with_fence(
         .map(|principal| principal.user_id.as_str())
         .unwrap_or("system");
     let receipt = match crate::cluster_operation_receipts::prepare(
-        &kernel.context_manager, &kernel.cluster_control.identity().node_id, &call, principal,
+        &kernel.context_manager,
+        &kernel.cluster_control.identity().node_id,
+        &call,
+        principal,
     ) {
         Ok(crate::cluster_operation_receipts::Admission::Legacy) => None,
         Ok(crate::cluster_operation_receipts::Admission::Prepared(receipt)) => Some(receipt),
@@ -6014,7 +6017,9 @@ async fn dispatch_scoped_inner_with_fence(
         }
     }}.await;
     if let Some(receipt) = receipt {
-        if let Err(error) = crate::cluster_operation_receipts::complete(&kernel.context_manager, receipt, &reply) {
+        if let Err(error) =
+            crate::cluster_operation_receipts::complete(&kernel.context_manager, receipt, &reply)
+        {
             return error;
         }
     }

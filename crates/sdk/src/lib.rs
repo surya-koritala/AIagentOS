@@ -2145,12 +2145,21 @@ impl KernelClient {
 
     /// Replace availability with a caller-retained durable operation UUID.
     pub async fn set_node_availability_with_operation_id(
-        &mut self, operation_id: impl Into<String>, availability: NodeAvailability,
-        expected_generation: u64, reason: impl Into<String>,
+        &mut self,
+        operation_id: impl Into<String>,
+        availability: NodeAvailability,
+        expected_generation: u64,
+        reason: impl Into<String>,
     ) -> Result<NodeControlStatus, SdkError> {
-        match self.call(Syscall::SetNodeAvailability {
-            operation_id: Some(operation_id.into()), availability, expected_generation, reason: reason.into(),
-        }).await? {
+        match self
+            .call(Syscall::SetNodeAvailability {
+                operation_id: Some(operation_id.into()),
+                availability,
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
             SyscallReply::NodeControlUpdated { control } => Ok(control),
             other => Err(unexpected("NodeControlUpdated", &other)),
         }
@@ -2158,12 +2167,21 @@ impl KernelClient {
 
     /// Replace placement metadata with a caller-retained durable operation UUID.
     pub async fn set_node_profile_with_operation_id(
-        &mut self, operation_id: impl Into<String>, profile: NodeProfile,
-        expected_generation: u64, reason: impl Into<String>,
+        &mut self,
+        operation_id: impl Into<String>,
+        profile: NodeProfile,
+        expected_generation: u64,
+        reason: impl Into<String>,
     ) -> Result<NodeControlStatus, SdkError> {
-        match self.call(Syscall::SetNodeProfile {
-            operation_id: Some(operation_id.into()), profile, expected_generation, reason: reason.into(),
-        }).await? {
+        match self
+            .call(Syscall::SetNodeProfile {
+                operation_id: Some(operation_id.into()),
+                profile,
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
             SyscallReply::NodeControlUpdated { control } => Ok(control),
             other => Err(unexpected("NodeControlUpdated", &other)),
         }
@@ -2742,15 +2760,26 @@ impl KernelClient {
 
     /// Install an exact destination proof with a durable local operation UUID.
     pub async fn install_agent_mutation_fence_with_operation_id(
-        &mut self, operation_id: impl Into<String>, agent_id: impl Into<String>,
-        proof: AgentMutationFenceProof, reason: impl Into<String>,
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        reason: impl Into<String>,
     ) -> Result<AgentMutationFence, SdkError> {
-        match self.call(Syscall::InstallAgentMutationFence {
-            operation_id: Some(operation_id.into()), agent_id: agent_id.into(),
-            cluster_id: proof.cluster_id, owner_node_id: proof.owner_node_id,
-            authority_term: proof.authority_term, authority_generation: proof.authority_generation,
-            fencing_token: proof.fencing_token, proof_expires_at: proof.proof_expires_at, reason: reason.into(),
-        }).await? {
+        match self
+            .call(Syscall::InstallAgentMutationFence {
+                operation_id: Some(operation_id.into()),
+                agent_id: agent_id.into(),
+                cluster_id: proof.cluster_id,
+                owner_node_id: proof.owner_node_id,
+                authority_term: proof.authority_term,
+                authority_generation: proof.authority_generation,
+                fencing_token: proof.fencing_token,
+                proof_expires_at: proof.proof_expires_at,
+                reason: reason.into(),
+            })
+            .await?
+        {
             SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
             other => Err(unexpected("AgentMutationFence", &other)),
         }
@@ -2758,15 +2787,26 @@ impl KernelClient {
 
     /// Retire an exact destination proof with a durable local operation UUID.
     pub async fn retire_agent_mutation_fence_with_operation_id(
-        &mut self, operation_id: impl Into<String>, agent_id: impl Into<String>,
-        proof: AgentMutationFenceProof, reason: impl Into<String>,
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        reason: impl Into<String>,
     ) -> Result<AgentMutationFence, SdkError> {
-        match self.call(Syscall::RetireAgentMutationFence {
-            operation_id: Some(operation_id.into()), agent_id: agent_id.into(),
-            cluster_id: proof.cluster_id, owner_node_id: proof.owner_node_id,
-            authority_term: proof.authority_term, authority_generation: proof.authority_generation,
-            fencing_token: proof.fencing_token, proof_expires_at: proof.proof_expires_at, reason: reason.into(),
-        }).await? {
+        match self
+            .call(Syscall::RetireAgentMutationFence {
+                operation_id: Some(operation_id.into()),
+                agent_id: agent_id.into(),
+                cluster_id: proof.cluster_id,
+                owner_node_id: proof.owner_node_id,
+                authority_term: proof.authority_term,
+                authority_generation: proof.authority_generation,
+                fencing_token: proof.fencing_token,
+                proof_expires_at: proof.proof_expires_at,
+                reason: reason.into(),
+            })
+            .await?
+        {
             SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
             other => Err(unexpected("AgentMutationFence", &other)),
         }

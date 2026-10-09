@@ -779,16 +779,41 @@ fn canonical_client_contract_is_explicit_and_honest() {
     }
     let cluster_cli = read_workspace_file("crates/cli/src/cluster.rs");
     for command in [
-        "node-availability", "node-profile", "join", "members", "member-state",
-        "cert-prepare", "cert-activate", "cert-abort", "cert-finalize", "ownerships",
-        "fence-install", "fence-retire", "fence-show", "reconfigure-voters",
-        "reconfigure-trust", "reconfiguration-status", "drain-node", "upgrade-node",
-        "remove-node", "migrate-agent", "--operation-id", "--authority", "--node",
+        "node-availability",
+        "node-profile",
+        "join",
+        "members",
+        "member-state",
+        "cert-prepare",
+        "cert-activate",
+        "cert-abort",
+        "cert-finalize",
+        "ownerships",
+        "fence-install",
+        "fence-retire",
+        "fence-show",
+        "reconfigure-voters",
+        "reconfigure-trust",
+        "reconfiguration-status",
+        "drain-node",
+        "upgrade-node",
+        "remove-node",
+        "migrate-agent",
+        "--operation-id",
+        "--authority",
+        "--node",
     ] {
-        assert!(cluster_cli.contains(command), "cluster operator help lost command {command:?}");
+        assert!(
+            cluster_cli.contains(command),
+            "cluster operator help lost command {command:?}"
+        );
     }
-    assert!(cluster_cli.contains("#306") && cluster_cli.contains("#310") && cluster_cli.contains("#314"),
-        "missing cluster backends must remain explicitly tracked");
+    assert!(
+        cluster_cli.contains("#306")
+            && cluster_cli.contains("#310")
+            && cluster_cli.contains("#314"),
+        "missing cluster backends must remain explicitly tracked"
+    );
     assert!(
         agentctl.contains("policy::explain_file")
             && agentctl.contains(".gate_stats()")

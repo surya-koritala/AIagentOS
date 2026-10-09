@@ -63,6 +63,7 @@ jobs:
         run: |
           cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture
           cargo test -p agent-sdk --test quorum_capacity --locked -- --nocapture
+          cargo test -p agent-sdk --test cluster --locked -- --nocapture
       - name: Reject old readers before signed capacity replay state can be lost
         run: cargo test -p kernel --lib --locked capacity_cursor_requires_current_reader -- --nocapture
       - name: Preserve public wire contracts

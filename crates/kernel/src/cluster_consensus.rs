@@ -2538,8 +2538,12 @@ fn apply_authority_command(
     if let Some(control) = state.control_plane.as_ref() {
         // Membership tombstones/epochs remain in signed history. Only obsolete
         // advisory samples are reclaimed; old epochs still fail admission.
-        state.capacities.retain(|node_id, capacity| control.members.get(node_id)
-            .is_some_and(|member| member.state == ClusterMemberState::Active && member.generation == capacity.report.member_generation));
+        state.capacities.retain(|node_id, capacity| {
+            control.members.get(node_id).is_some_and(|member| {
+                member.state == ClusterMemberState::Active
+                    && member.generation == capacity.report.member_generation
+            })
+        });
     }
     response
 }
@@ -4523,12 +4527,21 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
                     ));
                 }
                 for (node_id, old) in &current.authority.capacities {
-                    let retired = incoming.members.get(node_id).is_some_and(|member| member.state != ClusterMemberState::Active || member.generation != old.report.member_generation);
+                    let retired = incoming.members.get(node_id).is_some_and(|member| {
+                        member.state != ClusterMemberState::Active
+                            || member.generation != old.report.member_generation
+                    });
                     let next = installed.authority.capacities.get(node_id);
-                    if !retired && next.is_none_or(|next| next.report.sequence < old.report.sequence
-                        || next.report.observed_at < old.report.observed_at
-                        || (next.report.sequence == old.report.sequence && next != old)) {
-                        return Err(read_io("snapshot regresses or omits an active capacity replay fence"));
+                    if !retired
+                        && next.is_none_or(|next| {
+                            next.report.sequence < old.report.sequence
+                                || next.report.observed_at < old.report.observed_at
+                                || (next.report.sequence == old.report.sequence && next != old)
+                        })
+                    {
+                        return Err(read_io(
+                            "snapshot regresses or omits an active capacity replay fence",
+                        ));
                     }
                 }
                 for receipt in installed.authority.receipts.values() {
@@ -4815,9 +4828,26 @@ mod tests {
                 }
             ));
             assert_eq!(state, unchanged);
-            let mut forged = report.clone(); forged.counters.turn_capacity += 1;
-            let response = super::apply_authority_command(&mut state, AuthorityCommand::ReportNodeCapacity { operation_id: Uuid::new_v4().to_string(), report: forged, proposed_at: observed_at }, log_id(1, index * 2 + 4));
-            assert!(matches!(response, AuthorityResponse::Rejected { reason: AuthorityRejection::CapacityReport(crate::cluster_capacity::CapacityRejection::Forged), .. }));
+            let mut forged = report.clone();
+            forged.counters.turn_capacity += 1;
+            let response = super::apply_authority_command(
+                &mut state,
+                AuthorityCommand::ReportNodeCapacity {
+                    operation_id: Uuid::new_v4().to_string(),
+                    report: forged,
+                    proposed_at: observed_at,
+                },
+                log_id(1, index * 2 + 4),
+            );
+            assert!(matches!(
+                response,
+                AuthorityResponse::Rejected {
+                    reason: AuthorityRejection::CapacityReport(
+                        crate::cluster_capacity::CapacityRejection::Forged
+                    ),
+                    ..
+                }
+            ));
             assert_eq!(state, unchanged);
             validate_authority_state(&state).unwrap();
         }
@@ -4856,63 +4886,238 @@ mod tests {
         let context = Arc::new(SqliteContextManager::new(&root.path().join("quorum.db")).unwrap());
         let (_, mut store) = open_cluster_raft_storage(context.clone()).unwrap();
         let (_, seed_public_key, seed_fingerprint) = test_identity();
-        let cluster_id = crate::cluster_principal::FIXTURE_CLUSTER_ID.to_owned(); let started = Utc::now();
-        let genesis = AuthorityGenesis { cluster_id: cluster_id.clone(), operator_principals: vec![crate::cluster_principal::fixture_operator()], members: vec![AuthorityGenesisMember {
-            node_id: Uuid::new_v4().to_string(), fingerprint: seed_fingerprint, public_key: seed_public_key,
-            tls_server_certificate_fingerprint: None, endpoint: "127.0.0.1:7000".into(), server_version: "capacity-fixture".into(), min_protocol_version: 1, protocol_version: 2,
-        }] };
+        let cluster_id = crate::cluster_principal::FIXTURE_CLUSTER_ID.to_owned();
+        let started = Utc::now();
+        let genesis = AuthorityGenesis {
+            cluster_id: cluster_id.clone(),
+            operator_principals: vec![crate::cluster_principal::fixture_operator()],
+            members: vec![AuthorityGenesisMember {
+                node_id: Uuid::new_v4().to_string(),
+                fingerprint: seed_fingerprint,
+                public_key: seed_public_key,
+                tls_server_certificate_fingerprint: None,
+                endpoint: "127.0.0.1:7000".into(),
+                server_version: "capacity-fixture".into(),
+                min_protocol_version: 1,
+                protocol_version: 2,
+            }],
+        };
         let mut index = 1;
-        store.apply([normal_entry(log_id(1, index), AuthorityCommand::Initialize { operation_id: cluster_id.clone(), genesis: genesis.clone(), proposed_at: started })]).await.unwrap();
+        store
+            .apply([normal_entry(
+                log_id(1, index),
+                AuthorityCommand::Initialize {
+                    operation_id: cluster_id.clone(),
+                    genesis: genesis.clone(),
+                    proposed_at: started,
+                },
+            )])
+            .await
+            .unwrap();
         let mut last_report = None;
         for identity_index in 0..34u64 {
-            let (key, public_key, fingerprint) = test_identity(); let node_id = Uuid::new_v4().to_string();
+            let (key, public_key, fingerprint) = test_identity();
+            let node_id = Uuid::new_v4().to_string();
             let observed = started + chrono::Duration::seconds(identity_index as i64 * 10 + 1);
             let challenge_hex = format!("{identity_index:064x}");
             index += 1;
-            store.apply([normal_entry(log_id(1, index), AuthorityCommand::IssueJoinChallenge { operation_id: Uuid::new_v4().to_string(), challenge_hex: challenge_hex.clone(), ttl_seconds: 60, proposed_at: observed })]).await.unwrap();
-            let registration = ClusterMemberRegistration { node_id: node_id.clone(), fingerprint: fingerprint.clone(), public_key: public_key.clone(), tls_server_certificate_fingerprint: None,
-                endpoint: format!("127.0.0.1:{}", 7100 + identity_index), server_version: "capacity-fixture".into(), min_protocol_version: 1, protocol_version: 2 };
-            let payload = membership_join_payload(&cluster_id, &challenge_hex, &registration).unwrap();
+            store
+                .apply([normal_entry(
+                    log_id(1, index),
+                    AuthorityCommand::IssueJoinChallenge {
+                        operation_id: Uuid::new_v4().to_string(),
+                        challenge_hex: challenge_hex.clone(),
+                        ttl_seconds: 60,
+                        proposed_at: observed,
+                    },
+                )])
+                .await
+                .unwrap();
+            let registration = ClusterMemberRegistration {
+                node_id: node_id.clone(),
+                fingerprint: fingerprint.clone(),
+                public_key: public_key.clone(),
+                tls_server_certificate_fingerprint: None,
+                endpoint: format!("127.0.0.1:{}", 7100 + identity_index),
+                server_version: "capacity-fixture".into(),
+                min_protocol_version: 1,
+                protocol_version: 2,
+            };
+            let payload =
+                membership_join_payload(&cluster_id, &challenge_hex, &registration).unwrap();
             index += 1;
-            let registered = store.apply([normal_entry(log_id(1, index), AuthorityCommand::RegisterMember { operation_id: Uuid::new_v4().to_string(), registration, challenge_hex, signature_hex: crate::cluster_control::hex_encode(key.sign(&payload).as_ref()), expected_generation: None,
-                authority_min_protocol_version: 1, authority_protocol_version: 2, actor: "fixture".into(), reason: "signed capacity churn admission".into(), proposed_at: observed })]).await.unwrap();
-            assert!(matches!(registered[0], AuthorityResponse::MemberUpdated { .. }));
+            let registered = store
+                .apply([normal_entry(
+                    log_id(1, index),
+                    AuthorityCommand::RegisterMember {
+                        operation_id: Uuid::new_v4().to_string(),
+                        registration,
+                        challenge_hex,
+                        signature_hex: crate::cluster_control::hex_encode(
+                            key.sign(&payload).as_ref(),
+                        ),
+                        expected_generation: None,
+                        authority_min_protocol_version: 1,
+                        authority_protocol_version: 2,
+                        actor: "fixture".into(),
+                        reason: "signed capacity churn admission".into(),
+                        proposed_at: observed,
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(matches!(
+                registered[0],
+                AuthorityResponse::MemberUpdated { .. }
+            ));
             let view = read_replicated_authority_view(&context).unwrap().unwrap();
             let observed = view.logical_time;
-            let mut report = crate::cluster_capacity::SignedNodeCapacity { version: 1, cluster_id: cluster_id.clone(), node_id: node_id.clone(), member_generation: 1,
-                control: crate::cluster_control::NodeControlStatus { identity: crate::cluster_control::NodeIdentity { node_id: node_id.clone(), fingerprint, public_key, created_at: started },
-                    availability: crate::cluster_control::NodeAvailability::Active, generation: 0, profile: Default::default(), reason: "signed capacity fixture".into(), updated_at: started },
-                observed_at: observed, sequence: identity_index + 1, counters: Default::default(), signature_hex: String::new() };
-            report.signature_hex = crate::cluster_control::hex_encode(key.sign(&report.payload().unwrap()).as_ref());
+            let mut report = crate::cluster_capacity::SignedNodeCapacity {
+                version: 1,
+                cluster_id: cluster_id.clone(),
+                node_id: node_id.clone(),
+                member_generation: 1,
+                control: crate::cluster_control::NodeControlStatus {
+                    identity: crate::cluster_control::NodeIdentity {
+                        node_id: node_id.clone(),
+                        fingerprint,
+                        public_key,
+                        created_at: started,
+                    },
+                    availability: crate::cluster_control::NodeAvailability::Active,
+                    generation: 0,
+                    profile: Default::default(),
+                    reason: "signed capacity fixture".into(),
+                    updated_at: started,
+                },
+                observed_at: observed,
+                sequence: identity_index + 1,
+                counters: Default::default(),
+                signature_hex: String::new(),
+            };
+            report.signature_hex =
+                crate::cluster_control::hex_encode(key.sign(&report.payload().unwrap()).as_ref());
             index += 1;
-            let admitted = store.apply([normal_entry(log_id(1, index), AuthorityCommand::ReportNodeCapacity { operation_id: Uuid::new_v4().to_string(), report: report.clone(), proposed_at: observed })]).await.unwrap();
-            assert!(matches!(admitted[0], AuthorityResponse::NodeCapacityReported { .. }), "{admitted:?}");
+            let admitted = store
+                .apply([normal_entry(
+                    log_id(1, index),
+                    AuthorityCommand::ReportNodeCapacity {
+                        operation_id: Uuid::new_v4().to_string(),
+                        report: report.clone(),
+                        proposed_at: observed,
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(
+                matches!(admitted[0], AuthorityResponse::NodeCapacityReported { .. }),
+                "{admitted:?}"
+            );
             assert_eq!(read_capacity_snapshot(&context).unwrap().reports.len(), 1);
-            if identity_index == 33 { last_report = Some(report); break; }
+            if identity_index == 33 {
+                last_report = Some(report);
+                break;
+            }
             index += 1;
-            let retired = store.apply([normal_entry(log_id(1, index), AuthorityCommand::SetMemberState { operation_id: Uuid::new_v4().to_string(), node_id: node_id.clone(), state: ClusterMemberState::Revoked,
-                expected_generation: 1, actor: "fixture".into(), reason: "verified retired capacity node".into(), proposed_at: observed })]).await.unwrap();
-            assert!(matches!(retired[0], AuthorityResponse::MemberUpdated { .. }));
+            let retired = store
+                .apply([normal_entry(
+                    log_id(1, index),
+                    AuthorityCommand::SetMemberState {
+                        operation_id: Uuid::new_v4().to_string(),
+                        node_id: node_id.clone(),
+                        state: ClusterMemberState::Revoked,
+                        expected_generation: 1,
+                        actor: "fixture".into(),
+                        reason: "verified retired capacity node".into(),
+                        proposed_at: observed,
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(matches!(
+                retired[0],
+                AuthorityResponse::MemberUpdated { .. }
+            ));
             assert!(read_capacity_snapshot(&context).unwrap().reports.is_empty());
             index += 1;
-            let denied = store.apply([normal_entry(log_id(1, index), AuthorityCommand::ReportNodeCapacity { operation_id: Uuid::new_v4().to_string(), report, proposed_at: observed })]).await.unwrap();
-            assert!(matches!(denied[0], AuthorityResponse::Rejected { reason: AuthorityRejection::CapacityReport(crate::cluster_capacity::CapacityRejection::Unenrolled), .. }));
+            let denied = store
+                .apply([normal_entry(
+                    log_id(1, index),
+                    AuthorityCommand::ReportNodeCapacity {
+                        operation_id: Uuid::new_v4().to_string(),
+                        report,
+                        proposed_at: observed,
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(matches!(
+                denied[0],
+                AuthorityResponse::Rejected {
+                    reason: AuthorityRejection::CapacityReport(
+                        crate::cluster_capacity::CapacityRejection::Unenrolled
+                    ),
+                    ..
+                }
+            ));
         }
         let view = read_replicated_authority_view(&context).unwrap().unwrap();
         assert_eq!(view.membership.members.len(), 35);
-        assert_eq!(view.membership.members.iter().filter(|member| member.state == ClusterMemberState::Active).count(), 2);
-        let mut builder = store.get_snapshot_builder().await; let snapshot = builder.build_snapshot().await.unwrap();
-        let destination = Arc::new(SqliteContextManager::new(&root.path().join("restored.db")).unwrap());
-        let (_, mut restored) = open_cluster_raft_storage_pinned(destination.clone(), &genesis).unwrap();
-        restored.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
-        assert_eq!(read_capacity_snapshot(&context).unwrap(), read_capacity_snapshot(&destination).unwrap());
-        drop(builder); drop(store); drop(context); drop(restored); drop(destination);
-        let destination = Arc::new(SqliteContextManager::new(&root.path().join("restored.db")).unwrap());
-        let (_, mut restored) = open_cluster_raft_storage_pinned(destination.clone(), &genesis).unwrap();
+        assert_eq!(
+            view.membership
+                .members
+                .iter()
+                .filter(|member| member.state == ClusterMemberState::Active)
+                .count(),
+            2
+        );
+        let mut builder = store.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let destination =
+            Arc::new(SqliteContextManager::new(&root.path().join("restored.db")).unwrap());
+        let (_, mut restored) =
+            open_cluster_raft_storage_pinned(destination.clone(), &genesis).unwrap();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_capacity_snapshot(&context).unwrap(),
+            read_capacity_snapshot(&destination).unwrap()
+        );
+        drop(builder);
+        drop(store);
+        drop(context);
+        drop(restored);
+        drop(destination);
+        let destination =
+            Arc::new(SqliteContextManager::new(&root.path().join("restored.db")).unwrap());
+        let (_, mut restored) =
+            open_cluster_raft_storage_pinned(destination.clone(), &genesis).unwrap();
         index += 1;
-        let denied = restored.apply([normal_entry(log_id(1, index), AuthorityCommand::ReportNodeCapacity { operation_id: Uuid::new_v4().to_string(), report: last_report.unwrap(), proposed_at: view.logical_time })]).await.unwrap();
-        assert!(matches!(denied[0], AuthorityResponse::Rejected { reason: AuthorityRejection::CapacityReport(crate::cluster_capacity::CapacityRejection::Replay), .. }));
-        drop(restored); drop(destination); root.close().unwrap();
+        let denied = restored
+            .apply([normal_entry(
+                log_id(1, index),
+                AuthorityCommand::ReportNodeCapacity {
+                    operation_id: Uuid::new_v4().to_string(),
+                    report: last_report.unwrap(),
+                    proposed_at: view.logical_time,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            denied[0],
+            AuthorityResponse::Rejected {
+                reason: AuthorityRejection::CapacityReport(
+                    crate::cluster_capacity::CapacityRejection::Replay
+                ),
+                ..
+            }
+        ));
+        drop(restored);
+        drop(destination);
+        root.close().unwrap();
     }
 
     fn normal_entry(

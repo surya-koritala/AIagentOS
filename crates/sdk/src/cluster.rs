@@ -215,18 +215,31 @@ struct MaintainedRoute {
 
 impl ClusterClient {
     /// Discover managed quorum ownership with an explicit independent signer.
-    pub async fn connect_discovered_with_signer(authority_addr: impl AsRef<str>, token: impl Into<String>, signer: crate::AuthoritySigner) -> Result<Self, SdkError> {
+    pub async fn connect_discovered_with_signer(
+        authority_addr: impl AsRef<str>,
+        token: impl Into<String>,
+        signer: crate::AuthoritySigner,
+    ) -> Result<Self, SdkError> {
         Self::connect_discovered_inner(authority_addr.as_ref(), token.into(), Some(signer)).await
     }
 
     /// Install a signer only after verifying the retained discovery domain.
     pub fn set_authority_signer(&mut self, signer: crate::AuthoritySigner) -> Result<(), SdkError> {
-        let authority = self.authority.as_mut().ok_or_else(|| SdkError::Configuration("principal signer requires an authority-discovered cluster".into()))?;
+        let authority = self.authority.as_mut().ok_or_else(|| {
+            SdkError::Configuration(
+                "principal signer requires an authority-discovered cluster".into(),
+            )
+        })?;
         if authority.cluster_id != signer.cluster_id {
-            return Err(SdkError::Configuration("retained cluster differs from caller-selected signing domain".into()));
+            return Err(SdkError::Configuration(
+                "retained cluster differs from caller-selected signing domain".into(),
+            ));
         }
         if authority.maintenance.is_some() {
-            return Err(SdkError::Configuration("install the principal signer before starting automatic ownership maintenance".into()));
+            return Err(SdkError::Configuration(
+                "install the principal signer before starting automatic ownership maintenance"
+                    .into(),
+            ));
         }
         authority.client.set_authority_signer(signer);
         Ok(())
@@ -465,12 +478,20 @@ impl ClusterClient {
         Self::connect_discovered_inner(authority_addr.as_ref(), token.into(), None).await
     }
 
-    async fn connect_discovered_inner(authority_addr: &str, token: String, signer: Option<crate::AuthoritySigner>) -> Result<Self, SdkError> {
+    async fn connect_discovered_inner(
+        authority_addr: &str,
+        token: String,
+        signer: Option<crate::AuthoritySigner>,
+    ) -> Result<Self, SdkError> {
         let mut authority = KernelClient::connect(authority_addr).await?;
         authority.authenticate(&token).await?;
         let snapshot = authority.cluster_membership().await?;
         if let Some(signer) = signer {
-            if snapshot.cluster_id != signer.cluster_id { return Err(SdkError::Configuration("discovered cluster differs from caller-selected signing domain".into())); }
+            if snapshot.cluster_id != signer.cluster_id {
+                return Err(SdkError::Configuration(
+                    "discovered cluster differs from caller-selected signing domain".into(),
+                ));
+            }
             authority.set_authority_signer(signer);
         }
         let addrs = active_member_endpoints(&snapshot)?;
@@ -513,12 +534,26 @@ impl ClusterClient {
         Ok(cluster)
     }
 
-    pub async fn connect_discovered_with_signer_and_maintenance(authority_addr: impl AsRef<str>, token: impl Into<String>, signer: crate::AuthoritySigner, maintenance: ClusterMaintenanceConfig) -> Result<Self, SdkError> {
+    pub async fn connect_discovered_with_signer_and_maintenance(
+        authority_addr: impl AsRef<str>,
+        token: impl Into<String>,
+        signer: crate::AuthoritySigner,
+        maintenance: ClusterMaintenanceConfig,
+    ) -> Result<Self, SdkError> {
         validate_maintenance_config(&maintenance)?;
-        let authority_address = authority_addr.as_ref().to_string(); let token = token.into();
-        let connector = MaintenanceConnector::Plaintext { authority_address: authority_address.clone(), token: token.clone() };
-        let mut cluster = Self::connect_discovered_with_signer(&authority_address, token, signer).await?;
-        cluster.authority.as_mut().expect("discovered authority").lease_ttl_seconds = maintenance.lease_ttl_seconds;
+        let authority_address = authority_addr.as_ref().to_string();
+        let token = token.into();
+        let connector = MaintenanceConnector::Plaintext {
+            authority_address: authority_address.clone(),
+            token: token.clone(),
+        };
+        let mut cluster =
+            Self::connect_discovered_with_signer(&authority_address, token, signer).await?;
+        cluster
+            .authority
+            .as_mut()
+            .expect("discovered authority")
+            .lease_ttl_seconds = maintenance.lease_ttl_seconds;
         cluster.start_automatic_maintenance(connector, maintenance)?;
         Ok(cluster)
     }
@@ -736,7 +771,10 @@ impl ClusterClient {
             .expect("automatic maintenance requires authority")
             .cluster_id
             .clone();
-        let signer = self.authority.as_ref().and_then(|authority| authority.client.authority_signer.clone());
+        let signer = self
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.client.authority_signer.clone());
         let task = tokio::spawn(automatic_maintenance_loop(
             connector,
             cluster_id,
@@ -1826,11 +1864,21 @@ async fn automatic_maintenance_loop(
             Ok(mut authority) => {
                 if let Some(signer) = signer.clone() {
                     match authority.cluster_membership().await {
-                        Ok(snapshot) if snapshot.cluster_id == signer.cluster_id && snapshot.cluster_id == cluster_id => authority.set_authority_signer(signer),
+                        Ok(snapshot)
+                            if snapshot.cluster_id == signer.cluster_id
+                                && snapshot.cluster_id == cluster_id =>
+                        {
+                            authority.set_authority_signer(signer)
+                        }
                         _ => {
-                            let mut current = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let mut current = status
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
                             current.failed_cycles = current.failed_cycles.saturating_add(1);
-                            current.last_error = Some("maintenance authority differs from caller-selected signing domain".into());
+                            current.last_error = Some(
+                                "maintenance authority differs from caller-selected signing domain"
+                                    .into(),
+                            );
                             continue;
                         }
                     }

@@ -616,8 +616,18 @@ pub struct AuthoritySigner {
 }
 
 impl AuthoritySigner {
-    pub fn new(cluster_id: String, principal_id: String, principal_generation: u64, sign: impl Fn(&[u8]) -> Result<Vec<u8>, PrincipalProofError> + Send + Sync + 'static) -> Self {
-        Self { cluster_id, principal_id, principal_generation, sign: std::sync::Arc::new(sign) }
+    pub fn new(
+        cluster_id: String,
+        principal_id: String,
+        principal_generation: u64,
+        sign: impl Fn(&[u8]) -> Result<Vec<u8>, PrincipalProofError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cluster_id,
+            principal_id,
+            principal_generation,
+            sign: std::sync::Arc::new(sign),
+        }
     }
 }
 
@@ -2644,11 +2654,27 @@ impl KernelClient {
         expected_fencing_token: Option<u64>,
         reason: impl Into<String>,
     ) -> Result<ClusterAgentOwnership, SdkError> {
-        let operation_id = operation_id.into(); let agent_id = agent_id.into(); let owner_node_id = owner_node_id.into(); let reason = reason.into();
+        let operation_id = operation_id.into();
+        let agent_id = agent_id.into();
+        let owner_node_id = owner_node_id.into();
+        let reason = reason.into();
         if let Some(signer) = self.authority_signer.clone() {
             let actor = self.authority_machine_actor().await?;
-            return self.signed_ownership(AuthorityCommand::ClaimOwnership { operation_id, agent_id, owner_node_id, ttl_seconds, expected_fencing_token,
-                actor, reason, proposed_at: chrono::Utc::now() }, signer).await;
+            return self
+                .signed_ownership(
+                    AuthorityCommand::ClaimOwnership {
+                        operation_id,
+                        agent_id,
+                        owner_node_id,
+                        ttl_seconds,
+                        expected_fencing_token,
+                        actor,
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    },
+                    signer,
+                )
+                .await;
         }
         match self
             .call(Syscall::ClaimClusterAgentOwnership {
@@ -2698,11 +2724,27 @@ impl KernelClient {
         ttl_seconds: u64,
         reason: impl Into<String>,
     ) -> Result<ClusterAgentOwnership, SdkError> {
-        let operation_id = operation_id.into(); let agent_id = agent_id.into(); let owner_node_id = owner_node_id.into(); let reason = reason.into();
+        let operation_id = operation_id.into();
+        let agent_id = agent_id.into();
+        let owner_node_id = owner_node_id.into();
+        let reason = reason.into();
         if let Some(signer) = self.authority_signer.clone() {
             let actor = self.authority_machine_actor().await?;
-            return self.signed_ownership(AuthorityCommand::RenewOwnership { operation_id, agent_id, owner_node_id, fencing_token, ttl_seconds,
-                actor, reason, proposed_at: chrono::Utc::now() }, signer).await;
+            return self
+                .signed_ownership(
+                    AuthorityCommand::RenewOwnership {
+                        operation_id,
+                        agent_id,
+                        owner_node_id,
+                        fencing_token,
+                        ttl_seconds,
+                        actor,
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    },
+                    signer,
+                )
+                .await;
         }
         match self
             .call(Syscall::RenewClusterAgentOwnership {
@@ -2748,11 +2790,26 @@ impl KernelClient {
         fencing_token: u64,
         reason: impl Into<String>,
     ) -> Result<ClusterAgentOwnership, SdkError> {
-        let operation_id = operation_id.into(); let agent_id = agent_id.into(); let owner_node_id = owner_node_id.into(); let reason = reason.into();
+        let operation_id = operation_id.into();
+        let agent_id = agent_id.into();
+        let owner_node_id = owner_node_id.into();
+        let reason = reason.into();
         if let Some(signer) = self.authority_signer.clone() {
             let actor = self.authority_machine_actor().await?;
-            return self.signed_ownership(AuthorityCommand::ReleaseOwnership { operation_id, agent_id, owner_node_id, fencing_token,
-                actor, reason, proposed_at: chrono::Utc::now() }, signer).await;
+            return self
+                .signed_ownership(
+                    AuthorityCommand::ReleaseOwnership {
+                        operation_id,
+                        agent_id,
+                        owner_node_id,
+                        fencing_token,
+                        actor,
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    },
+                    signer,
+                )
+                .await;
         }
         match self
             .call(Syscall::ReleaseClusterAgentOwnership {
@@ -2772,14 +2829,34 @@ impl KernelClient {
     }
 
     async fn authority_machine_actor(&mut self) -> Result<String, SdkError> {
-        self.node_info().await?.control.map(|control| format!("system-node:{}", control.identity.node_id))
-            .ok_or_else(|| SdkError::Configuration("authority connection has no durable node identity".into()))
+        self.node_info()
+            .await?
+            .control
+            .map(|control| format!("system-node:{}", control.identity.node_id))
+            .ok_or_else(|| {
+                SdkError::Configuration("authority connection has no durable node identity".into())
+            })
     }
 
-    async fn signed_ownership(&mut self, command: AuthorityCommand, signer: AuthoritySigner) -> Result<ClusterAgentOwnership, SdkError> {
-        match self.submit_authority_command_with_signer(command, &signer.cluster_id, &signer.principal_id, signer.principal_generation, |payload| (signer.sign)(payload)).await? {
+    async fn signed_ownership(
+        &mut self,
+        command: AuthorityCommand,
+        signer: AuthoritySigner,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .submit_authority_command_with_signer(
+                command,
+                &signer.cluster_id,
+                &signer.principal_id,
+                signer.principal_generation,
+                |payload| (signer.sign)(payload),
+            )
+            .await?
+        {
             AuthorityResponse::OwnershipUpdated { ownership, .. } => Ok(ownership),
-            _ => Err(SdkError::Configuration("signed ownership returned a non-ownership response".into())),
+            _ => Err(SdkError::Configuration(
+                "signed ownership returned a non-ownership response".into(),
+            )),
         }
     }
 

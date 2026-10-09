@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agent_sdk::{
-    AgentMutationFenceProof, AuthorityCommand, AuthorityResponse, ClusterAdmissionOperationIds, ClusterClient, ClusterMemberState,
-    ConnectionProfile, ConnectionTransport, NodeAvailability, NodeProfile, SdkError,
+    AgentMutationFenceProof, AuthorityCommand, AuthorityResponse, ClusterAdmissionOperationIds,
+    ClusterClient, ClusterMemberState, ConnectionProfile, ConnectionTransport, NodeAvailability,
+    NodeProfile, SdkError,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -270,7 +271,17 @@ pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Command, String
         None
     };
     let principal = PrincipalOptions::parse(&mut arguments.options)?;
-    if principal.is_some() && !matches!(name.as_str(), "join" | "cert-activate" | "cert-prepare" | "cert-abort" | "cert-finalize" | "member-state") {
+    if principal.is_some()
+        && !matches!(
+            name.as_str(),
+            "join"
+                | "cert-activate"
+                | "cert-prepare"
+                | "cert-abort"
+                | "cert-finalize"
+                | "member-state"
+        )
+    {
         return Err("principal signing options require a replicated membership mutation".into());
     }
     let action = match name.as_str() {
@@ -521,13 +532,13 @@ pub async fn run(
                 signer.admit(&mut client, &mut node, &join).await
             } else {
                 ClusterClient::admit_node_with_operation_ids(
-                &mut client,
-                &mut node,
-                &join.node,
-                join.generation,
-                &join.reason,
-                join.ids,
-            )
+                    &mut client,
+                    &mut node,
+                    &join.node,
+                    join.generation,
+                    &join.reason,
+                    join.ids,
+                )
                 .await
             };
             let closed = node.close().await;
@@ -543,19 +554,21 @@ pub async fn run(
         } => {
             let mut node = node_client(&join, &profile, token).await?;
             let result = if let Some(signer) = signer.as_mut() {
-                signer.prepare(&mut client, &mut node, &join, fingerprint, (ttl, overlap)).await
+                signer
+                    .prepare(&mut client, &mut node, &join, fingerprint, (ttl, overlap))
+                    .await
             } else {
                 ClusterClient::prepare_node_certificate_rollout_with_operation_ids(
-                &mut client,
-                &mut node,
-                &join.node,
-                fingerprint,
-                join.generation.expect("certificate generation"),
-                ttl,
-                overlap,
-                &join.reason,
-                join.ids,
-            )
+                    &mut client,
+                    &mut node,
+                    &join.node,
+                    fingerprint,
+                    join.generation.expect("certificate generation"),
+                    ttl,
+                    overlap,
+                    &join.reason,
+                    join.ids,
+                )
                 .await
             };
             let closed = node.close().await;
@@ -571,23 +584,33 @@ pub async fn run(
         } => {
             let member = if let Some(signer) = signer.as_mut() {
                 let actor = signer.actor(&mut client).await?;
-                signer.member(&mut client, AuthorityCommand::SetMemberState {
-                    operation_id: id.clone().expect("write id"), node_id, state,
-                    expected_generation: generation, actor, reason, proposed_at: chrono::Utc::now(),
-                }).await?
+                signer
+                    .member(
+                        &mut client,
+                        AuthorityCommand::SetMemberState {
+                            operation_id: id.clone().expect("write id"),
+                            node_id,
+                            state,
+                            expected_generation: generation,
+                            actor,
+                            reason,
+                            proposed_at: chrono::Utc::now(),
+                        },
+                    )
+                    .await?
             } else {
                 client
-                .set_cluster_member_state_with_operation_id(
-                    id.as_deref().expect("write id"),
-                    node_id,
-                    state,
-                    generation,
-                    reason,
-                )
-                .await?
+                    .set_cluster_member_state_with_operation_id(
+                        id.as_deref().expect("write id"),
+                        node_id,
+                        state,
+                        generation,
+                        reason,
+                    )
+                    .await?
             };
             json_value(&member)?
-        },
+        }
         Action::CertificateFinish {
             node_id,
             abort,
@@ -598,13 +621,31 @@ pub async fn run(
                 let actor = signer.actor(&mut client).await?;
                 let operation_id = id.clone().expect("write id");
                 let command = if abort {
-                    AuthorityCommand::AbortMemberCertificateRollout {operation_id, node_id, expected_generation: generation, actor, reason, proposed_at: chrono::Utc::now()}
+                    AuthorityCommand::AbortMemberCertificateRollout {
+                        operation_id,
+                        node_id,
+                        expected_generation: generation,
+                        actor,
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    }
                 } else {
-                    AuthorityCommand::FinalizeMemberCertificateRollout {operation_id, node_id, expected_generation: generation, actor, reason, proposed_at: chrono::Utc::now()}
+                    AuthorityCommand::FinalizeMemberCertificateRollout {
+                        operation_id,
+                        node_id,
+                        expected_generation: generation,
+                        actor,
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    }
                 };
                 match signer.submit(&mut client, command).await? {
-                    AuthorityResponse::CertificateRolloutUpdated {member, ..} => member,
-                    _ => return Err(SdkError::Kernel("unexpected signed certificate response".into())),
+                    AuthorityResponse::CertificateRolloutUpdated { member, .. } => member,
+                    _ => {
+                        return Err(SdkError::Kernel(
+                            "unexpected signed certificate response".into(),
+                        ))
+                    }
                 }
             } else if abort {
                 client

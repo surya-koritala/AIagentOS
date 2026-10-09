@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_sdk::{
-    AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind, AuthoritySigner, ClusterClient, KernelClient,
-    Placement, SdkError, WireErrorCode,
+    AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind, AuthoritySigner,
+    ClusterClient, KernelClient, Placement, SdkError, WireErrorCode,
 };
 use kernel::cluster_runtime::{ClusterRaftRuntime, ClusterRaftRuntimeConfig, ClusterRaftTls};
 use kernel::config::{ClusterRaftConfig, ClusterRaftMemberConfig};
@@ -206,10 +206,16 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
             clients.push(client);
         }
         let own_key = operator.clone();
-        let signer = AuthoritySigner::new(cluster_id.clone(), principal_id.clone(), 1, move |payload| Ok(own_key.sign(payload).as_ref().to_vec()));
-        let mut placement = ClusterClient::connect_discovered_with_signer(addresses[0].to_string(), TOKEN, signer)
-        .await
-        .unwrap();
+        let signer = AuthoritySigner::new(
+            cluster_id.clone(),
+            principal_id.clone(),
+            1,
+            move |payload| Ok(own_key.sign(payload).as_ref().to_vec()),
+        );
+        let mut placement =
+            ClusterClient::connect_discovered_with_signer(addresses[0].to_string(), TOKEN, signer)
+                .await
+                .unwrap();
         assert!(placement.is_authority_managed());
         let fresh = placement
             .create_agent(
@@ -225,19 +231,51 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         assert!(kernels
             .iter()
             .any(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id));
-        let ownership = clients[1].active_cluster_agent_ownership(&fresh.agent_id).await.unwrap();
+        let ownership = clients[1]
+            .active_cluster_agent_ownership(&fresh.agent_id)
+            .await
+            .unwrap();
         assert_eq!(ownership.owner_node_id, fresh.node_id);
-        let owner_index = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id).unwrap();
-        let fence = clients[owner_index].agent_mutation_fence(&fresh.agent_id).await.unwrap().unwrap();
-        assert_eq!(fence.fencing_token, ownership.fencing_token); assert_eq!(fence.authority_generation, ownership.generation);
-        let audit = clients[2].cluster_agent_ownership_audit(Some(fresh.agent_id.clone()), 10).await.unwrap();
+        let owner_index = kernels
+            .iter()
+            .position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id)
+            .unwrap();
+        let fence = clients[owner_index]
+            .agent_mutation_fence(&fresh.agent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fence.fencing_token, ownership.fencing_token);
+        assert_eq!(fence.authority_generation, ownership.generation);
+        let audit = clients[2]
+            .cluster_agent_ownership_audit(Some(fresh.agent_id.clone()), 10)
+            .await
+            .unwrap();
         assert_eq!(audit[0].actor, format!("principal:{principal_id}"));
-        placement.renew_agent_ownership(&fresh.agent_id, 60).await.unwrap();
-        let owner = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id).unwrap();
-        let renewed = clients[1].active_cluster_agent_ownership(&fresh.agent_id).await.unwrap();
-        let paused_proof = agent_sdk::AgentMutationFenceProof { cluster_id: cluster_id.clone(), owner_node_id: renewed.owner_node_id.clone(), authority_term: renewed.authority_term,
-            authority_generation: renewed.generation, fencing_token: renewed.fencing_token, proof_expires_at: renewed.lease_expires_at };
-        clients[owner].pause_agent_fenced(&fresh.agent_id, &paused_proof).await.unwrap();
+        placement
+            .renew_agent_ownership(&fresh.agent_id, 60)
+            .await
+            .unwrap();
+        let owner = kernels
+            .iter()
+            .position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id)
+            .unwrap();
+        let renewed = clients[1]
+            .active_cluster_agent_ownership(&fresh.agent_id)
+            .await
+            .unwrap();
+        let paused_proof = agent_sdk::AgentMutationFenceProof {
+            cluster_id: cluster_id.clone(),
+            owner_node_id: renewed.owner_node_id.clone(),
+            authority_term: renewed.authority_term,
+            authority_generation: renewed.generation,
+            fencing_token: renewed.fencing_token,
+            proof_expires_at: renewed.lease_expires_at,
+        };
+        clients[owner]
+            .pause_agent_fenced(&fresh.agent_id, &paused_proof)
+            .await
+            .unwrap();
         // No reporters run here. A new any-member quorum barrier must advance time
         // independently; the client's clock is never consulted for eligibility.
         tokio::time::sleep(Duration::from_secs(16)).await;
@@ -325,29 +363,62 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         // A later exact sample includes actual lifecycle changes and every
         // production counter, rather than accepting only the zero-load shape.
         tokio::time::sleep(Duration::from_secs(5)).await;
-        for (kernel, runtime) in kernels.iter().zip(&runtimes) { assert!(matches!(runtime.authority_handle().publish_kernel_capacity(kernel).await.unwrap(), kernel::cluster_consensus::AuthorityResponse::NodeCapacityReported { .. })); }
+        for (kernel, runtime) in kernels.iter().zip(&runtimes) {
+            assert!(matches!(
+                runtime
+                    .authority_handle()
+                    .publish_kernel_capacity(kernel)
+                    .await
+                    .unwrap(),
+                kernel::cluster_consensus::AuthorityResponse::NodeCapacityReported { .. }
+            ));
+        }
         let loaded = clients[2].cluster_capacity().await.unwrap();
         for capacity in &loaded.reports {
-            let kernel = kernels.iter().find(|kernel| kernel.cluster_control.identity().node_id == capacity.report.node_id).unwrap();
+            let kernel = kernels
+                .iter()
+                .find(|kernel| kernel.cluster_control.identity().node_id == capacity.report.node_id)
+                .unwrap();
             let actual = kernel::metrics::MetricsSnapshot::collect(kernel);
             let c = &capacity.report.counters;
-            assert_eq!(c.agent_count, actual.agent_count); assert_eq!(c.running_agents, actual.running_agents);
-            assert_eq!(c.live_agents, actual.live_agents); assert_eq!(c.queued_agents, actual.queued_agents);
-            assert_eq!(c.paused_agents, actual.paused_agents); assert_eq!(c.stopped_agents, actual.stopped_agents);
-            assert_eq!(c.active_turns, actual.active_turns); assert_eq!(c.waiting_turns, actual.waiting_turns);
-            assert_eq!(c.turn_capacity, actual.turn_capacity); assert_eq!(c.llm_requests_in_flight, actual.llm_requests_in_flight);
-            assert_eq!(c.llm_requests_waiting, actual.llm_requests_waiting); assert_eq!(c.llm_core_capacity, actual.llm_core_capacity);
+            assert_eq!(c.agent_count, actual.agent_count);
+            assert_eq!(c.running_agents, actual.running_agents);
+            assert_eq!(c.live_agents, actual.live_agents);
+            assert_eq!(c.queued_agents, actual.queued_agents);
+            assert_eq!(c.paused_agents, actual.paused_agents);
+            assert_eq!(c.stopped_agents, actual.stopped_agents);
+            assert_eq!(c.active_turns, actual.active_turns);
+            assert_eq!(c.waiting_turns, actual.waiting_turns);
+            assert_eq!(c.turn_capacity, actual.turn_capacity);
+            assert_eq!(c.llm_requests_in_flight, actual.llm_requests_in_flight);
+            assert_eq!(c.llm_requests_waiting, actual.llm_requests_waiting);
+            assert_eq!(c.llm_core_capacity, actual.llm_core_capacity);
         }
-        assert!(loaded.reports.iter().any(|capacity| capacity.report.counters.paused_agents > 0));
+        assert!(loaded
+            .reports
+            .iter()
+            .any(|capacity| capacity.report.counters.paused_agents > 0));
         for agent in [&fresh, &active] {
             let owner = kernels
                 .iter()
                 .position(|kernel| kernel.cluster_control.identity().node_id == agent.node_id)
                 .unwrap();
-            let owned = clients[1].active_cluster_agent_ownership(&agent.agent_id).await.unwrap();
-            let proof = agent_sdk::AgentMutationFenceProof { cluster_id: cluster_id.clone(), owner_node_id: owned.owner_node_id, authority_term: owned.authority_term,
-                authority_generation: owned.generation, fencing_token: owned.fencing_token, proof_expires_at: owned.lease_expires_at };
-            clients[owner].stop_agent_fenced(&agent.agent_id, &proof).await.unwrap();
+            let owned = clients[1]
+                .active_cluster_agent_ownership(&agent.agent_id)
+                .await
+                .unwrap();
+            let proof = agent_sdk::AgentMutationFenceProof {
+                cluster_id: cluster_id.clone(),
+                owner_node_id: owned.owner_node_id,
+                authority_term: owned.authority_term,
+                authority_generation: owned.generation,
+                fencing_token: owned.fencing_token,
+                proof_expires_at: owned.lease_expires_at,
+            };
+            clients[owner]
+                .stop_agent_fenced(&agent.agent_id, &proof)
+                .await
+                .unwrap();
         }
         for client in &mut clients {
             client.close().await.unwrap();

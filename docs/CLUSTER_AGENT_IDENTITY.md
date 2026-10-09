@@ -23,7 +23,9 @@ current ownership while preserving every initial reservation field.
 
 Transitions use bounded, consecutive compare-and-set revisions. Operation UUIDs
 are retained across indeterminate outcomes. A successful exact retry returns its
-original committed response only after current independent authorization. A
+original committed response only after current independent authorization and
+while the current identity still permits that operation. Abort/delete tombstones
+reject historical creation and publication replay. A
 different creator, scope, digest, placement or receipt fails closed. The current
 forwarding node's audit actor is authenticated by its separate delegation; a
 retry through another admitted origin does not change caller semantics.

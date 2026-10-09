@@ -202,6 +202,7 @@ fn immutable_identity_allocation_retry_conflicts_and_tombstones_are_permanent() 
         AuthorityResponse::AgentIdentityUpdated { replayed: true, .. }
     ));
     assert_eq!(fixture.record(&agent).reservation, reservation);
+    assert!(matches!(fixture.apply(command), AuthorityResponse::Rejected { reason: AuthorityRejection::Conflict, .. }));
     let replacement = fixture.prepare(&agent, &Uuid::new_v4().to_string());
     assert!(matches!(
         fixture.apply(replacement),

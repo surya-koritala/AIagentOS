@@ -2483,6 +2483,17 @@ fn apply_authority_command(
             }
         }
     };
+    if let Ok(inner) = crate::cluster_principal::unsigned_authority_command(&command) {
+        if matches!(inner, AuthorityCommand::PrepareAgentIdentity { .. }
+            | AuthorityCommand::RecordAgentCreation { .. } | AuthorityCommand::PublishAgentIdentity { .. })
+            && crate::cluster_agent_identity::identity_command_agent(inner).and_then(|agent| {
+                state.control_plane.as_ref()?.agent_identities.get(agent)
+            }).is_some_and(|identity| matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted))
+        {
+            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::Conflict,
+                "terminal immutable identity refuses historical creation or publication replay");
+        }
+    }
     if let Some(receipt) = state.receipts.get(&canonical_id) {
         if commands_are_same_retry(&receipt.command, &command) {
             return replay_response(&receipt.response);

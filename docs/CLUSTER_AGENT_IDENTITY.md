@@ -72,11 +72,13 @@ legacy row cannot prove current publication or authorization.
 
 The `Immutable quorum agent identity` workflow checks the exact source in
 GitHub CI. Its fixtures cover deterministic transition and receipt conflicts,
-actual destination SQLite process exits, current principal revocation, lease
+actual authority and destination SQLite process exits, current principal revocation, lease
 expiry, real mutual-TLS majority allocation and duplicate origins, leader loss
 between receipt and publication, retained ownership migration evidence,
 minority refusal, and database backup/restore with a later tombstone snapshot.
-These fixtures are controlled CI evidence, not independent multi-host
+Authority process cuts exercise each state-machine transaction before and after
+commit; the network quorum fixture separately verifies majority allocation and
+leader shutdown/failover. These fixtures are controlled CI evidence, not independent multi-host
 qualification.
 
 Full managed creation, receipt-loss reconciliation and ordinary destination

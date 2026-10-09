@@ -4855,9 +4855,11 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
         }
         write_persistent_state(&transaction, &state)
             .map_err(StorageIOError::write_state_machine)?;
+        crash_identity_authority_after_step_for_test(responses.last(), "before_commit");
         transaction
             .commit()
             .map_err(|error| StorageIOError::write_state_machine(read_io(error.to_string())))?;
+        crash_identity_authority_after_step_for_test(responses.last(), "after_commit");
         Ok(responses)
     }
 
@@ -5022,6 +5024,24 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
         }))
     }
 }
+
+#[cfg(test)]
+fn crash_identity_authority_after_step_for_test(response: Option<&AuthorityResponse>, boundary: &str) {
+    if let Some(AuthorityResponse::AgentIdentityUpdated { identity, .. }) = response {
+        let phase = match identity.state {
+            AgentIdentityState::Prepared => "prepared",
+            AgentIdentityState::Created => "created",
+            AgentIdentityState::Published => "published",
+            AgentIdentityState::Aborted => "aborted",
+            AgentIdentityState::Deleted => "deleted",
+        };
+        crate::cluster_agent_identity::crash_identity_after_step_for_test(&format!("authority_{phase}_{boundary}"));
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_identity_authority_after_step_for_test(_response: Option<&AuthorityResponse>, _boundary: &str) {}
 
 impl RaftSnapshotBuilder<ClusterRaftTypeConfig> for ClusterRaftSnapshotBuilder {
     async fn build_snapshot(&mut self) -> ClusterStorageResult<Snapshot<ClusterRaftTypeConfig>> {

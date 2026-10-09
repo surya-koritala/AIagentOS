@@ -263,6 +263,7 @@ pub struct AgentExecutor {
     /// Shared RPM/TPM/provider-concurrency limiter, acquired for each actual
     /// provider attempt rather than for the whole agent turn.
     rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
+    provider_outcomes: Arc<crate::telemetry::ProviderOutcomeCounters>,
     /// Shared active-prompt admission. The tenant id is immutable for the
     /// executor lifetime and restored with the owning agent.
     context_admission: Option<(Arc<crate::context_paging::ActiveContextManager>, String)>,
@@ -335,6 +336,7 @@ impl AgentExecutor {
             budget_enforcer: None,
             llm_scheduler: None,
             rate_limiter: None,
+            provider_outcomes: Arc::new(crate::telemetry::ProviderOutcomeCounters::default()),
             context_admission: None,
             context_budget_tokens: 0,
             max_tool_calls_per_turn: 0,
@@ -399,6 +401,10 @@ impl AgentExecutor {
 
     pub fn set_rate_limiter(&mut self, limiter: Arc<crate::rate_limit::RateLimiter>) {
         self.rate_limiter = Some(limiter);
+    }
+
+    pub(crate) fn set_provider_outcomes(&mut self, counters: Arc<crate::telemetry::ProviderOutcomeCounters>) {
+        self.provider_outcomes = counters;
     }
 
     pub fn set_context_admission(
@@ -1584,6 +1590,7 @@ impl AgentExecutor {
                     }
                 }
             };
+            let mut provider_observation = self.provider_outcomes.start();
             let started = std::time::Instant::now();
             let (provider_events_tx, mut provider_events_rx) =
                 mpsc::channel(crate::wire_io::STREAM_EVENT_BUFFER_CAPACITY);
@@ -1621,6 +1628,13 @@ impl AgentExecutor {
                     }
                 }
             };
+            provider_observation.finish(match &result {
+                Ok(_) => crate::telemetry::ProviderOutcome::Success,
+                Err(ConnectorError::Timeout(_)) => crate::telemetry::ProviderOutcome::TimedOut,
+                Err(ConnectorError::Cancelled(_)) => crate::telemetry::ProviderOutcome::Cancelled,
+                Err(_) => crate::telemetry::ProviderOutcome::Failed,
+            });
+            drop(provider_observation);
             provider_latency_ms = provider_latency_ms
                 .saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             drop(_llm_core);
@@ -3178,6 +3192,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
 
         let output = executor.run("test").await.unwrap();
         assert_eq!(output.content, "recovered!");
+        assert_eq!(executor.provider_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { success: 1, failed: 2, timed_out: 0, cancelled: 0 });
         assert_eq!(output.usage.llm_requests, 3);
         assert_eq!(output.usage.retries, 2);
         assert_eq!(output.usage.provider_reported_requests, 0);
@@ -3220,6 +3235,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
             1,
             "a permanent failure must burn exactly one durable request receipt"
         );
+        assert_eq!(executor.provider_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { failed: 1, ..Default::default() });
     }
 
     struct ImageBoundSession {
@@ -3637,6 +3653,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
             .to_string()
             .contains("does not enforce the configured max_output_tokens_per_request"));
         assert_eq!(limiter.try_stats().unwrap().requests_this_minute, 0);
+        assert_eq!(executor.provider_outcomes.snapshot(), Default::default());
     }
 
     #[tokio::test]
@@ -4033,6 +4050,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
         executor.set_rate_limiter(limiter.clone());
         let cancellation = executor.cancel_token();
 
+        let observed_outcomes = executor.provider_outcomes.clone();
         let run = tokio::spawn(async move { executor.run("cancel after invoke").await });
         tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
             .await
@@ -4042,6 +4060,7 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
 
         assert_eq!(output.content, "Cancelled.");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observed_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { cancelled: 1, ..Default::default() });
         let stats = limiter.try_stats().unwrap();
         assert_eq!(stats.requests_this_minute, 1);
         assert!(stats.tokens_this_minute > 0);
@@ -4087,6 +4106,32 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
         assert_eq!(stats.reconciled_receipts, 1);
         assert_eq!(stats.reserved_receipts, 0);
         assert_eq!(stats.in_flight_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn timed_out_provider_invocations_are_counted_without_failure_or_success_inflation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: None,
+                release: Some(Arc::new(tokio::sync::Notify::new())),
+                fail: false,
+                id: "timeout-fixture".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(execution_rate_limiter_with_tpm(100_000));
+        executor.set_provider_request_timeout(std::time::Duration::from_millis(10));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), executor.run("provider deadline"))
+            .await.unwrap().unwrap_err();
+        assert!(matches!(error, KernelError::Connector(ConnectorError::Timeout(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), LLM_RETRIES);
+        assert_eq!(executor.provider_outcomes.snapshot(), crate::telemetry::ProviderOutcomeSnapshot { timed_out: u64::try_from(LLM_RETRIES).unwrap(), ..Default::default() });
     }
 
     /// Mock session that calls a nonexistent tool — tests error recovery message to LLM.

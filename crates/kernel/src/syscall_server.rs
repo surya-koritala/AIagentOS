@@ -44,7 +44,7 @@ use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
 use crate::observability::{AgentAction, ObservabilityEngine};
 use crate::resources::ResourceBroker;
 use crate::wire_io::{graceful_close_framed, read_bounded_line, write_bounded_json};
-use crate::{AgentConfig, AgentKernelImpl, Priority};
+use crate::{AgentConfig, AgentKernelImpl, KernelError, Priority};
 
 /// Default simultaneous syscall connection limit.
 pub use crate::wire_io::DEFAULT_MAX_CONNECTIONS as DEFAULT_WIRE_MAX_CONNECTIONS;
@@ -2404,6 +2404,30 @@ async fn authorize(
     }
 
     Ok(())
+}
+
+/// Trusted harness check against the same live credential and tenant admission
+/// used by public dispatch. The expectation has no wire/MCP/package operation.
+/// No syscall effect is executed even when the probe detects an unexpected allow.
+pub async fn probe_expected_tenant_denial(
+    kernel: &AgentKernelImpl,
+    credential: &str,
+    call: &Syscall,
+) -> Result<bool, KernelError> {
+    let resolved = kernel.resolve_principal(credential).await
+        .ok_or_else(|| KernelError::Policy("tenant probe credential is not currently admitted".into()))?;
+    let identity = resolved.credential.as_ref()
+        .ok_or_else(|| KernelError::Policy("tenant probe requires a leased credential identity".into()))?;
+    let (principal, _lease) = kernel.acquire_credential_principal(identity).await
+        .ok_or_else(|| KernelError::Policy("tenant probe credential is not currently admitted".into()))?;
+    let target = syscall_policy(call).2.ok_or_else(|| KernelError::Policy("tenant probe requires an agent-addressed operation".into()))?;
+    let agent = uuid::Uuid::parse_str(target).map_err(|_| KernelError::Policy("tenant probe requires a valid recorded agent".into()))?;
+    if kernel.context_manager.agent_tenant(agent)?.is_none() {
+        return Err(KernelError::Policy("tenant probe requires an existing recorded target".into()));
+    }
+    let allowed = authorize(kernel, Some(&principal), call).await.is_ok();
+    kernel.syscall_gate.denial_probes.record(crate::telemetry::DenialProbeKind::TenantBoundary, allowed);
+    Ok(!allowed)
 }
 
 async fn dispatch_lifecycle<F, Fut>(agent_id: String, action: F) -> SyscallReply
@@ -10389,6 +10413,42 @@ memory = ["remember this"]
 
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn explicit_tenant_sli_probes_use_leased_credentials_and_leave_ordinary_wire_unmarked() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let owner_tenant = kernel.create_tenant("sli-owner").await.unwrap();
+        let other_tenant = kernel.create_tenant("sli-other").await.unwrap();
+        let user = kernel.register_user(&owner_tenant, "probe-user", "probe@fixture.test", Role::User).await.unwrap();
+        let credential = kernel.issue_api_key(&user, "denial-probe").await.unwrap();
+        let config = || AgentConfig { name: "denial probe target".into(), task: "offline fixture".into(), llm_provider: "stub".into(), permission_profile: "standard".into(), priority: Priority::default(), sandbox_config: None };
+        let owned = kernel.create_agent_for_tenant(&owner_tenant, config()).await.unwrap().id;
+        let foreign = kernel.create_agent_for_tenant(&other_tenant, config()).await.unwrap().id;
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0").await.unwrap().with_auth_token("probe-system-fixture");
+        let mut client = SyscallClient::connect(server.local_addr().unwrap()).await.unwrap();
+        let serving = tokio::spawn(server.serve());
+        assert!(matches!(client.call(Syscall::Authenticate { token: credential.clone() }).await.unwrap(), SyscallReply::Authenticated));
+        assert!(matches!(client.call(Syscall::AgentInfo { agent_id: owned.to_string() }).await.unwrap(), SyscallReply::AgentInfo { .. }));
+        assert!(matches!(client.call(Syscall::AgentInfo { agent_id: foreign.to_string() }).await.unwrap(), SyscallReply::TypedError { .. } | SyscallReply::Error { .. }));
+        assert_eq!(kernel.syscall_gate.denial_probe_stats(), Default::default());
+        let foreign_call = Syscall::AgentInfo { agent_id: foreign.to_string() };
+        for _ in 0..100 {
+            assert!(probe_expected_tenant_denial(&kernel, &credential, &foreign_call).await.unwrap());
+        }
+        let owned_call = Syscall::AgentInfo { agent_id: owned.to_string() };
+        assert!(!probe_expected_tenant_denial(&kernel, &credential, &owned_call).await.unwrap());
+        let snapshot = kernel.syscall_gate.denial_probe_stats();
+        assert_eq!(snapshot.tenant_boundary_attempts, 101);
+        assert_eq!(snapshot.confirmed_violations, 1);
+        assert_eq!(snapshot.adversarial_attempts, 0);
+        assert!(probe_expected_tenant_denial(&kernel, "invalid-probe-credential", &foreign_call).await.is_err());
+        assert_eq!(kernel.syscall_gate.denial_probe_stats(), snapshot);
+        client.close().await.unwrap();
+        serving.abort();
+        let _ = serving.await;
+        kernel.stop_agent(owned).await.unwrap();
+        kernel.stop_agent(foreign).await.unwrap();
     }
 
     fn assert_authorization_denied(reply: SyscallReply) {

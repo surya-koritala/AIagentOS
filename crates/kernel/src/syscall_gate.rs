@@ -466,6 +466,7 @@ pub struct SyscallGate {
     /// lifecycle cleanup so tenant aggregates do not decrease when an agent
     /// stops; they reset on process restart as documented.
     agent_stats: DashMap<uuid::Uuid, GateStats>,
+    pub(crate) denial_probes: crate::telemetry::DenialProbeCounters,
     #[cfg(test)]
     authorization_snapshot_hook: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
     #[cfg(test)]
@@ -678,6 +679,7 @@ impl SyscallGate {
             denied_namespace: AtomicU64::new(0),
             audited: AtomicU64::new(0),
             agent_stats: DashMap::new(),
+            denial_probes: crate::telemetry::DenialProbeCounters::default(),
             #[cfg(test)]
             authorization_snapshot_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1445,6 +1447,25 @@ impl SyscallGate {
         )
         .await
         .map(|authorized| authorized.pid)
+    }
+
+    /// Trusted harness path declaring that this real gate decision must deny.
+    /// Ordinary wire, tool and package requests cannot set this expectation.
+    /// This checks authorization only and never invokes a resource provider.
+    pub async fn probe_expected_tool_denial(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        est_tokens: u64,
+    ) -> Result<Pid, GateDenial> {
+        let result = self.check_tool_call(kid, tool_name, resource, est_tokens).await;
+        self.denial_probes.record(crate::telemetry::DenialProbeKind::AuthorizationSandbox, result.is_ok());
+        result
+    }
+
+    pub fn denial_probe_stats(&self) -> crate::telemetry::DenialProbeSnapshot {
+        self.denial_probes.snapshot()
     }
 
     /// Enforce the validated security declaration carried by the live tool
@@ -2688,6 +2709,21 @@ mod tests {
             gate.approvals.is_empty(),
             "unregister must purge the old registration's newly inserted grant"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_denial_probes_measure_an_unexpected_allow_and_leave_ordinary_traffic_unmarked() {
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::none(), None);
+        assert!(gate.check_tool_call(kid, "read_file", "/scope", 1).await.is_ok());
+        assert!(gate.check_tool_call(kid, "write_file", "/scope", 1).await.is_err());
+        assert_eq!(gate.denial_probe_stats(), Default::default());
+        for _ in 0..100 {
+            assert!(gate.probe_expected_tool_denial(kid, "write_file", "/scope", 1).await.is_err());
+        }
+        assert!(gate.probe_expected_tool_denial(kid, "read_file", "/scope", 1).await.is_ok());
+        assert_eq!(gate.denial_probe_stats(), crate::telemetry::DenialProbeSnapshot { adversarial_attempts: 101, unexpected_allows: 1, ..Default::default() });
     }
 
     #[tokio::test]

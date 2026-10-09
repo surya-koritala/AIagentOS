@@ -1010,6 +1010,7 @@ pub struct SqliteContextManager {
     /// without touching persistence.
     embedder: Arc<dyn Embedder>,
     fact_cache: Mutex<fact_index::FactCache>,
+    checkpoint_recovery: Arc<crate::telemetry::CheckpointRecoveryCounters>,
     #[cfg(test)]
     fail_next_agent_save: AtomicBool,
     #[cfg(test)]
@@ -1238,6 +1239,7 @@ impl SqliteContextManager {
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fact_cache: Mutex::new(fact_index::FactCache::default()),
+            checkpoint_recovery: Arc::new(crate::telemetry::CheckpointRecoveryCounters::default()),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
             #[cfg(test)]
@@ -1277,6 +1279,7 @@ impl SqliteContextManager {
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fact_cache: Mutex::new(fact_index::FactCache::default()),
+            checkpoint_recovery: Arc::new(crate::telemetry::CheckpointRecoveryCounters::default()),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
             #[cfg(test)]
@@ -5796,7 +5799,31 @@ impl SqliteContextManager {
         agent_id: AgentId,
         tenant_id: &str,
     ) -> Result<StoredGenerationCheckpoint, ContextError> {
+        let mut observation = self.checkpoint_recovery_observation();
+        let result = self.claim_generation_checkpoint_observed(checkpoint_id, agent_id, tenant_id, &mut observation);
+        if result.is_ok() { observation.recovered(); }
+        result
+    }
+
+    pub(crate) fn checkpoint_recovery_observation(&self) -> crate::telemetry::CheckpointRecoveryObservation {
+        self.checkpoint_recovery.start()
+    }
+
+    pub(crate) fn checkpoint_recovery_snapshot(&self) -> crate::telemetry::CheckpointRecoverySnapshot {
+        self.checkpoint_recovery.snapshot()
+    }
+
+    pub(crate) fn claim_generation_checkpoint_observed(
+        &self,
+        checkpoint_id: uuid::Uuid,
+        agent_id: AgentId,
+        tenant_id: &str,
+        observation: &mut crate::telemetry::CheckpointRecoveryObservation,
+    ) -> Result<StoredGenerationCheckpoint, ContextError> {
         let conn = self.locked_conn();
+        let stored_tenant = conn.query_row("SELECT tenant_id FROM generation_checkpoints WHERE id=?1", [checkpoint_id.to_string()], |row| row.get::<_, String>(0))
+            .optional().map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        observation.observed_foreign_tenant(stored_tenant.as_deref().is_some_and(|stored| stored != tenant_id));
         let changed = conn
             .execute(
                 "UPDATE generation_checkpoints SET status = 'resuming'
@@ -5843,7 +5870,7 @@ impl SqliteContextManager {
                 "checkpoint version {version} is incompatible with runtime version {GENERATION_CHECKPOINT_VERSION}"
             )));
         }
-        let checkpoint = match serde_json::from_str(&row.3) {
+        let checkpoint: crate::execution::GenerationCheckpoint = match serde_json::from_str(&row.3) {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 let _ = conn.execute(
@@ -5855,6 +5882,10 @@ impl SqliteContextManager {
                 )));
             }
         };
+        if checkpoint.agent_id != agent_id {
+            let _ = conn.execute("UPDATE generation_checkpoints SET status='corrupt' WHERE id=?1", [checkpoint_id.to_string()]);
+            return Err(ContextError::RestoreFailed("checkpoint payload identity disagrees with its scoped record".into()));
+        }
         Ok(StoredGenerationCheckpoint {
             metadata: GenerationCheckpointMetadata {
                 id: checkpoint_id,
@@ -7915,6 +7946,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checkpoint_recovery_sli_counts_foreign_rejections_and_refuses_payload_identity_corruption() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let foreign_agent = uuid::Uuid::new_v4();
+        let foreign = manager.save_generation_checkpoint(DEFAULT_TENANT, "provider", "model", &sample_generation_checkpoint(foreign_agent), std::time::Duration::from_secs(60)).unwrap();
+        manager.locked_conn().execute("UPDATE generation_checkpoints SET tenant_id='foreign-fixture' WHERE id=?1", [foreign.to_string()]).unwrap();
+        for _ in 0..100 {
+            assert!(manager.claim_generation_checkpoint(foreign, foreign_agent, DEFAULT_TENANT).is_err());
+        }
+        let restored = manager.claim_generation_checkpoint(foreign, foreign_agent, "foreign-fixture").unwrap();
+        assert_eq!(restored.checkpoint.agent_id, foreign_agent);
+        let owner = uuid::Uuid::new_v4();
+        let corrupt = manager.save_generation_checkpoint(DEFAULT_TENANT, "provider", "model", &sample_generation_checkpoint(owner), std::time::Duration::from_secs(60)).unwrap();
+        let mismatched_payload = serde_json::to_string(&sample_generation_checkpoint(foreign_agent)).unwrap();
+        manager.locked_conn().execute("UPDATE generation_checkpoints SET checkpoint_json=?1 WHERE id=?2", params![mismatched_payload, corrupt.to_string()]).unwrap();
+        let error = manager.claim_generation_checkpoint(corrupt, owner, DEFAULT_TENANT).unwrap_err();
+        assert!(error.to_string().contains("payload identity"));
+        let status: String = manager.locked_conn().query_row("SELECT status FROM generation_checkpoints WHERE id=?1", [corrupt.to_string()], |row| row.get(0)).unwrap();
+        assert_eq!(status, "corrupt");
+        let snapshot = manager.checkpoint_recovery_snapshot();
+        assert_eq!(snapshot.attempted, 102);
+        assert_eq!(snapshot.recovered, 1);
+        assert_eq!(snapshot.safe_rejected, 101);
+        assert_eq!(snapshot.recovered + snapshot.safe_rejected, snapshot.attempted);
+        assert_eq!(snapshot.cross_tenant_attempts, 100);
+        assert_eq!(snapshot.cross_tenant_recoveries, 0);
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains("foreign-fixture") && !rendered.contains("sensitive prompt"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn persistent_checkpoint_store_is_owner_only() {
@@ -9910,6 +9971,7 @@ mod tests {
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fact_cache: Mutex::new(fact_index::FactCache::default()),
+            checkpoint_recovery: Arc::new(crate::telemetry::CheckpointRecoveryCounters::default()),
             fail_next_agent_save: AtomicBool::new(false),
             fail_agent_status_update_after: AtomicUsize::new(0),
         };

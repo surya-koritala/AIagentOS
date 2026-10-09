@@ -853,7 +853,7 @@ mod tests {
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_metrics_http(listener, kernel));
+        let serving = tokio::spawn(serve_metrics_http(listener, kernel));
 
         // GET /metrics → 200 + a Prometheus exposition body.
         let (status, body) = http_get(addr, "/metrics").await;
@@ -863,6 +863,24 @@ mod tests {
             "body:\n{body}"
         );
         assert!(body.contains("agentos_agents"));
+        for family in [
+            "agentos_llm_requests_total",
+            "agentos_checkpoint_recovery_attempts_total",
+            "agentos_checkpoint_recovery_total",
+            "agentos_checkpoint_cross_tenant_attempts_total",
+            "agentos_checkpoint_cross_tenant_recoveries_total",
+            "agentos_adversarial_attempts_total",
+            "agentos_unexpected_allows_total",
+            "agentos_tenant_boundary_attempts_total",
+            "agentos_confirmed_violations_total",
+            "agentos_quota_storage_healthy_seconds_total",
+            "agentos_quota_storage_unhealthy_seconds_total",
+            "agentos_request_class_total",
+            "agentos_request_class_duration_seconds",
+        ] {
+            assert!(body.contains(&format!("# HELP {family} ")), "HTTP metrics omitted HELP for {family}");
+            assert!(body.contains(&format!("# TYPE {family} ")), "HTTP metrics omitted TYPE for {family}");
+        }
 
         // A query string is tolerated and still routes to /metrics.
         let (status, _) = http_get(addr, "/metrics?foo=bar").await;
@@ -871,6 +889,8 @@ mod tests {
         // Any other path → 404.
         let (status, _) = http_get(addr, "/nope").await;
         assert!(status.contains("404"), "status: {status}");
+        serving.abort();
+        let _ = serving.await;
     }
 
     /// A client that connects and never sends must be reaped, not held forever.

@@ -8,7 +8,7 @@
 //! epoch. The concurrency permit is process-local and is always acquired before
 //! a durable reservation, so cancellation while waiting cannot leak quota.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -22,6 +22,50 @@ use crate::context::{
 };
 use crate::quota_clock::{quota_epoch, QuotaClock, SystemQuotaClock, QUOTA_EPOCH_MILLIS};
 use crate::ContextError;
+
+struct LedgerHealth {
+    started: std::time::Instant,
+    // One atomic publishes both the failed-closed latch and its timestamp.
+    // MAX means no failure; the first published timestamp is immutable.
+    failed_at_nanoseconds: AtomicU64,
+}
+
+impl Default for LedgerHealth {
+    fn default() -> Self {
+        Self::at(std::time::Instant::now())
+    }
+}
+
+impl LedgerHealth {
+    fn at(started: std::time::Instant) -> Self {
+        Self { started, failed_at_nanoseconds: AtomicU64::new(u64::MAX) }
+    }
+
+    fn elapsed_nanoseconds(&self, now: std::time::Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.started).as_nanos()).unwrap_or(u64::MAX - 1).min(u64::MAX - 1)
+    }
+
+    fn mark_unhealthy_at(&self, now: std::time::Instant) {
+        let at = self.elapsed_nanoseconds(now);
+        let _ = self.failed_at_nanoseconds.compare_exchange(u64::MAX, at, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn mark_unhealthy(&self) {
+        self.mark_unhealthy_at(std::time::Instant::now());
+    }
+
+    fn is_healthy(&self) -> bool { self.failed_at_nanoseconds.load(Ordering::Acquire) == u64::MAX }
+
+    fn snapshot_at(&self, now: std::time::Instant) -> (u64, u64) {
+        let elapsed = self.elapsed_nanoseconds(now);
+        let healthy = self.failed_at_nanoseconds.load(Ordering::Acquire).min(elapsed);
+        (healthy, elapsed.saturating_sub(healthy))
+    }
+
+    fn duration_nanoseconds(&self) -> (u64, u64) {
+        self.snapshot_at(std::time::Instant::now())
+    }
+}
 
 /// Rate limiter configuration.
 #[derive(Debug, Clone)]
@@ -97,7 +141,7 @@ pub struct RateLimiter {
     concurrency: Arc<Semaphore>,
     store: Arc<SqliteContextManager>,
     clock: Arc<dyn QuotaClock>,
-    healthy: Arc<AtomicBool>,
+    healthy: Arc<LedgerHealth>,
     capacity_changed: watch::Sender<u64>,
     last_pruned_epoch: AtomicU64,
     denied_provider_requests: AtomicU64,
@@ -150,7 +194,7 @@ impl RateLimiter {
             concurrency: Arc::new(Semaphore::new(permits)),
             store,
             clock,
-            healthy: Arc::new(AtomicBool::new(true)),
+            healthy: Arc::new(LedgerHealth::default()),
             capacity_changed,
             last_pruned_epoch: AtomicU64::new(recovery.effective_epoch),
             denied_provider_requests: AtomicU64::new(0),
@@ -166,12 +210,12 @@ impl RateLimiter {
     }
 
     fn poison(&self, error: ContextError) -> RateLimitError {
-        self.healthy.store(false, Ordering::Release);
+        self.healthy.mark_unhealthy();
         Self::storage_error(error)
     }
 
     fn ensure_healthy(&self) -> Result<(), RateLimitError> {
-        if self.healthy.load(Ordering::Acquire) {
+        if self.healthy.is_healthy() {
             Ok(())
         } else {
             Err(RateLimitError::StorageUnavailable(
@@ -583,6 +627,10 @@ impl RateLimiter {
         })
     }
 
+    pub(crate) fn health_duration_nanoseconds(&self) -> (u64, u64) {
+        self.healthy.duration_nanoseconds()
+    }
+
     pub fn try_is_limited(&self) -> Result<bool, RateLimitError> {
         let stats = self.try_stats()?;
         Ok(
@@ -623,7 +671,7 @@ impl RateLimiter {
 pub struct RateLimitGuard {
     permit: Option<OwnedSemaphorePermit>,
     store: Arc<SqliteContextManager>,
-    healthy: Arc<AtomicBool>,
+    healthy: Arc<LedgerHealth>,
     capacity_changed: watch::Sender<u64>,
     reservation: Option<ProviderRateReservation>,
     invoked: bool,
@@ -656,7 +704,7 @@ impl RateLimitGuard {
         self.store
             .mark_provider_rate_invoked(receipt.id)
             .map_err(|error| {
-                self.healthy.store(false, Ordering::Release);
+                self.healthy.mark_unhealthy();
                 RateLimiter::storage_error(error)
             })?;
         self.invoked = true;
@@ -672,7 +720,7 @@ impl RateLimitGuard {
             self.store
                 .refund_provider_rate_before_invocation(receipt.id)
                 .map_err(|error| {
-                    self.healthy.store(false, Ordering::Release);
+                    self.healthy.mark_unhealthy();
                     RateLimiter::storage_error(error)
                 })?;
             self.capacity_changed
@@ -691,7 +739,7 @@ impl RateLimitGuard {
             self.store
                 .reconcile_provider_rate(receipt.id, actual_tokens)
                 .map_err(|error| {
-                    self.healthy.store(false, Ordering::Release);
+                    self.healthy.mark_unhealthy();
                     RateLimiter::storage_error(error)
                 })?;
             self.capacity_changed
@@ -715,7 +763,7 @@ impl RateLimitGuard {
             self.store
                 .reconcile_provider_rate_attempts(receipt.id, actual_requests, actual_tokens)
                 .map_err(|error| {
-                    self.healthy.store(false, Ordering::Release);
+                    self.healthy.mark_unhealthy();
                     RateLimiter::storage_error(error)
                 })?;
             self.capacity_changed
@@ -737,7 +785,7 @@ impl RateLimitGuard {
             self.store
                 .retain_provider_rate_estimate(receipt.id)
                 .map_err(|error| {
-                    self.healthy.store(false, Ordering::Release);
+                    self.healthy.mark_unhealthy();
                     RateLimiter::storage_error(error)
                 })?;
         }
@@ -763,7 +811,7 @@ impl Drop for RateLimitGuard {
                     .send_modify(|generation| *generation = generation.wrapping_add(1));
             }
             Ok(()) => {}
-            Err(_) => self.healthy.store(false, Ordering::Release),
+            Err(_) => self.healthy.mark_unhealthy(),
         }
         self.permit.take();
     }
@@ -794,6 +842,46 @@ pub struct RateLimitStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_health_seconds_keep_fractional_intervals_and_never_reset_on_repeat_failure() {
+        let start = std::time::Instant::now();
+        let health = LedgerHealth::at(start);
+        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(250)), (250_000_000, 0));
+        health.mark_unhealthy_at(start + std::time::Duration::from_millis(350));
+        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(700)), (350_000_000, 350_000_000));
+        health.mark_unhealthy_at(start + std::time::Duration::from_millis(900));
+        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(1000)), (350_000_000, 650_000_000));
+    }
+
+    #[test]
+    fn ledger_failure_latches_admission_and_duration_source_together() {
+        let health = LedgerHealth::default();
+        assert!(health.is_healthy());
+        health.mark_unhealthy();
+        assert!(!health.is_healthy());
+        let first = health.duration_nanoseconds();
+        health.mark_unhealthy();
+        let second = health.duration_nanoseconds();
+        assert_eq!(second.0, first.0);
+        assert!(second.1 >= first.1);
+    }
+
+    #[test]
+    fn a_late_failure_report_cannot_rewrite_the_published_health_timestamp() {
+        let start = std::time::Instant::now();
+        let health = Arc::new(LedgerHealth::at(start));
+        health.mark_unhealthy_at(start + std::time::Duration::from_millis(10));
+        let before = health.snapshot_at(start + std::time::Duration::from_millis(20));
+        std::thread::scope(|scope| {
+            let health = health.clone();
+            scope.spawn(move || health.mark_unhealthy_at(start + std::time::Duration::from_millis(1))).join().unwrap();
+        });
+        assert!(!health.is_healthy());
+        assert_eq!(before, (10_000_000, 10_000_000));
+        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(20)), before);
+        assert_eq!(health.snapshot_at(start + std::time::Duration::from_millis(25)), (10_000_000, 15_000_000));
+    }
     use crate::quota_clock::ManualQuotaClock;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 

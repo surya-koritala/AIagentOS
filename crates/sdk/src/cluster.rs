@@ -20,11 +20,11 @@ use std::{
 };
 
 use crate::{
-    AgentMutationFence, AgentMutationFenceProof, AgentMutationFenceState, AgentSummary,
-    ClusterAgentOwnership, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
-    ClusterMembershipSnapshot, ClusterOwnershipState, KernelClient, MessageResult,
-    MessageStreamEvent, NodeAvailability, NodeLoad, ReservedAgentIdentity, SdkError, WireErrorCode,
-    AgentIdentityRecord, AgentIdentityState,
+    AgentIdentityRecord, AgentIdentityState, AgentMutationFence, AgentMutationFenceProof,
+    AgentMutationFenceState, AgentSummary, ClusterAgentOwnership, ClusterMember,
+    ClusterMemberRegistration, ClusterMemberState, ClusterMembershipSnapshot,
+    ClusterOwnershipState, KernelClient, MessageResult, MessageStreamEvent, NodeAvailability,
+    NodeLoad, ReservedAgentIdentity, SdkError, WireErrorCode,
 };
 
 /// Initial authority lease used when a discovered cluster places an agent.
@@ -1034,14 +1034,18 @@ impl ClusterClient {
             match identity.state {
                 AgentIdentityState::Prepared | AgentIdentityState::Created => {
                     if local_index.is_some() {
-                        return Err(route_conflict("unpublished immutable identity was exposed by a destination".into()));
+                        return Err(route_conflict(
+                            "unpublished immutable identity was exposed by a destination".into(),
+                        ));
                     }
                     report.pending_reservations += 1;
                     continue;
                 }
                 AgentIdentityState::Aborted | AgentIdentityState::Deleted => {
                     if local_index.is_some() {
-                        return Err(route_conflict("terminal immutable identity was exposed by a destination".into()));
+                        return Err(route_conflict(
+                            "terminal immutable identity was exposed by a destination".into(),
+                        ));
                     }
                     continue;
                 }
@@ -1067,11 +1071,23 @@ impl ClusterClient {
                     listed.agent_id, listed.owner_node_id, self.nodes[index].id
                 )));
             }
-            let receipt = self.nodes[index].client.destination_creation_receipt(&listed.agent_id).await?
-                .ok_or_else(|| route_conflict("published immutable identity has no exact destination creation receipt".into()))?;
-            receipt.validate(&identity.reservation).map_err(|error| route_conflict(error.to_string()))?;
+            let receipt = self.nodes[index]
+                .client
+                .destination_creation_receipt(&listed.agent_id)
+                .await?
+                .ok_or_else(|| {
+                    route_conflict(
+                        "published immutable identity has no exact destination creation receipt"
+                            .into(),
+                    )
+                })?;
+            receipt
+                .validate(&identity.reservation)
+                .map_err(|error| route_conflict(error.to_string()))?;
             if identity.creation_receipt.as_ref() != Some(&receipt) {
-                return Err(route_conflict("destination receipt differs from the immutable majority publication".into()));
+                return Err(route_conflict(
+                    "destination receipt differs from the immutable majority publication".into(),
+                ));
             }
             let authority = self
                 .authority
@@ -1140,15 +1156,28 @@ impl ClusterClient {
         Ok(report)
     }
 
-    async fn identity_directory(&mut self) -> Result<HashMap<String, AgentIdentityRecord>, SdkError> {
-        let authority = self.authority.as_mut().ok_or_else(|| SdkError::Configuration("immutable identity directory requires a discovered authority".into()))?;
+    async fn identity_directory(
+        &mut self,
+    ) -> Result<HashMap<String, AgentIdentityRecord>, SdkError> {
+        let authority = self.authority.as_mut().ok_or_else(|| {
+            SdkError::Configuration(
+                "immutable identity directory requires a discovered authority".into(),
+            )
+        })?;
         let mut records = HashMap::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = authority.client.cluster_agent_identities(cursor.clone(), 1000).await?;
-            if page.is_empty() { break; }
+            let page = authority
+                .client
+                .cluster_agent_identities(cursor.clone(), 1000)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
             for identity in page {
-                identity.validate().map_err(|error| route_conflict(error.to_string()))?;
+                identity
+                    .validate()
+                    .map_err(|error| route_conflict(error.to_string()))?;
                 let id = identity.reservation.agent_id.clone();
                 if identity.reservation.cluster_id != authority.cluster_id
                     || cursor.as_ref().is_some_and(|cursor| id <= *cursor)

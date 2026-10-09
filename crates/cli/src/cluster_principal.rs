@@ -308,7 +308,7 @@ mod tests {
         let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
         kernel::config::write_owner_only_atomic(&path, document.as_ref()).unwrap();
         assert!(PrincipalSigner::load(options(path.clone())).is_ok());
-        kernel::config::write_owner_only_atomic(&path, &vec![0; 4097]).unwrap();
+        kernel::config::write_owner_only_atomic(&path, &[0; 4097]).unwrap();
         let Err(error) = PrincipalSigner::load(options(path.clone())) else {
             panic!("oversized principal key accepted")
         };
@@ -321,12 +321,17 @@ mod tests {
         assert!(PrincipalSigner::load(options(root.path().into())).is_err());
         #[cfg(unix)]
         {
+            use std::os::unix::ffi::OsStrExt;
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(PrincipalSigner::load(options(path.clone())).is_err());
             let link = root.path().join("linked.pk8");
             std::os::unix::fs::symlink(&path, &link).unwrap();
             assert!(PrincipalSigner::load(options(link)).is_err());
+            let pipe = root.path().join("pipe.pk8");
+            let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            assert!(PrincipalSigner::load(options(pipe)).is_err());
         }
     }
 

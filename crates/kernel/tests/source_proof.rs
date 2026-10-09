@@ -43,8 +43,15 @@ fn prepare(repository: &Path, context: &Path) -> std::process::Output {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let repository = root.path().join("repo");
-        let context = root.path().join("context");
+        // Unix temporary roots can contain system symlinks, including macOS
+        // /var. The generator intentionally rejects every output ancestor
+        // symlink, so positive fixtures pass the actual owned directory.
+        #[cfg(unix)]
+        let actual_root = fs::canonicalize(root.path()).unwrap();
+        #[cfg(not(unix))]
+        let actual_root = root.path().to_path_buf();
+        let repository = actual_root.join("repo");
+        let context = actual_root.join("context");
         fs::create_dir(&repository).unwrap();
         git(&repository, &["init"]);
         fs::create_dir(repository.join("nested")).unwrap();
@@ -92,6 +99,10 @@ impl Fixture {
     fn proof(&self) -> serde_json::Value {
         serde_json::from_slice(&fs::read(self.context.join(source_proof::PROOF_FILE)).unwrap())
             .unwrap()
+    }
+
+    fn output(&self, name: &str) -> PathBuf {
+        self.repository.parent().unwrap().join(name)
     }
 
     fn replace(&self, proof: &serde_json::Value) {
@@ -258,12 +269,10 @@ fn unattested_file_directory_or_git_metadata_are_rejected() {
 fn dirty_checkout_cannot_generate_a_qualified_context() {
     let fixture = Fixture::new();
     fs::write(fixture.repository.join("README.md"), "dirty working copy\n").unwrap();
-    let output = prepare(
-        &fixture.repository,
-        &fixture._root.path().join("dirty-context"),
-    );
+    let output = prepare(&fixture.repository, &fixture.output("dirty-context"));
     assert!(!output.status.success());
-    assert!(!fixture._root.path().join("dirty-context").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tracked source must be clean"));
+    assert!(!fixture.output("dirty-context").exists());
 }
 
 #[test]
@@ -288,12 +297,10 @@ fn tracked_credential_path_is_refused_before_context_publication() {
             "test: forbidden credential path fixture",
         ],
     );
-    let output = prepare(
-        &fixture.repository,
-        &fixture._root.path().join("credential-context"),
-    );
+    let output = prepare(&fixture.repository, &fixture.output("credential-context"));
     assert!(!output.status.success());
-    assert!(!fixture._root.path().join("credential-context").exists());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("rejects symlink ancestors"));
+    assert!(!fixture.output("credential-context").exists());
 }
 
 #[test]
@@ -324,12 +331,10 @@ fn env_token_and_os_credential_paths_are_refused_case_insensitively() {
                 "test: sensitive source path fixture",
             ],
         );
-        let output = prepare(
-            &fixture.repository,
-            &fixture._root.path().join("forbidden-context"),
-        );
+        let output = prepare(&fixture.repository, &fixture.output("forbidden-context"));
         assert!(!output.status.success());
-        assert!(!fixture._root.path().join("forbidden-context").exists());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("rejects symlink ancestors"));
+        assert!(!fixture.output("forbidden-context").exists());
     }
 }
 
@@ -357,7 +362,7 @@ fn exact_public_npm_directives_validate_but_auth_content_cannot_be_generated() {
             "test: public npm directives fixture",
         ],
     );
-    let context = fixture._root.path().join("public-context");
+    let context = fixture.output("public-context");
     let output = prepare(&fixture.repository, &context);
     assert!(
         output.status.success(),
@@ -395,12 +400,10 @@ fn exact_public_npm_directives_validate_but_auth_content_cannot_be_generated() {
             "test: forbidden npm authentication fixture",
         ],
     );
-    let rejected = prepare(
-        &fixture.repository,
-        &fixture._root.path().join("auth-context"),
-    );
+    let rejected = prepare(&fixture.repository, &fixture.output("auth-context"));
     assert!(!rejected.status.success());
-    assert!(!fixture._root.path().join("auth-context").exists());
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains("rejects symlink ancestors"));
+    assert!(!fixture.output("auth-context").exists());
 }
 
 #[cfg(unix)]
@@ -417,9 +420,24 @@ fn symlink_replacement_does_not_validate_or_follow_external_source() {
 #[test]
 fn context_generator_refuses_output_alias_into_checkout() {
     let fixture = Fixture::new();
-    let alias = fixture._root.path().join("output-alias");
+    let alias = fixture.repository.parent().unwrap().join("output-alias");
     std::os::unix::fs::symlink(&fixture.repository, &alias).unwrap();
     let output = prepare(&fixture.repository, &alias.join("generated-context"));
     assert!(!output.status.success());
     assert!(!fixture.repository.join("generated-context").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn context_generator_refuses_output_alias_outside_checkout() {
+    let fixture = Fixture::new();
+    let root = fixture.repository.parent().unwrap();
+    let outside = root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let alias = root.join("outside-alias");
+    std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    let output = prepare(&fixture.repository, &alias.join("generated-context"));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rejects symlink ancestors"));
+    assert!(!outside.join("generated-context").exists());
 }

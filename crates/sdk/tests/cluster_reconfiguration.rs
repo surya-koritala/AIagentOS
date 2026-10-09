@@ -310,13 +310,18 @@ fn assert_no_native_delete_holders(_path: &std::path::Path) {}
 #[cfg(windows)]
 fn assert_no_native_delete_holders(path: &std::path::Path) {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
     let mut paths = vec![path.to_owned()];
     let mut cursor = 0;
     while cursor < paths.len() {
         assert!(paths.len() <= 64, "native fixture inventory is bounded");
         if paths[cursor].is_dir() {
-            let children = std::fs::read_dir(&paths[cursor]).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+            let children = std::fs::read_dir(&paths[cursor])
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
             paths.extend(children);
         }
         cursor += 1;
@@ -324,7 +329,11 @@ fn assert_no_native_delete_holders(path: &std::path::Path) {
     for target in paths.into_iter().rev() {
         // Requesting DELETE access without a delete disposition identifies an
         // outstanding incompatible native holder; it never retries deletion.
-        let probe = std::fs::OpenOptions::new().access_mode(DELETE).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(&target);
+        let probe = std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&target);
         match probe {
             Ok(handle) => drop(handle),
             Err(error) => panic!("native fixture target still has an incompatible deletion holder: {target:?}; {error}; holder identity requires further qualification"),

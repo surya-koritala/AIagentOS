@@ -606,13 +606,15 @@ pub struct KernelClient {
     authority_signer: Option<AuthoritySigner>,
 }
 
+type PrincipalSignCallback = dyn Fn(&[u8]) -> Result<Vec<u8>, PrincipalProofError> + Send + Sync;
+
 /// Explicit caller-owned key callback; no SDK key-file loading or node fallback.
 #[derive(Clone)]
 pub struct AuthoritySigner {
     pub cluster_id: String,
     pub principal_id: String,
     pub principal_generation: u64,
-    sign: std::sync::Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, PrincipalProofError> + Send + Sync>,
+    sign: std::sync::Arc<PrincipalSignCallback>,
 }
 
 impl AuthoritySigner {

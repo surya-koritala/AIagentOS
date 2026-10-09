@@ -3279,6 +3279,11 @@ async fn dispatch_scoped_inner_with_fence(
                 message: error.to_string(),
             };
         }
+        match crate::cluster_agent_identity::destination_agent_is_published(&kernel.context_manager, parsed_agent) {
+            Ok(true) => {},
+            Ok(false) => return SyscallReply::Error { message: "immutable agent identity is not published".into() },
+            Err(error) => return SyscallReply::Error { message: error.to_string() },
+        }
         return Box::pin(dispatch_scoped_inner_with_fence(
             kernel, *mutation, None, true, true,
         ))

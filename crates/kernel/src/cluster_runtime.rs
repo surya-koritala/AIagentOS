@@ -3463,6 +3463,10 @@ mod tests {
         use super::*;
         include!("cluster_principal_tests.rs");
     }
+    mod agent_identity_security_tests {
+        use super::*;
+        include!("cluster_agent_identity_runtime_tests.rs");
+    }
     use std::time::Instant;
 
     use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};

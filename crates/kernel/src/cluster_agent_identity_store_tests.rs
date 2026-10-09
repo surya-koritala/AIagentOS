@@ -176,7 +176,7 @@ fn immutable_identity_destination_crash_child() {
         .unwrap()
         .parse()
         .unwrap();
-    let store = SqliteContextManager::new(path).unwrap();
+    let store = SqliteContextManager::new(std::path::Path::new(&path)).unwrap();
     let (identity, record) = destination_fixture(&store, agent);
     begin_destination_creation(
         &store,

@@ -54,6 +54,10 @@ path = "docs/DESKTOP_DISTRIBUTION.md"
 kind = "current"
 
 [[surface]]
+path = "docs/DESTINATION_AUTHORITY.md"
+kind = "current"
+
+[[surface]]
 path = "docs/DISTRIBUTED_CONTROL_PLANE.md"
 kind = "current"
 

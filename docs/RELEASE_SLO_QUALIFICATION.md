@@ -96,9 +96,14 @@ has exactly `schema_version: 1`, `release_candidate`, `source` (`commit`,
 `prometheus_target` (`job`, `instance`). The configuration and workload digest
 fields must match the actual files. The exporter hashes both files before and
 after reading measurements; it rejects mismatches. The manifest is the target
-operator's retained identity binding, not a source identity inferred from a
-metric. Provisioning and independent review must verify the installed artifact
-and keep that binding valid throughout the window.
+operator's retained configuration binding. Every sample must additionally
+expose the runtime's compiled source identity as five fixed
+`agentos_build_source_sha1{part}` gauges and
+`agentos_build_source_verified: 1`. The exporter reconstructs the actual commit
+and requires it to match the declared clean source throughout the window.
+Missing Git build metadata, dirty tracked source, and mixed builds fail closed.
+Provisioning and independent review also verify the installed artifact and
+keep the deployment binding valid throughout the window.
 
 ```bash
 python3 scripts/slo_observation.py \
@@ -122,11 +127,14 @@ at least 30 measured days. The output window starts and ends at real retained
 sample timestamps, with at most 120 seconds between samples. It rejects missing
 sources, stale/duplicate/out-of-order samples, changed series, mixed targets,
 counter decreases without a measured process restart and incomplete ledger
-time. Availability and durability use the whole actual envelope; latency,
-queue, provider and tool outcomes use its final daily interval. Counter
-increases are measured per series before summation and include observed reset
-values. Unobserved pre-crash events cannot be reconstructed from scrape data.
-The continuous healthy-ledger interval resets at every observed restart;
+time. A restart discards the entire earlier prefix and starts a new baseline
+at the first post-restart sample; this newly reported window must independently
+cover at least 30 days. The exporter never treats unavailable terminal counters
+or unobserved failures before a crash as zero. Availability and durability use
+the whole resulting envelope; latency, queue, provider and tool outcomes use
+its final daily interval, including at most a few minutes of boundary samples
+to cover a full measured day. Counter increases are measured per series before
+summation. The continuous healthy-ledger interval resets at every observed restart;
 subsecond unhealthy time rounds upward. Histograms use the first finite bucket
 covering 95% as a conservative upper bound, without interpolating a better p95.
 

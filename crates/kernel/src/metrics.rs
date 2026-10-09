@@ -421,6 +421,21 @@ impl MetricsSnapshot {
             "agentos_telemetry_contract_info{{version=\"{}\"}} 1\n",
             self.telemetry_contract_version
         ));
+        out.push_str("# HELP agentos_build_source_sha1 Compiled Git source identity as five fixed 32-bit segments.\n");
+        out.push_str("# TYPE agentos_build_source_sha1 gauge\n");
+        let source = env!("AGENTOS_COMPILED_SOURCE_SHA");
+        for part in 0..5 {
+            let value = u32::from_str_radix(&source[part * 8..part * 8 + 8], 16).unwrap_or(0);
+            out.push_str(&format!(
+                "agentos_build_source_sha1{{part=\"{part}\"}} {value}\n"
+            ));
+        }
+        out.push_str("# HELP agentos_build_source_verified Whether compiled Git metadata was available and tracked source was clean.\n");
+        out.push_str("# TYPE agentos_build_source_verified gauge\n");
+        out.push_str(&format!(
+            "agentos_build_source_verified {}\n",
+            env!("AGENTOS_COMPILED_SOURCE_VERIFIED")
+        ));
         out.push_str("# HELP agentos_requests_in_flight Requests currently executing.\n");
         out.push_str("# TYPE agentos_requests_in_flight gauge\n");
         out.push_str(&format!(
@@ -1332,6 +1347,34 @@ mod tests {
     fn render_is_deterministic() {
         let s = sample();
         assert_eq!(s.render_prometheus(), s.render_prometheus());
+    }
+
+    #[test]
+    fn build_identity_matches_actual_compiled_source_with_fixed_labels() {
+        let text = sample().render_prometheus();
+        let source = env!("AGENTOS_COMPILED_SOURCE_SHA");
+        let mut rebuilt = String::new();
+        for part in 0..5 {
+            let prefix = format!("agentos_build_source_sha1{{part=\"{part}\"}} ");
+            let value: u32 = text
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .expect("fixed source segment exists")
+                .parse()
+                .unwrap();
+            rebuilt.push_str(&format!("{value:08x}"));
+        }
+        assert_eq!(rebuilt, source);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("agentos_build_source_sha1{"))
+                .count(),
+            5
+        );
+        assert!(text.contains(&format!(
+            "agentos_build_source_verified {}\n",
+            env!("AGENTOS_COMPILED_SOURCE_VERIFIED")
+        )));
     }
 
     #[test]

@@ -40,6 +40,14 @@ records `cancelled`, so transport cancellation cannot leak the in-flight gauge.
 The fixed request-latency histogram supports p95/p99 calculations without
 request, tenant, agent, tool, or provider labels.
 
+Compiled runtime identity uses five `agentos_build_source_sha1{part}` gauges
+with fixed `part` values `0` through `4`, each carrying one exact 32-bit segment,
+and `agentos_build_source_verified`. The build script reads the actual tracked
+Git source and marks missing metadata or dirty source unverified. Numeric
+segments preserve fixed label cardinality across builds. Target observations
+require every segment to reconstruct the expected clean commit; package builds
+without Git metadata remain usable but cannot supply eligible source evidence.
+
 `RequestSubsystem::request_class` defines the latency split in one place.
 Agent, checkpoint, memory, storage and tool traffic use the `agent` class;
 authentication, cluster, operator, package, protocol, service and system traffic

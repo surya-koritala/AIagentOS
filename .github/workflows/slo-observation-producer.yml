@@ -8,6 +8,9 @@ on:
       - 'scripts/tests/test_slo_observation.py'
       - 'scripts/release_slo_qualification.py'
       - 'scripts/phase1_promotion_qualification.py'
+      - 'crates/kernel/build.rs'
+      - 'crates/kernel/src/metrics.rs'
+      - 'observability/telemetry-contract-v2.toml'
       - '.github/workflows/slo-observation-producer.yml'
   pull_request:
     paths:
@@ -15,6 +18,9 @@ on:
       - 'scripts/tests/test_slo_observation.py'
       - 'scripts/release_slo_qualification.py'
       - 'scripts/phase1_promotion_qualification.py'
+      - 'crates/kernel/build.rs'
+      - 'crates/kernel/src/metrics.rs'
+      - 'observability/telemetry-contract-v2.toml'
       - '.github/workflows/slo-observation-producer.yml'
   workflow_dispatch:
 
@@ -26,6 +32,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formatting:
+    name: Runtime source identity formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Retain exact hosted formatting patch
+        run: |
+          mkdir -p target/qualification
+          git rev-parse HEAD > target/qualification/slo-format-source.txt
+          cargo fmt --all
+          git diff --binary > target/qualification/slo-format.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: slo-source-format-${{ github.run_id }}
+          path: target/qualification/slo-format*
+          retention-days: 30
+      - name: Require committed formatting
+        run: git diff --exit-code
+
+  runtime-identity:
+    name: Compiled identity and real HTTP (${{ matrix.os }})
+    needs: formatting
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_INCREMENTAL: 0
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Actual runtime identity, catalog and HTTP contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/qualification
+          git rev-parse HEAD > target/qualification/slo-runtime-source.txt
+          cargo test -p kernel --lib --locked metrics:: -- --nocapture 2>&1 | tee target/qualification/slo-runtime-tests.log
+          cargo test -p agent-cli --bin agent-server --locked metrics_http_endpoint_serves_exposition_and_404s -- --nocapture 2>&1 | tee -a target/qualification/slo-runtime-tests.log
+          cargo clippy -p kernel -p agent-cli --all-targets --locked -- -D warnings 2>&1 | tee target/qualification/slo-runtime-clippy.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: slo-runtime-identity-${{ runner.os }}-${{ github.run_id }}
+          path: target/qualification/slo-runtime-*
+          retention-days: 30
+          if-no-files-found: error
+
   producer:
     name: Nine-SLI source/schema and negative contracts
     runs-on: ubuntu-latest

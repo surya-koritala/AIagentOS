@@ -62,6 +62,7 @@ SCALARS = (
     "agentos_quota_storage_unhealthy_seconds_total",
     "agentos_backup_last_success_unixtime_seconds",
     "agentos_process_uptime_seconds",
+    "agentos_build_source_verified",
 )
 FAMILIES = SCALARS + (
     "agentos_requests_total", "agentos_request_class_total",
@@ -69,10 +70,12 @@ FAMILIES = SCALARS + (
     "agentos_request_class_duration_seconds_count",
     "agentos_llm_requests_total", "agentos_checkpoint_recovery_total",
     "agentos_quota_denied_total", "agentos_telemetry_contract_info",
+    "agentos_build_source_sha1",
 )
 GAUGES = frozenset((
     "agentos_process_uptime_seconds", "agentos_backup_last_success_unixtime_seconds",
     "agentos_telemetry_contract_info",
+    "agentos_build_source_sha1", "agentos_build_source_verified",
 ))
 FRACTIONAL_COUNTERS = frozenset((
     "agentos_quota_storage_healthy_seconds_total",
@@ -184,6 +187,8 @@ def metric_key(name: str, labels: Any) -> MetricKey:
         }
     elif name == "agentos_telemetry_contract_info":
         valid = labels == {"version": "2"}
+    elif name == "agentos_build_source_sha1":
+        valid = set(labels) == {"part"} and labels["part"] in {"0", "1", "2", "3", "4"}
     if not valid:
         raise ObservationError(f"{name} has undeclared metric labels")
     return name, tuple(sorted(labels.items()))
@@ -204,6 +209,10 @@ def parse_samples(samples: Any) -> dict[MetricKey, Decimal]:
             raise ObservationError(f"required metric absent: {name}")
     if result.get(metric_key("agentos_telemetry_contract_info", {"version": "2"})) != 1:
         raise ObservationError("telemetry contract v2 is required")
+    for part in range(5):
+        value = result.get(metric_key("agentos_build_source_sha1", {"part": str(part)}))
+        if value is None or value > 2**32 - 1:
+            raise ObservationError("compiled runtime source identity is incomplete")
     for outcome in OUTCOMES:
         if metric_key("agentos_llm_requests_total", {"outcome": outcome}) not in result:
             raise ObservationError("provider outcome source is incomplete")
@@ -308,11 +317,12 @@ def prometheus_frames(base: str, job: str, instance: str, start: Decimal, end: D
 
 
 class Measurements:
-    def __init__(self, requested_start: Decimal, requested_end: Decimal):
+    def __init__(self, requested_start: Decimal, requested_end: Decimal, expected_commit: str | None = None):
         if not evaluator.MIN_30D_SECONDS <= requested_end - requested_start <= MAX_WINDOW_SECONDS:
             raise ObservationError("requested window must span 30 to 32 days")
         self.requested_start = requested_start
         self.requested_end = requested_end
+        self.expected_commit = expected_commit
         self.first: Decimal | None = None
         self.previous: tuple[Decimal, dict[MetricKey, Decimal]] | None = None
         self.deltas: dict[MetricKey, Decimal] = defaultdict(Decimal)
@@ -327,6 +337,14 @@ class Measurements:
         for at, samples in frames:
             if at < self.requested_start or at > self.requested_end:
                 continue
+            self.frames += 1
+            if self.frames > 600_000:
+                raise ObservationError("observation exceeds its frame bound")
+            source = "".join(f"{int(samples[metric_key('agentos_build_source_sha1', {'part': str(part)})]):08x}" for part in range(5))
+            if samples[("agentos_build_source_verified", ())] != 1 or (self.expected_commit is not None and source != self.expected_commit):
+                raise ObservationError("runtime build identity is dirty, unknown or differs from the declared source")
+            if self.expected_commit is None:
+                self.expected_commit = source
             if self.first is None:
                 if at - self.requested_start > MAX_GAP_SECONDS:
                     raise ObservationError("metrics archive does not cover the window start")
@@ -342,8 +360,18 @@ class Measurements:
                 if restart:
                     self.restarts += 1
                     self.healthy_period = Decimal(0)
+                    self.unhealthy = Decimal(0)
+                    self.first = at
+                    self.deltas.clear()
+                    self.daily_deltas.clear()
+                    self.daily_first = None
+                    # The old process's terminal counters are unavailable.
+                    # Make this actual sample the new baseline; never invent
+                    # zero failures for the interval ending at its crash.
+                    self.previous = at, samples
+                    continue
                 for key, value in prior.items():
-                    if key not in samples and not restart:
+                    if key not in samples:
                         raise ObservationError("a previously measured series disappeared")
                 for key, value in samples.items():
                     if key[0] in GAUGES:
@@ -351,17 +379,17 @@ class Measurements:
                     old = prior.get(key, Decimal(0))
                     if value < old and not restart:
                         raise ObservationError("counter decreased without a measured process restart")
-                    delta = value if restart else value - old
+                    delta = value - old
                     self.deltas[key] += delta
-                    if at > self.requested_end - 86_400:
+                    if at > self.requested_end - 86_400 - MAX_GAP_SECONDS:
                         if self.daily_first is None:
                             self.daily_first = prior_at
                         self.daily_deltas[key] += delta
                 healthy = samples[("agentos_quota_storage_healthy_seconds_total", ())]
                 unhealthy = samples[("agentos_quota_storage_unhealthy_seconds_total", ())]
-                healthy_delta = healthy if restart else healthy - prior[("agentos_quota_storage_healthy_seconds_total", ())]
-                unhealthy_delta = unhealthy if restart else unhealthy - prior[("agentos_quota_storage_unhealthy_seconds_total", ())]
-                if not restart and abs(healthy_delta + unhealthy_delta - elapsed) > 3:
+                healthy_delta = healthy - prior[("agentos_quota_storage_healthy_seconds_total", ())]
+                unhealthy_delta = unhealthy - prior[("agentos_quota_storage_unhealthy_seconds_total", ())]
+                if abs(healthy_delta + unhealthy_delta - elapsed) > 3:
                     raise ObservationError("ledger measurement interval does not cover elapsed target time")
                 self.unhealthy += unhealthy_delta
                 if unhealthy_delta > 0:
@@ -369,9 +397,6 @@ class Measurements:
                 else:
                     self.healthy_period += min(healthy_delta, elapsed)
             self.previous = at, samples
-            self.frames += 1
-            if self.frames > 600_000:
-                raise ObservationError("observation exceeds its frame bound")
         if self.previous is None or self.first is None or self.requested_end - self.previous[0] > MAX_GAP_SECONDS:
             raise ObservationError("metrics archive does not cover the window end")
         if self.previous[0] - self.first < evaluator.MIN_30D_SECONDS:
@@ -496,7 +521,7 @@ def build_observation(deployment: dict[str, Any], config: Path, dataset: Path, f
     if environment["configuration_sha256"] != file_digest(config) or environment["dataset_sha256"] != file_digest(dataset):
         raise ObservationError("frozen configuration or workload digest differs from deployment")
     binding = {"source": deployment["source"], "environment_id": environment["environment_id"], "configuration_sha256": environment["configuration_sha256"], "dataset_sha256": environment["dataset_sha256"]}
-    measurements = Measurements(requested_start, requested_end)
+    measurements = Measurements(requested_start, requested_end, deployment["source"]["commit"])
     measurements.consume(frames)
     assert measurements.first is not None and measurements.previous is not None
     report = {"schema_version": 1, "qualification_class": evaluator.QUALIFICATION_CLASS, "release_candidate": deployment["release_candidate"], "source": deployment["source"], "environment": environment, "window": {"start": utc(measurements.first), "end": utc(measurements.previous[0])}, "alert_firings": alert_history(history, binding, measurements.first, measurements.previous[0]), "slis": measurements.slis()}

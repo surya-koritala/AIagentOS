@@ -27,12 +27,15 @@ def snapshot(elapsed=0, *, reboot=False, unhealthy="0"):
     samples = [{"name": name, "labels": {}, "value": 0} for name in producer.SCALARS]
     samples.extend([
         {"name": "agentos_telemetry_contract_info", "labels": {"version": "2"}, "value": 1},
+        *({"name": "agentos_build_source_sha1", "labels": {"part": str(part)}, "value": int("a" * 8, 16)} for part in range(5)),
         *({"name": "agentos_llm_requests_total", "labels": {"outcome": outcome}, "value": int(runtime) if outcome == "success" else 0} for outcome in producer.OUTCOMES),
         *({"name": "agentos_checkpoint_recovery_total", "labels": {"outcome": outcome}, "value": 0} for outcome in ("recovered", "safe_rejected")),
     ])
     for sample in samples:
         if sample["name"] == "agentos_process_uptime_seconds":
             sample["value"] = int(runtime)
+        elif sample["name"] == "agentos_build_source_verified":
+            sample["value"] = 1
         elif sample["name"] == "agentos_quota_storage_healthy_seconds_total":
             sample["value"] = str(runtime - Decimal(unhealthy))
         elif sample["name"] == "agentos_quota_storage_unhealthy_seconds_total":
@@ -85,8 +88,8 @@ class SloObservationTests(unittest.TestCase):
         measured.consume(frames())
         result = measured.slis()
         self.assertEqual(result["availability"]["success"], 2_592_000)
-        self.assertEqual(result["llm_success"]["success"], 86_400)
-        self.assertEqual(result["llm_success"]["window_seconds"], 86_400)
+        self.assertEqual(result["llm_success"]["success"], 86_520)
+        self.assertEqual(result["llm_success"]["window_seconds"], 86_520)
         self.assertEqual(result["syscall_latency"]["control_p95_seconds"], 0.25)
         self.assertEqual(result["data_durability"]["continuous_ledger_healthy_seconds"], 2_592_000)
         self.assertEqual(result["data_durability"]["latest_verified_backup_age_seconds"], 3600)
@@ -95,10 +98,39 @@ class SloObservationTests(unittest.TestCase):
 
     def test_restart_increases_do_not_claim_continuous_healthy_month(self):
         measured = producer.Measurements(START, END)
-        measured.consume(frames(reboot=True))
+        with self.assertRaisesRegex(producer.ObservationError, "actual sampled window is shorter"):
+            measured.consume(frames(reboot=True))
         self.assertEqual(measured.restarts, 30)
-        self.assertLess(measured.slis()["data_durability"]["continuous_ledger_healthy_seconds"], 86_400)
-        self.assertGreater(measured.slis()["availability"]["success"], 0)
+
+    def test_early_restart_discards_unknown_prefix_and_requires_full_new_month(self):
+        requested_end = START + 32 * 86_400
+        measured = producer.Measurements(START, requested_end, "a" * 40)
+
+        def restarted_frames():
+            for elapsed in range(0, 32 * 86_400 + 1, 120):
+                samples = producer.parse_samples(snapshot(elapsed))
+                if elapsed >= 86_400:
+                    for key in list(samples):
+                        if key[0] not in producer.GAUGES:
+                            samples[key] = max(Decimal(0), samples[key] - (86_400 if samples[key] >= 86_400 else 0))
+                    samples[("agentos_process_uptime_seconds", ())] -= 86_400
+                yield START + elapsed, samples
+
+        measured.consume(restarted_frames())
+        self.assertEqual(measured.first, START + 86_400)
+        self.assertEqual(measured.restarts, 1)
+        self.assertEqual(measured.slis()["availability"]["success"], 31 * 86_400)
+        self.assertEqual(measured.slis()["availability"]["window_seconds"], 31 * 86_400)
+
+    def test_reused_instance_or_dirty_build_cannot_claim_manifest_source(self):
+        for kind in ("different", "dirty"):
+            samples = producer.parse_samples(snapshot())
+            if kind == "dirty":
+                samples[("agentos_build_source_verified", ())] = 0
+            else:
+                samples[producer.metric_key("agentos_build_source_sha1", {"part": "0"})] += 1
+            with self.subTest(kind=kind), self.assertRaisesRegex(producer.ObservationError, "runtime build identity"):
+                producer.Measurements(START, END, "a" * 40).consume([(START, samples)])
 
     def test_coverage_gap_reset_without_reboot_and_duplicate_fail(self):
         for bad_frames in (

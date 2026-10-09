@@ -11,6 +11,19 @@ labels = ["version"]
 allowed_label_values = { version = ["2"] }
 
 [[metric]]
+name = "agentos_build_source_sha1"
+type = "gauge"
+unit = "dimensionless"
+labels = ["part"]
+allowed_label_values = { part = ["0", "1", "2", "3", "4"] }
+
+[[metric]]
+name = "agentos_build_source_verified"
+type = "gauge"
+unit = "dimensionless"
+labels = []
+
+[[metric]]
 name = "agentos_request_class_total"
 type = "counter"
 unit = "requests"

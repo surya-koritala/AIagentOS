@@ -434,8 +434,13 @@ pub fn inspect_destination_creation_receipt(
     identity: &AgentIdentityRecord,
 ) -> Result<Option<DestinationCreationReceipt>, ContextError> {
     identity.validate().map_err(evidence_error)?;
-    if matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted) {
-        return Err(failure("terminal immutable identity refuses destination receipt inspection"));
+    if matches!(
+        identity.state,
+        AgentIdentityState::Aborted | AgentIdentityState::Deleted
+    ) {
+        return Err(failure(
+            "terminal immutable identity refuses destination receipt inspection",
+        ));
     }
     let has_receipt = {
         let connection = kernel.context_manager.locked_conn();
@@ -450,7 +455,11 @@ pub fn inspect_destination_creation_receipt(
             _ => return Err(failure("destination receipt inspection retains conflicting or incomplete local row evidence")),
         }
     };
-    if has_receipt { destination_creation_receipt(kernel, identity).map(Some) } else { Ok(None) }
+    if has_receipt {
+        destination_creation_receipt(kernel, identity).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// The caller has just verified this Published record through an online quorum
@@ -541,8 +550,13 @@ pub(crate) fn retain_identity_tombstones(
                 ));
             }
             if identity.state == AgentIdentityState::Deleted && local.receipt.is_none() {
-                let receipt = identity.creation_receipt.as_ref().ok_or_else(|| failure("deletion tombstone has no exact committed receipt"))?;
-                if receipt.destination_installation_id != local.installation_id || receipt.local_receipt_id != local.local_receipt_id {
+                let receipt = identity
+                    .creation_receipt
+                    .as_ref()
+                    .ok_or_else(|| failure("deletion tombstone has no exact committed receipt"))?;
+                if receipt.destination_installation_id != local.installation_id
+                    || receipt.local_receipt_id != local.local_receipt_id
+                {
                     return Err(failure("restored deletion tombstone retains ambiguous destination receipt identity"));
                 }
                 // A restored Prepared image may lack the later local row.
@@ -568,23 +582,46 @@ pub fn verify_destination_identity_erasure(
     identity: &AgentIdentityRecord,
 ) -> Result<(), ContextError> {
     identity.validate().map_err(evidence_error)?;
-    if !matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted) {
-        return Err(failure("destination erasure requires a committed immutable identity tombstone"));
+    if !matches!(
+        identity.state,
+        AgentIdentityState::Aborted | AgentIdentityState::Deleted
+    ) {
+        return Err(failure(
+            "destination erasure requires a committed immutable identity tombstone",
+        ));
     }
     let connection = store.locked_conn();
     let row = row_sha256(&connection, &identity.reservation.agent_id)?;
     let local = load_local(&connection, &identity.reservation.agent_id)?;
     let Some(local) = local else {
-        return if row.is_none() { Ok(()) } else { Err(failure("destination erasure cannot adopt a foreign local row")) };
+        return if row.is_none() {
+            Ok(())
+        } else {
+            Err(failure(
+                "destination erasure cannot adopt a foreign local row",
+            ))
+        };
     };
-    if local.reservation != identity.reservation || !matches!(local.state.as_str(), "aborted" | "deleted") {
-        return Err(failure("destination erasure differs from its exact retained tombstone"));
+    if local.reservation != identity.reservation
+        || !matches!(local.state.as_str(), "aborted" | "deleted")
+    {
+        return Err(failure(
+            "destination erasure differs from its exact retained tombstone",
+        ));
     }
     if row.is_some() && (local.receipt.is_none() || row != local.row_sha256) {
-        return Err(failure("destination erasure refuses partial or mismatched local row evidence"));
+        return Err(failure(
+            "destination erasure refuses partial or mismatched local row evidence",
+        ));
     }
-    if local.receipt.as_ref().is_some_and(|receipt| identity.creation_receipt.as_ref() != Some(receipt)) {
-        return Err(failure("destination erasure receipt differs from its committed tombstone"));
+    if local
+        .receipt
+        .as_ref()
+        .is_some_and(|receipt| identity.creation_receipt.as_ref() != Some(receipt))
+    {
+        return Err(failure(
+            "destination erasure receipt differs from its committed tombstone",
+        ));
     }
     Ok(())
 }
@@ -594,16 +631,22 @@ pub(crate) fn guard_local_identity_erasure(
     agent_id: uuid::Uuid,
     allow_preparation_rollback: bool,
 ) -> Result<(), ContextError> {
-    let Some(local) = load_local(connection, &agent_id.to_string())? else { return Ok(()); };
+    let Some(local) = load_local(connection, &agent_id.to_string())? else {
+        return Ok(());
+    };
     if allow_preparation_rollback && local.state == "preparing" && local.receipt.is_none() {
         return Ok(());
     }
     if !matches!(local.state.as_str(), "aborted" | "deleted") {
-        return Err(failure("managed agent erasure requires a committed immutable identity tombstone"));
+        return Err(failure(
+            "managed agent erasure requires a committed immutable identity tombstone",
+        ));
     }
     let row = row_sha256(connection, &agent_id.to_string())?;
     if row.is_some() && (local.receipt.is_none() || row != local.row_sha256) {
-        return Err(failure("managed agent erasure refuses partial or foreign local row evidence"));
+        return Err(failure(
+            "managed agent erasure refuses partial or foreign local row evidence",
+        ));
     }
     Ok(())
 }

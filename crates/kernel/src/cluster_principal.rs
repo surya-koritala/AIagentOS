@@ -214,7 +214,9 @@ pub fn authority_command_semantic_sha256(
     // Identity retries may enter through a different currently admitted node.
     // Its actor is authenticated separately by the node delegation; immutable
     // identity, creator, scope, digest and destination remain caller-signed.
-    if crate::cluster_agent_identity::identity_command_agent(unsigned_authority_command(command)?).is_some() {
+    if crate::cluster_agent_identity::identity_command_agent(unsigned_authority_command(command)?)
+        .is_some()
+    {
         fields.remove("actor");
     }
     let mut canonical = Vec::new();

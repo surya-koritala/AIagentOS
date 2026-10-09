@@ -549,11 +549,23 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
     let (_, mut prepared_state) = open_cluster_raft_storage(prepared_restore.clone()).unwrap();
     let mut latest_builder = current.get_snapshot_builder().await;
     let latest_snapshot = latest_builder.build_snapshot().await.unwrap();
-    prepared_state.install_snapshot(&latest_snapshot.meta, latest_snapshot.snapshot).await.unwrap();
-    assert_eq!(read_initialized_authority_view(&prepared_restore).unwrap().agent_identities[&agent.to_string()], deleted);
+    prepared_state
+        .install_snapshot(&latest_snapshot.meta, latest_snapshot.snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_initialized_authority_view(&prepared_restore)
+            .unwrap()
+            .agent_identities[&agent.to_string()],
+        deleted
+    );
     assert!(prepared_restore.agent_tenant(agent).unwrap().is_none());
-    assert!(!crate::cluster_agent_identity::destination_agent_is_published(&prepared_restore, agent).unwrap());
-    crate::cluster_agent_identity::verify_destination_identity_erasure(&prepared_restore, &deleted).unwrap();
+    assert!(
+        !crate::cluster_agent_identity::destination_agent_is_published(&prepared_restore, agent)
+            .unwrap()
+    );
+    crate::cluster_agent_identity::verify_destination_identity_erasure(&prepared_restore, &deleted)
+        .unwrap();
 
     // A minority cannot make a newly allocated identity visible or return a
     // successful publication. The interrupted operation remains indeterminate.

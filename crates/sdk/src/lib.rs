@@ -2563,8 +2563,15 @@ impl KernelClient {
         &mut self,
         agent_id: impl Into<String>,
     ) -> Result<Option<DestinationCreationReceipt>, SdkError> {
-        match self.call(Syscall::GetDestinationCreationReceipt { agent_id: agent_id.into() }).await? {
-            SyscallReply::DestinationCreationReceipt { receipt } => Ok(receipt.map(|receipt| *receipt)),
+        match self
+            .call(Syscall::GetDestinationCreationReceipt {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::DestinationCreationReceipt { receipt } => {
+                Ok(receipt.map(|receipt| *receipt))
+            }
             other => Err(unexpected("DestinationCreationReceipt", &other)),
         }
     }

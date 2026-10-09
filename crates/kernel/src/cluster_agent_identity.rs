@@ -435,13 +435,12 @@ mod destination_store;
 
 pub use destination_store::{
     begin_destination_creation, destination_agent_is_published, destination_creation_receipt,
-    inspect_destination_creation_receipt,
-    verify_destination_identity_erasure,
-    require_local_identity_tombstone,
-    publish_destination_identity, DestinationCreationAdmission,
+    inspect_destination_creation_receipt, publish_destination_identity,
+    require_local_identity_tombstone, verify_destination_identity_erasure,
+    DestinationCreationAdmission,
 };
 pub(crate) use destination_store::{
-    commit_agent_creation_evidence, crash_identity_after_step_for_test, retain_identity_tombstones,
-    validate_creation_write, validate_destination_identity_store,
-    guard_local_identity_erasure,
+    commit_agent_creation_evidence, crash_identity_after_step_for_test,
+    guard_local_identity_erasure, retain_identity_tombstones, validate_creation_write,
+    validate_destination_identity_store,
 };

@@ -2082,7 +2082,8 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListClusterAgentOwnershipAudit { .. } => {
             (AccessLevel::System, "cluster.ownership.audit", None)
         }
-        Syscall::GetClusterAgentIdentity { .. } | Syscall::ListClusterAgentIdentities { .. }
+        Syscall::GetClusterAgentIdentity { .. }
+        | Syscall::ListClusterAgentIdentities { .. }
         | Syscall::GetDestinationCreationReceipt { .. } => {
             (AccessLevel::ReadOnly, "cluster.agent_identity.read", None)
         }
@@ -11613,7 +11614,12 @@ memory = ["remember this"]
         let unscoped_calls = unscoped_calls
             .into_iter()
             .chain([
-                (Syscall::GetDestinationCreationReceipt { agent_id: uuid::Uuid::new_v4().to_string() }, AccessLevel::ReadOnly),
+                (
+                    Syscall::GetDestinationCreationReceipt {
+                        agent_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    AccessLevel::ReadOnly,
+                ),
                 (
                     Syscall::GetClusterAgentIdentity {
                         agent_id: uuid::Uuid::new_v4().to_string(),

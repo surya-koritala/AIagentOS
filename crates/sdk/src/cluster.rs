@@ -24,6 +24,7 @@ use crate::{
     ClusterAgentOwnership, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
     ClusterMembershipSnapshot, ClusterOwnershipState, KernelClient, MessageResult,
     MessageStreamEvent, NodeAvailability, NodeLoad, ReservedAgentIdentity, SdkError, WireErrorCode,
+    AgentIdentityRecord, AgentIdentityState,
 };
 
 /// Initial authority lease used when a discovered cluster places an agent.
@@ -991,11 +992,9 @@ impl ClusterClient {
     /// Reconcile managed routes from the authority directory and exact local
     /// node state.
     ///
-    /// An unexpired pre-creation reservation is left pending so a concurrent
-    /// creator cannot be raced. Once that reservation expires, absence of the
-    /// exact agent on every node proves that it can be released. An expired
-    /// lease with the exact agent on its recorded owner is recovered with the
-    /// previous token, producing a strictly newer fence.
+    /// Incomplete immutable identities remain pending. Publication requires the
+    /// exact destination receipt and current majority record before a route is
+    /// rebuilt; UUID presence alone never proves identity or permits adoption.
     pub async fn reconcile_routes(&mut self) -> Result<ClusterReconciliationReport, SdkError> {
         if self.authority.is_none() {
             return Err(SdkError::Configuration(
@@ -1018,6 +1017,7 @@ impl ClusterClient {
         }
 
         let ownerships = self.ownership_directory().await?;
+        let identities = self.identity_directory().await?;
         let directory_ids: HashSet<String> = ownerships
             .iter()
             .map(|ownership| ownership.agent_id.clone())
@@ -1028,6 +1028,25 @@ impl ClusterClient {
 
         for listed in ownerships {
             let local_index = local_agents.get(&listed.agent_id).copied();
+            let identity = identities.get(&listed.agent_id).ok_or_else(|| route_conflict(
+                "ownership without an immutable quorum identity requires explicit reconciliation".into()
+            ))?;
+            match identity.state {
+                AgentIdentityState::Prepared | AgentIdentityState::Created => {
+                    if local_index.is_some() {
+                        return Err(route_conflict("unpublished immutable identity was exposed by a destination".into()));
+                    }
+                    report.pending_reservations += 1;
+                    continue;
+                }
+                AgentIdentityState::Aborted | AgentIdentityState::Deleted => {
+                    if local_index.is_some() {
+                        return Err(route_conflict("terminal immutable identity was exposed by a destination".into()));
+                    }
+                    continue;
+                }
+                AgentIdentityState::Published => {}
+            }
             if listed.state == ClusterOwnershipState::Released {
                 if local_index.is_some() {
                     return Err(route_conflict(format!(
@@ -1039,135 +1058,7 @@ impl ClusterClient {
             }
 
             let Some(index) = local_index else {
-                if listed.reason != "cluster client pre-creation reservation" {
-                    return Err(route_conflict(format!(
-                        "authority owns agent {} but no cluster node contains it",
-                        listed.agent_id
-                    )));
-                }
-                let active_result = self
-                    .authority
-                    .as_mut()
-                    .expect("managed reconciliation retains authority")
-                    .client
-                    .active_cluster_agent_ownership(&listed.agent_id)
-                    .await;
-                match active_result {
-                    Ok(active) => {
-                        validate_active_ownership(
-                            &listed.agent_id,
-                            &listed.owner_node_id,
-                            &active,
-                        )?;
-                        report.pending_reservations += 1;
-                    }
-                    Err(error) if error.wire_code() == Some(WireErrorCode::Conflict) => {
-                        let destination_index = self
-                            .nodes
-                            .iter()
-                            .position(|node| node.id == listed.owner_node_id)
-                            .ok_or_else(|| {
-                                route_conflict(format!(
-                                    "reservation {} names an unavailable destination {}",
-                                    listed.agent_id, listed.owner_node_id
-                                ))
-                            })?;
-                        let (recovered, cluster_id) = {
-                            let authority = self
-                                .authority
-                                .as_mut()
-                                .expect("managed reconciliation retains authority");
-                            let current = authority
-                                .client
-                                .cluster_agent_ownership(&listed.agent_id)
-                                .await?
-                                .ok_or_else(|| {
-                                    route_conflict(format!(
-                                        "ownership {} disappeared during reconciliation",
-                                        listed.agent_id
-                                    ))
-                                })?;
-                            if current.state == ClusterOwnershipState::Released {
-                                continue;
-                            }
-                            if current.owner_node_id != listed.owner_node_id
-                                || current.fencing_token != listed.fencing_token
-                                || current.reason != "cluster client pre-creation reservation"
-                            {
-                                return Err(route_conflict(format!(
-                                    "ownership {} changed while reconciling a reservation",
-                                    listed.agent_id
-                                )));
-                            }
-                            let recovered = authority
-                                .client
-                                .claim_cluster_agent_ownership(
-                                    &current.agent_id,
-                                    &current.owner_node_id,
-                                    authority.lease_ttl_seconds,
-                                    Some(current.fencing_token),
-                                    "cluster client pre-creation reservation",
-                                )
-                                .await?;
-                            (recovered, authority.cluster_id.clone())
-                        };
-                        let proof = ownership_proof(&cluster_id, &recovered);
-                        let fence = self.nodes[destination_index]
-                            .client
-                            .install_agent_mutation_fence(
-                                &recovered.agent_id,
-                                &proof.cluster_id,
-                                &proof.owner_node_id,
-                                proof.authority_term,
-                                proof.authority_generation,
-                                proof.fencing_token,
-                                proof.proof_expires_at,
-                                "fence expired incomplete cluster creation",
-                            )
-                            .await?;
-                        validate_destination_fence(&recovered.agent_id, &proof, &fence)?;
-                        let appeared = self.nodes[destination_index]
-                            .client
-                            .list_agents()
-                            .await?
-                            .iter()
-                            .any(|agent| agent.id == recovered.agent_id);
-                        if appeared {
-                            rebuilt.insert(recovered.agent_id.clone(), destination_index);
-                            rebuilt_proofs.insert(recovered.agent_id, proof);
-                            report.recovered_expired_leases += 1;
-                            report.published_routes += 1;
-                        } else {
-                            self.nodes[destination_index]
-                                .client
-                                .retire_agent_mutation_fence(
-                                    &recovered.agent_id,
-                                    &proof.cluster_id,
-                                    &proof.owner_node_id,
-                                    proof.authority_term,
-                                    proof.authority_generation,
-                                    proof.fencing_token,
-                                    proof.proof_expires_at,
-                                    "retire expired incomplete cluster creation",
-                                )
-                                .await?;
-                            self.authority
-                                .as_mut()
-                                .expect("managed reconciliation retains authority")
-                                .client
-                                .release_cluster_agent_ownership(
-                                    &recovered.agent_id,
-                                    &recovered.owner_node_id,
-                                    recovered.fencing_token,
-                                    "release expired incomplete cluster creation",
-                                )
-                                .await?;
-                            report.released_expired_reservations += 1;
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-                continue;
+                return Err(route_conflict("published immutable identity has no exact destination row; reconciliation must retain this gap".into()));
             };
 
             if self.nodes[index].id != listed.owner_node_id {
@@ -1175,6 +1066,12 @@ impl ClusterClient {
                     "authority routes agent {} to {} but durable local state is on {}",
                     listed.agent_id, listed.owner_node_id, self.nodes[index].id
                 )));
+            }
+            let receipt = self.nodes[index].client.destination_creation_receipt(&listed.agent_id).await?
+                .ok_or_else(|| route_conflict("published immutable identity has no exact destination creation receipt".into()))?;
+            receipt.validate(&identity.reservation).map_err(|error| route_conflict(error.to_string()))?;
+            if identity.creation_receipt.as_ref() != Some(&receipt) {
+                return Err(route_conflict("destination receipt differs from the immutable majority publication".into()));
             }
             let authority = self
                 .authority
@@ -1241,6 +1138,29 @@ impl ClusterClient {
         self.ownership_proofs = rebuilt_proofs;
         self.replace_maintenance_routes();
         Ok(report)
+    }
+
+    async fn identity_directory(&mut self) -> Result<HashMap<String, AgentIdentityRecord>, SdkError> {
+        let authority = self.authority.as_mut().ok_or_else(|| SdkError::Configuration("immutable identity directory requires a discovered authority".into()))?;
+        let mut records = HashMap::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = authority.client.cluster_agent_identities(cursor.clone(), 1000).await?;
+            if page.is_empty() { break; }
+            for identity in page {
+                identity.validate().map_err(|error| route_conflict(error.to_string()))?;
+                let id = identity.reservation.agent_id.clone();
+                if identity.reservation.cluster_id != authority.cluster_id
+                    || cursor.as_ref().is_some_and(|cursor| id <= *cursor)
+                    || records.insert(id.clone(), identity).is_some()
+                    || records.len() > kernel::cluster_agent_identity::MAX_AGENT_IDENTITIES
+                {
+                    return Err(route_conflict("immutable identity directory contains conflicting or out-of-order evidence".into()));
+                }
+                cursor = Some(id);
+            }
+        }
+        Ok(records)
     }
 
     async fn ownership_directory(&mut self) -> Result<Vec<ClusterAgentOwnership>, SdkError> {

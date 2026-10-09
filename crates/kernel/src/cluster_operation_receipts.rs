@@ -567,9 +567,20 @@ mod tests {
         };
         let denied = crate::syscall_server::dispatch_scoped(&kernel, original, Some(&actor)).await;
         let encoded = serde_json::to_string(&denied).unwrap();
-        assert!(matches!(&denied, SyscallReply::Error { message } if message == "resource not found or access denied"));
-        let missing = crate::syscall_server::dispatch_scoped(&kernel, call(uuid::Uuid::new_v4()), Some(&actor)).await;
-        assert_eq!(serde_json::to_value(&denied).unwrap(), serde_json::to_value(missing).unwrap(), "cached and missing operations must have the same authorization denial");
+        assert!(
+            matches!(&denied, SyscallReply::Error { message } if message == "resource not found or access denied")
+        );
+        let missing = crate::syscall_server::dispatch_scoped(
+            &kernel,
+            call(uuid::Uuid::new_v4()),
+            Some(&actor),
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(&denied).unwrap(),
+            serde_json::to_value(missing).unwrap(),
+            "cached and missing operations must have the same authorization denial"
+        );
         assert!(!encoded.contains("receipt fixture"));
         assert!(!encoded.contains("draining"));
         assert_eq!(kernel.cluster_control.status().unwrap().generation, 1);

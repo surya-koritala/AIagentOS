@@ -345,8 +345,15 @@ async fn restart_resolves_interrupted_lifecycle_states_without_readmission() {
             "{}.json",
             interrupted_workspace.file_name().unwrap().to_str().unwrap()
         ));
-    assert!(interrupted_control.is_file(), "real allocation must attest ownership");
-    std::fs::write(interrupted_workspace.join("owned-data"), b"interrupted owned bytes").unwrap();
+    assert!(
+        interrupted_control.is_file(),
+        "real allocation must attest ownership"
+    );
+    std::fs::write(
+        interrupted_workspace.join("owned-data"),
+        b"interrupted owned bytes",
+    )
+    .unwrap();
     stopping_record.status = serde_json::to_string(&AgentState::Stopping).unwrap();
     seed.context_manager.save_agent(&stopping_record).unwrap();
 
@@ -372,7 +379,11 @@ async fn restart_resolves_interrupted_lifecycle_states_without_readmission() {
             "{}.json",
             peer_workspace.file_name().unwrap().to_str().unwrap()
         ));
-    std::fs::write(peer_workspace.join("sentinel"), b"active peer bytes survive").unwrap();
+    std::fs::write(
+        peer_workspace.join("sentinel"),
+        b"active peer bytes survive",
+    )
+    .unwrap();
     let peer_owner_before = std::fs::read(&peer_control).unwrap();
     let context = &seed.context_manager;
     let now = chrono::Utc::now();
@@ -388,7 +399,11 @@ async fn restart_resolves_interrupted_lifecycle_states_without_readmission() {
         b"managed-by=aiagentos\n",
     )
     .unwrap();
-    std::fs::write(legacy_workspace.join("sentinel"), b"legacy marker is not ownership").unwrap();
+    std::fs::write(
+        legacy_workspace.join("sentinel"),
+        b"legacy marker is not ownership",
+    )
+    .unwrap();
     let legacy_sandbox = serde_json::to_string(&SandboxConfig {
         workspace_dir: legacy_workspace.clone(),
         allowed_network_hosts: Some(Vec::new()),
@@ -445,8 +460,16 @@ async fn restart_resolves_interrupted_lifecycle_states_without_readmission() {
         kernel.get_agent_status(malformed_id).is_err(),
         "corrupt lifecycle state must fail closed instead of becoming Running"
     );
-    assert_eq!(kernel.get_agent_status(legacy_stopping_id).unwrap(), AgentState::Stopped);
-    for id in [initializing_id, stopping_id, legacy_stopping_id, malformed_id] {
+    assert_eq!(
+        kernel.get_agent_status(legacy_stopping_id).unwrap(),
+        AgentState::Stopped
+    );
+    for id in [
+        initializing_id,
+        stopping_id,
+        legacy_stopping_id,
+        malformed_id,
+    ] {
         assert!(!kernel.scheduler.contains(id));
         assert!(!kernel.ipc.is_registered(id));
         assert!(kernel.syscall_gate.agent_info(id).is_none());
@@ -456,7 +479,10 @@ async fn restart_resolves_interrupted_lifecycle_states_without_readmission() {
         !interrupted_workspace.exists(),
         "interrupted terminal workspace must be reconciled"
     );
-    assert!(!interrupted_control.exists(), "owned terminal manifest must retire");
+    assert!(
+        !interrupted_control.exists(),
+        "owned terminal manifest must retire"
+    );
     assert_eq!(
         std::fs::read(legacy_workspace.join("sentinel")).unwrap(),
         b"legacy marker is not ownership",
@@ -471,10 +497,16 @@ async fn restart_resolves_interrupted_lifecycle_states_without_readmission() {
         std::fs::read(peer_workspace.join("sentinel")).unwrap(),
         b"active peer bytes survive"
     );
-    assert_eq!(kernel.get_agent_status(peer_id).unwrap(), AgentState::Running);
+    assert_eq!(
+        kernel.get_agent_status(peer_id).unwrap(),
+        AgentState::Running
+    );
     assert!(kernel.scheduler.contains(peer_id));
     assert!(kernel.syscall_gate.agent_info(peer_id).is_some());
-    assert!(kernel.sandbox_manager.get_sandbox_for_agent(peer_id).is_some());
+    assert!(kernel
+        .sandbox_manager
+        .get_sandbox_for_agent(peer_id)
+        .is_some());
 
     let persisted = kernel.context_manager.load_all_agents().unwrap();
     let state_for = |id| {

@@ -5,10 +5,12 @@ on:
     branches: [codex/lifecycle-owner-restart-proof]
     paths:
       - 'tests/src/lifecycle_coordinator.rs'
+      - 'tests/src/durable_checkpoints.rs'
       - '.github/workflows/lifecycle-owner-restart.yml'
   pull_request:
     paths:
       - 'tests/src/lifecycle_coordinator.rs'
+      - 'tests/src/durable_checkpoints.rs'
       - '.github/workflows/lifecycle-owner-restart.yml'
   workflow_dispatch:
 
@@ -73,6 +75,7 @@ jobs:
           set -euo pipefail
           git rev-parse HEAD > lifecycle-source.txt
           cargo test -p integration-tests --lib --locked lifecycle_coordinator -- --nocapture 2>&1 | tee lifecycle-controls.log
+          cargo test -p integration-tests --lib --locked durable_checkpoints -- --nocapture 2>&1 | tee checkpoint-controls.log
           cargo clippy -p integration-tests --all-targets --locked -- -D warnings 2>&1 | tee lifecycle-clippy.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
@@ -81,6 +84,7 @@ jobs:
           path: |
             lifecycle-source.txt
             lifecycle-controls.log
+            checkpoint-controls.log
             lifecycle-clippy.log
           retention-days: 30
           if-no-files-found: error

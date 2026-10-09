@@ -206,8 +206,52 @@ pub fn authority_command_semantic_sha256(
         .and_then(serde_json::Value::as_object_mut)
         .ok_or(PrincipalProofError::InvalidProof)?;
     fields.remove("proposed_at");
-    let canonical = serde_json::to_vec(&value).map_err(|_| PrincipalProofError::InvalidProof)?;
+    let mut canonical = Vec::new();
+    encode_canonical_json(&value, &mut canonical)?;
     Ok(crate::cluster_control::sha256_hex(&canonical))
+}
+
+fn encode_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<(), PrincipalProofError> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            output.push(b'{');
+            let ordered = fields.iter().collect::<BTreeMap<_, _>>();
+            for (index, (key, value)) in ordered.into_iter().enumerate() {
+                if index > 0 { output.push(b','); }
+                serde_json::to_writer(&mut *output, key).map_err(|_| PrincipalProofError::InvalidProof)?;
+                output.push(b':');
+                encode_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 { output.push(b','); }
+                encode_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        _ => serde_json::to_writer(output, value).map_err(|_| PrincipalProofError::InvalidProof)?,
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_bytes_sort_nested_objects_and_preserve_array_order() {
+        let value: serde_json::Value = serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":[{"y":true,"x":"quoted"},3]}"#).unwrap();
+        let mut encoded = Vec::new();
+        encode_canonical_json(&value, &mut encoded).unwrap();
+        assert_eq!(encoded, br#"{"a":[{"x":"quoted","y":true},3],"z":{"a":2,"b":1}}"#);
+        let reordered: serde_json::Value = serde_json::from_str(r#"{"a":[3,{"x":"quoted","y":true}],"z":{"a":2,"b":1}}"#).unwrap();
+        let mut other = Vec::new();
+        encode_canonical_json(&reordered, &mut other).unwrap();
+        assert_ne!(encoded, other);
+    }
 }
 
 fn append_field(payload: &mut Vec<u8>, value: &str) -> Result<(), PrincipalProofError> {

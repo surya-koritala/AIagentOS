@@ -13,6 +13,8 @@ MAX_PROOF_BYTES = 4 * 1024 * 1024
 MAX_SOURCE_BYTES = 128 * 1024 * 1024
 MAX_FILES = 8192
 MAX_TREES = 2048
+PUBLIC_NPMRC = b"audit=true\nfund=false\nignore-scripts=true\n"
+PUBLIC_NPMRC_PATH = Path("crates/tauri-app/ui/.npmrc")
 
 
 def git(repository, *arguments):
@@ -32,7 +34,7 @@ def safe_component(name):
         and folded not in {
             ".", "..", ".git", ".ssh", ".aws", ".azure", ".gcloud", ".kube",
             ".docker", ".config", ".gnupg", ".codex", ".netrc", ".git-credentials",
-            ".npmrc", ".pypirc", ".env", "credentials", "credentials.toml", "credentials.json",
+            ".pypirc", ".env", "credentials", "credentials.toml", "credentials.json",
             PROOF_FILE, "target", "node_modules",
         }
         and not any(character in name for character in "/\\\0\r\n")
@@ -97,9 +99,13 @@ def prepare(repository, output):
             names.add(name)
             path = relative / name
             if mode == "40000":
+                if name.lower() == ".npmrc":
+                    raise ValueError("source proof refuses credential configuration directories")
                 walk(child_oid, path, depth+1)
             elif mode in {"100644", "100755"}:
                 data = git(repository, "cat-file", "blob", child_oid)
+                if name.lower() == ".npmrc" and (path != PUBLIC_NPMRC_PATH or data != PUBLIC_NPMRC):
+                    raise ValueError("source npm configuration contains unapproved credential-capable content")
                 total += len(data)
                 if object_hash("blob", data) != child_oid or total > MAX_SOURCE_BYTES or len(files) >= MAX_FILES:
                     raise ValueError("source blob or byte inventory exceeds bounds")

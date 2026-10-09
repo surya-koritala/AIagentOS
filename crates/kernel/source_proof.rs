@@ -14,6 +14,8 @@ const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_FILES: usize = 8192;
 const MAX_TREES: usize = 2048;
 const MAX_DEPTH: usize = 64;
+const PUBLIC_NPMRC: &[u8] = b"audit=true\nfund=false\nignore-scripts=true\n";
+const PUBLIC_NPMRC_PATH: &str = "crates/tauri-app/ui/.npmrc";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +84,6 @@ fn component(name: &str) -> bool {
                 | ".codex"
                 | ".netrc"
                 | ".git-credentials"
-                | ".npmrc"
                 | ".pypirc"
                 | ".env"
                 | "credentials"
@@ -231,6 +232,7 @@ fn walk_tree(
             return Err("packaged source rejects symlinks");
         }
         if mode == "40000" {
+            if name.eq_ignore_ascii_case(".npmrc") { return Err("source proof refuses credential configuration directories"); }
             if !metadata.is_dir() {
                 return Err("tracked source directory has wrong type");
             }
@@ -243,6 +245,11 @@ fn walk_tree(
             {
                 return Err("source file type or inventory is invalid");
             }
+            if name.eq_ignore_ascii_case(".npmrc")
+                && (path != root.join(PUBLIC_NPMRC_PATH)
+                    || metadata.len() != PUBLIC_NPMRC.len() as u64
+                    || fs::read(&path).map_err(|_| "public npm configuration cannot be read")? != PUBLIC_NPMRC)
+            { return Err("source npm configuration contains unapproved credential-capable content"); }
             inventory.total = inventory
                 .total
                 .checked_add(metadata.len())

@@ -1760,9 +1760,15 @@ impl LiveTransportCatalog {
     }
 
     fn latest(&self) -> io::Result<Option<TrustedPeerCatalogs>> {
-        let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
-        let Some(plan) = plan else { return Ok(None); };
-        let current = crate::cluster_reconfiguration::ClusterReconfigurationTarget::from_membership(&membership)?;
+        let (membership, plan) =
+            crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        let current =
+            crate::cluster_reconfiguration::ClusterReconfigurationTarget::from_membership(
+                &membership,
+            )?;
         let (target, prior) = if plan.is_unresolved(&membership) {
             (plan.target.clone(), plan.prior.catalog.clone())
         } else if !self.startup_target.is_settled(&membership)
@@ -1773,10 +1779,11 @@ impl LiveTransportCatalog {
         } else {
             (current, BTreeMap::new())
         };
-        if target.trust_generation > 0 { self.check_target(&target)?; }
+        if target.trust_generation > 0 {
+            self.check_target(&target)?;
+        }
         Ok(Some((target.catalog, prior)))
     }
-
 }
 
 #[derive(Clone)]
@@ -2433,7 +2440,15 @@ impl ClusterRaftRuntime {
                 }
                 // Completed history must not disable the fenced operator path
                 // for subsequently provisioned root and private-leaf changes.
-                inspect_membership_target(&membership, &configured.catalog, &configured.catalog_sha256, configured.trust_generation, &configured.voter_ids, configured.voter_generation, &configured.voter_set_sha256)?;
+                inspect_membership_target(
+                    &membership,
+                    &configured.catalog,
+                    &configured.catalog_sha256,
+                    configured.trust_generation,
+                    &configured.voter_ids,
+                    configured.voter_generation,
+                    &configured.voter_set_sha256,
+                )?;
             }
         }
         let local_addr = listener.local_addr()?;
@@ -2449,9 +2464,13 @@ impl ClusterRaftRuntime {
             local_server_sha256: config.tls.server_certificate_sha256.clone(),
             local_client_sha256: config.tls.client_certificate_sha256.clone(),
             startup_target: crate::cluster_reconfiguration::ClusterReconfigurationTarget {
-                catalog: config.members.clone(), voter_ids: config.voter_ids.clone(), voter_generation: config.voter_set_generation,
-                voter_set_sha256: config.voter_set_sha256.clone(), trust_generation: config.transport_trust_generation,
-                catalog_sha256: config.transport_catalog_sha256.clone(), overlap_not_after: config.transport_trust_overlap_not_after,
+                catalog: config.members.clone(),
+                voter_ids: config.voter_ids.clone(),
+                voter_generation: config.voter_set_generation,
+                voter_set_sha256: config.voter_set_sha256.clone(),
+                trust_generation: config.transport_trust_generation,
+                catalog_sha256: config.transport_catalog_sha256.clone(),
+                overlap_not_after: config.transport_trust_overlap_not_after,
             },
         });
         live_catalog.latest()?;
@@ -2828,12 +2847,12 @@ async fn serve_reconfiguration(
         }
         drop(projections.borrow_and_update());
         let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&context)?;
-        let unresolved = plan.as_ref().is_some_and(|plan| plan.is_unresolved(&membership));
+        let unresolved = plan
+            .as_ref()
+            .is_some_and(|plan| plan.is_unresolved(&membership));
         let current_leader = { metrics.borrow().current_leader };
         if let Some(plan) = plan {
-            if plan.is_unresolved(&membership)
-                && current_leader == Some(node_id)
-            {
+            if plan.is_unresolved(&membership) && current_leader == Some(node_id) {
                 if plan.target.trust_generation > 0 {
                     live.check_target(&plan.target)?;
                 }
@@ -2943,9 +2962,7 @@ async fn converge_membership_target(
                     }
                 }
             }
-            DurableMembershipProgress::NeedsCatalog
-                if observed.current_leader == Some(node_id) =>
-            {
+            DurableMembershipProgress::NeedsCatalog if observed.current_leader == Some(node_id) => {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
                     raft.change_membership(ChangeMembers::SetNodes(target.catalog.clone()), true),
@@ -2982,9 +2999,7 @@ async fn converge_membership_target(
                     }
                 }
             }
-            DurableMembershipProgress::NeedsIntent
-                if observed.current_leader == Some(node_id) =>
-            {
+            DurableMembershipProgress::NeedsIntent if observed.current_leader == Some(node_id) => {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
                     raft.change_membership(ChangeMembers::SetNodes(target.catalog.clone()), true),
@@ -3051,9 +3066,7 @@ async fn converge_membership_target(
                     }
                 }
             }
-            DurableMembershipProgress::Joint
-                if observed.current_leader == Some(node_id) =>
-            {
+            DurableMembershipProgress::Joint if observed.current_leader == Some(node_id) => {
                 match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
                     raft.change_membership(target.voter_ids.clone(), true),
@@ -3749,7 +3762,8 @@ fn validate_new_live_proposal(
         crate::cluster_principal::unsigned_authority_command(command).map_err(invalid_input)?;
     if let AuthorityCommand::ProposeClusterVoterChange { prior, .. } = inner {
         if prior.trust_generation > 0 {
-            live.ok_or_else(|| invalid_input("live trust runtime is unavailable"))?.check_target(prior)?;
+            live.ok_or_else(|| invalid_input("live trust runtime is unavailable"))?
+                .check_target(prior)?;
         }
     }
     if let AuthorityCommand::ProposeClusterTrustChange {

@@ -200,8 +200,11 @@ impl LiveFixture {
                 .filter(|context| {
                     let (membership, local) =
                         crate::cluster_consensus::read_cluster_reconfiguration(context).unwrap();
-                    let durable = crate::cluster_consensus::read_cluster_raft_membership(context).unwrap();
-                    local.as_ref() == Some(plan) && plan.target.is_settled(&membership) && plan.target.is_settled(&durable)
+                    let durable =
+                        crate::cluster_consensus::read_cluster_raft_membership(context).unwrap();
+                    local.as_ref() == Some(plan)
+                        && plan.target.is_settled(&membership)
+                        && plan.target.is_settled(&durable)
                 })
                 .count();
             if matched >= count {
@@ -283,7 +286,9 @@ fn prepared(
     }
 }
 
-async fn projection_reads_do_not_reconstruct_history_under_a_writer_lock(context: Arc<SqliteContextManager>) {
+async fn projection_reads_do_not_reconstruct_history_under_a_writer_lock(
+    context: Arc<SqliteContextManager>,
+) {
     let expected = crate::cluster_consensus::read_cluster_reconfiguration(&context).unwrap();
     let holder_context = context.clone();
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
@@ -291,38 +296,67 @@ async fn projection_reads_do_not_reconstruct_history_under_a_writer_lock(context
     let holder = tokio::task::spawn_blocking(move || {
         let guard = holder_context.locked_conn();
         held_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(3)).expect("fixture writer is bounded");
+        release_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("fixture writer is bounded");
         drop(guard);
     });
-    tokio::time::timeout(Duration::from_secs(1), held_rx).await.unwrap().unwrap();
-    let mut reader = tokio::task::spawn_blocking(move || crate::cluster_consensus::read_cluster_reconfiguration(&context));
+    tokio::time::timeout(Duration::from_secs(1), held_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut reader = tokio::task::spawn_blocking(move || {
+        crate::cluster_consensus::read_cluster_reconfiguration(&context)
+    });
     let delivered = tokio::time::timeout(Duration::from_millis(500), &mut reader).await;
     release_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(3), holder).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), holder)
+        .await
+        .unwrap()
+        .unwrap();
     match delivered {
         Ok(delivered) => assert_eq!(delivered.unwrap().unwrap(), expected),
         Err(_) => {
-            tokio::time::timeout(Duration::from_secs(3), reader).await.unwrap().unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(3), reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             panic!("a warmed peer-admission projection must not reacquire SQLite or reconstruct signed history");
         }
     }
 }
 
-async fn validated_snapshot_refreshes_a_warmed_projection(fixture: &LiveFixture, plan: &crate::cluster_reconfiguration::ClusterReconfigurationPlan) {
+async fn validated_snapshot_refreshes_a_warmed_projection(
+    fixture: &LiveFixture,
+    plan: &crate::cluster_reconfiguration::ClusterReconfigurationPlan,
+) {
     use openraft::storage::RaftStateMachine;
     use openraft::RaftSnapshotBuilder;
-    let (_, mut source) = crate::cluster_consensus::open_cluster_raft_storage(fixture.contexts[0].clone()).unwrap();
+    let (_, mut source) =
+        crate::cluster_consensus::open_cluster_raft_storage(fixture.contexts[0].clone()).unwrap();
     let mut builder = source.get_snapshot_builder().await;
     let snapshot = builder.build_snapshot().await.unwrap();
     let target = Arc::new(SqliteContextManager::in_memory().unwrap());
     let initial = crate::cluster_consensus::read_cluster_reconfiguration(&target).unwrap();
     assert!(initial.1.is_none());
-    let (_, mut destination) = crate::cluster_consensus::open_cluster_raft_storage_pinned(target.clone(), &fixture.configs[0].authority_genesis).unwrap();
-    destination.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
-    let (published, retained) = crate::cluster_consensus::read_cluster_reconfiguration(&target).unwrap();
+    let (_, mut destination) = crate::cluster_consensus::open_cluster_raft_storage_pinned(
+        target.clone(),
+        &fixture.configs[0].authority_genesis,
+    )
+    .unwrap();
+    destination
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+    let (published, retained) =
+        crate::cluster_consensus::read_cluster_reconfiguration(&target).unwrap();
     assert_eq!(retained.as_ref(), Some(plan));
     assert!(plan.target.is_settled(&published));
-    assert_eq!(published, crate::cluster_consensus::read_cluster_raft_membership(&target).unwrap());
+    assert_eq!(
+        published,
+        crate::cluster_consensus::read_cluster_raft_membership(&target).unwrap()
+    );
     projection_reads_do_not_reconstruct_history_under_a_writer_lock(target.clone()).await;
 }
 
@@ -451,7 +485,14 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
                 plan.target.catalog
             );
         }
-        let voter = fixture.voter_command(0, plan.target.clone(), BTreeSet::from([1, 2]), 0, 1, Uuid::new_v4().to_string());
+        let voter = fixture.voter_command(
+            0,
+            plan.target.clone(),
+            BTreeSet::from([1, 2]),
+            0,
+            1,
+            Uuid::new_v4().to_string(),
+        );
         let voter_plan = prepared(fixture.submit(0, voter).await.unwrap());
         fixture.settle(&voter_plan, 4).await;
         let mut retained_config = fixture.configs[0].clone();
@@ -463,13 +504,44 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
         retained_config.transport_catalog_sha256 = voter_plan.target.catalog_sha256.clone();
         retained_config.transport_trust_overlap_not_after = voter_plan.target.overlap_not_after;
         let mut opaque = retained_config.clone();
-        opaque.tls = ClusterRaftTls::from_configs(opaque.tls.server_config.as_ref().clone(), opaque.tls.client_config.as_ref().clone(), opaque.tls.server_certificate_sha256.clone(), opaque.tls.client_certificate_sha256.clone()).unwrap();
-        fixture.runtimes[0].take().unwrap().shutdown().await.unwrap();
-        let listener = rebind_test_listener(opaque.listen_addr, "opaque root evidence denial").await;
-        let denied = ClusterRaftRuntime::start_on_listener(fixture.contexts[0].clone(), opaque, listener).await.unwrap_err();
-        assert_eq!(denied.kind(), io::ErrorKind::Unsupported, "a voter-kind latest plan must not mask versioned root provenance");
-        let listener = rebind_test_listener(retained_config.listen_addr, "restore material-backed live root evidence").await;
-        fixture.runtimes[0] = Some(ClusterRaftRuntime::start_on_listener(fixture.contexts[0].clone(), retained_config, listener).await.unwrap());
+        opaque.tls = ClusterRaftTls::from_configs(
+            opaque.tls.server_config.as_ref().clone(),
+            opaque.tls.client_config.as_ref().clone(),
+            opaque.tls.server_certificate_sha256.clone(),
+            opaque.tls.client_certificate_sha256.clone(),
+        )
+        .unwrap();
+        fixture.runtimes[0]
+            .take()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        let listener =
+            rebind_test_listener(opaque.listen_addr, "opaque root evidence denial").await;
+        let denied =
+            ClusterRaftRuntime::start_on_listener(fixture.contexts[0].clone(), opaque, listener)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            denied.kind(),
+            io::ErrorKind::Unsupported,
+            "a voter-kind latest plan must not mask versioned root provenance"
+        );
+        let listener = rebind_test_listener(
+            retained_config.listen_addr,
+            "restore material-backed live root evidence",
+        )
+        .await;
+        fixture.runtimes[0] = Some(
+            ClusterRaftRuntime::start_on_listener(
+                fixture.contexts[0].clone(),
+                retained_config,
+                listener,
+            )
+            .await
+            .unwrap(),
+        );
         wait_live_leader(&fixture.runtimes, "restored material-backed root evidence").await;
         // A cached actual OpenRaft client must consult the current catalog.
         // Removing this non-voter makes that pre-existing client fail closed.

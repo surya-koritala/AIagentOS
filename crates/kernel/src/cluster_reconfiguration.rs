@@ -23,7 +23,8 @@ pub(crate) struct CommittedReconfigurationProjection {
     pub plan: Option<ClusterReconfigurationPlan>,
 }
 
-pub(crate) type ReconfigurationProjectionPublisher = tokio::sync::watch::Sender<Option<std::sync::Arc<CommittedReconfigurationProjection>>>;
+pub(crate) type ReconfigurationProjectionPublisher =
+    tokio::sync::watch::Sender<Option<std::sync::Arc<CommittedReconfigurationProjection>>>;
 
 pub(crate) fn retained_plan_bytes(plans: &[ClusterReconfigurationPlan]) -> io::Result<usize> {
     plans.iter().try_fold(0usize, |total, plan| {
@@ -60,15 +61,23 @@ pub struct ClusterReconfigurationPlan {
 }
 
 impl ClusterReconfigurationPlan {
-    pub(crate) fn is_unresolved(&self, membership: &StoredMembership<ClusterRaftNodeId, ClusterRaftNode>) -> bool {
-        if self.target.is_settled(membership) { return false; }
-        let Ok(current) = ClusterReconfigurationTarget::from_membership(membership) else { return true; };
+    pub(crate) fn is_unresolved(
+        &self,
+        membership: &StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
+    ) -> bool {
+        if self.target.is_settled(membership) {
+            return false;
+        }
+        let Ok(current) = ClusterReconfigurationTarget::from_membership(membership) else {
+            return true;
+        };
         // A later operator-configured generation uses the existing durable
         // startup transition. It supersedes this completed historical plan;
         // it must never cause the live worker to restore an earlier target.
         !(current.voter_generation >= self.target.voter_generation
             && current.trust_generation >= self.target.trust_generation
-            && (current.voter_generation > self.target.voter_generation || current.trust_generation > self.target.trust_generation))
+            && (current.voter_generation > self.target.voter_generation
+                || current.trust_generation > self.target.trust_generation))
     }
 }
 
@@ -201,9 +210,23 @@ pub(crate) fn prepare_trust_target(
     }
     target.validate(at)?;
     for (id, prior) in &current.catalog {
-        let Some(retained) = target.catalog.get(id) else { continue; };
-        let server_retained = std::iter::once(&prior.tls_certificate_sha256).chain(prior.tls_certificate_sha256_overlap.iter()).all(|leaf| leaf == &retained.tls_certificate_sha256 || retained.tls_certificate_sha256_overlap.contains(leaf));
-        let client_retained = std::iter::once(&prior.tls_client_certificate_sha256).chain(prior.tls_client_certificate_sha256_overlap.iter()).all(|leaf| leaf == &retained.tls_client_certificate_sha256 || retained.tls_client_certificate_sha256_overlap.contains(leaf));
+        let Some(retained) = target.catalog.get(id) else {
+            continue;
+        };
+        let server_retained = std::iter::once(&prior.tls_certificate_sha256)
+            .chain(prior.tls_certificate_sha256_overlap.iter())
+            .all(|leaf| {
+                leaf == &retained.tls_certificate_sha256
+                    || retained.tls_certificate_sha256_overlap.contains(leaf)
+            });
+        let client_retained = std::iter::once(&prior.tls_client_certificate_sha256)
+            .chain(prior.tls_client_certificate_sha256_overlap.iter())
+            .all(|leaf| {
+                leaf == &retained.tls_client_certificate_sha256
+                    || retained
+                        .tls_client_certificate_sha256_overlap
+                        .contains(leaf)
+            });
         if !server_retained || !client_retained {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "live trust must retain every prior leaf of retained peers until installed-leaf evidence is available"));
         }
@@ -342,7 +365,8 @@ pub(crate) fn status(
     plan: Option<&ClusterReconfigurationPlan>,
 ) -> io::Result<ClusterReconfigurationStatus> {
     let current = ClusterReconfigurationTarget::from_membership(membership)?;
-    let settled = current.is_settled(membership) && plan.is_none_or(|plan| !plan.is_unresolved(membership));
+    let settled =
+        current.is_settled(membership) && plan.is_none_or(|plan| !plan.is_unresolved(membership));
     let plan = plan.filter(|plan| plan.is_unresolved(membership) || plan.target == current);
     Ok(ClusterReconfigurationStatus {
         current,

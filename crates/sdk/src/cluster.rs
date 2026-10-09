@@ -1028,9 +1028,11 @@ impl ClusterClient {
 
         for listed in ownerships {
             let local_index = local_agents.get(&listed.agent_id).copied();
-            let identity = identities.get(&listed.agent_id).ok_or_else(|| route_conflict(
+            let identity = identities.get(&listed.agent_id).ok_or_else(|| {
+                route_conflict(
                 "ownership without an immutable quorum identity requires explicit reconciliation"
-            ))?;
+            )
+            })?;
             match identity.state {
                 AgentIdentityState::Prepared | AgentIdentityState::Created => {
                     if local_index.is_some() {

@@ -1,13 +1,24 @@
-async fn wait_live_leader(runtimes: &[Option<ClusterRaftRuntime>], phase: &str) -> ClusterRaftNodeId {
+async fn wait_live_leader(
+    runtimes: &[Option<ClusterRaftRuntime>],
+    phase: &str,
+) -> ClusterRaftNodeId {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let mut votes = BTreeMap::new();
         for runtime in runtimes.iter().flatten() {
-            if let Some(leader) = runtime.metrics().borrow().current_leader { *votes.entry(leader).or_insert(0usize) += 1; }
+            if let Some(leader) = runtime.metrics().borrow().current_leader {
+                *votes.entry(leader).or_insert(0usize) += 1;
+            }
         }
-        if let Some((leader, _)) = votes.into_iter().find(|(_, count)| *count >= 2) { return leader; }
+        if let Some((leader, _)) = votes.into_iter().find(|(_, count)| *count >= 2) {
+            return leader;
+        }
         if Instant::now() >= deadline {
-            let actual = runtimes.iter().flatten().map(|runtime| runtime.metrics().borrow().clone()).collect::<Vec<_>>();
+            let actual = runtimes
+                .iter()
+                .flatten()
+                .map(|runtime| runtime.metrics().borrow().clone())
+                .collect::<Vec<_>>();
             panic!("{phase}: no leader; actual bounded node metrics: {actual:?}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -29,97 +40,244 @@ impl LiveFixture {
         let peers = (1..=4).map(|id| test_peer(&ca, id)).collect::<Vec<_>>();
         let bound = listeners(4).await;
         let members = member_map(&peers, &bound);
-        let mut configs = peers.iter().zip(&bound).map(|(peer, listener)| runtime_config(peer, listener, &members, name)).collect::<Vec<_>>();
-        for config in &mut configs { set_voter_plan(config, 0, BTreeSet::from([1, 2, 3])); }
+        let mut configs = peers
+            .iter()
+            .zip(&bound)
+            .map(|(peer, listener)| runtime_config(peer, listener, &members, name))
+            .collect::<Vec<_>>();
+        for config in &mut configs {
+            set_voter_plan(config, 0, BTreeSet::from([1, 2, 3]));
+        }
         let root = TempDir::new().unwrap();
         let contexts = (1..=4).map(|id| context(&root, id)).collect::<Vec<_>>();
         let mut runtimes = Vec::new();
         for ((config, listener), context) in configs.iter().cloned().zip(bound).zip(&contexts) {
-            runtimes.push(Some(ClusterRaftRuntime::start_on_listener(context.clone(), config, listener).await.unwrap()));
+            runtimes.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .unwrap(),
+            ));
         }
         let (one, two, three, four) = tokio::join!(
-            runtimes[0].as_ref().unwrap().ensure_configured_membership(true),
-            runtimes[1].as_ref().unwrap().ensure_configured_membership(true),
-            runtimes[2].as_ref().unwrap().ensure_configured_membership(true),
-            runtimes[3].as_ref().unwrap().ensure_configured_membership(false),
+            runtimes[0]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(true),
+            runtimes[1]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(true),
+            runtimes[2]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(true),
+            runtimes[3]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(false),
         );
-        one.unwrap(); two.unwrap(); three.unwrap(); four.unwrap();
+        one.unwrap();
+        two.unwrap();
+        three.unwrap();
+        four.unwrap();
         let leader = wait_live_leader(&runtimes, "initial live fixture").await;
-        runtimes[(leader - 1) as usize].as_ref().unwrap().ensure_authority_initialized().await.unwrap();
+        runtimes[(leader - 1) as usize]
+            .as_ref()
+            .unwrap()
+            .ensure_authority_initialized()
+            .await
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if contexts.iter().all(|context| read_initialized_authority_view(context).is_ok()) { break; }
-            assert!(Instant::now() < deadline, "authority did not replicate to every learner");
+            if contexts
+                .iter()
+                .all(|context| read_initialized_authority_view(context).is_ok())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "authority did not replicate to every learner"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Self { root, ca, peers, contexts, configs, runtimes }
+        Self {
+            root,
+            ca,
+            peers,
+            contexts,
+            configs,
+            runtimes,
+        }
     }
 
-    async fn submit(&self, source: usize, inner: AuthorityCommand) -> io::Result<AuthorityResponse> {
-        let command = crate::cluster_principal::fixture_signed(inner, crate::cluster_principal::FIXTURE_CLUSTER_ID);
-        self.runtimes[source].as_ref().unwrap().authority_handle().commit(command.clone(), test_authority_delegation(&self.peers[source], &command)).await
+    async fn submit(
+        &self,
+        source: usize,
+        inner: AuthorityCommand,
+    ) -> io::Result<AuthorityResponse> {
+        let command = crate::cluster_principal::fixture_signed(
+            inner,
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
+        self.runtimes[source]
+            .as_ref()
+            .unwrap()
+            .authority_handle()
+            .commit(
+                command.clone(),
+                test_authority_delegation(&self.peers[source], &command),
+            )
+            .await
     }
 
-    async fn current(&self, source: usize) -> crate::cluster_reconfiguration::ClusterReconfigurationTarget {
-        self.runtimes[source].as_ref().unwrap().authority_handle().reconfiguration_status().await.unwrap().current
+    async fn current(
+        &self,
+        source: usize,
+    ) -> crate::cluster_reconfiguration::ClusterReconfigurationTarget {
+        self.runtimes[source]
+            .as_ref()
+            .unwrap()
+            .authority_handle()
+            .reconfiguration_status()
+            .await
+            .unwrap()
+            .current
     }
 
-    fn voter_command(&self, source: usize, prior: crate::cluster_reconfiguration::ClusterReconfigurationTarget, target: BTreeSet<u64>, expected: u64, next: u64, operation_id: String) -> AuthorityCommand {
+    fn voter_command(
+        &self,
+        source: usize,
+        prior: crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+        target: BTreeSet<u64>,
+        expected: u64,
+        next: u64,
+        operation_id: String,
+    ) -> AuthorityCommand {
         AuthorityCommand::ProposeClusterVoterChange {
-            operation_id, prior, target_voter_ids: target, expected_generation: expected, target_generation: next,
-            actor: authority_system_actor(&self.peers[source].application_node_id), reason: "controlled live voter proposal".into(), proposed_at: chrono::Utc::now(),
+            operation_id,
+            prior,
+            target_voter_ids: target,
+            expected_generation: expected,
+            target_generation: next,
+            actor: authority_system_actor(&self.peers[source].application_node_id),
+            reason: "controlled live voter proposal".into(),
+            proposed_at: chrono::Utc::now(),
         }
     }
 
-    fn trust_command(&self, source: usize, prior: crate::cluster_reconfiguration::ClusterReconfigurationTarget, catalog: BTreeMap<u64, ClusterRaftNode>, generation: u64, expiry: Option<chrono::DateTime<chrono::Utc>>) -> AuthorityCommand {
+    fn trust_command(
+        &self,
+        source: usize,
+        prior: crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+        catalog: BTreeMap<u64, ClusterRaftNode>,
+        generation: u64,
+        expiry: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AuthorityCommand {
         AuthorityCommand::ProposeClusterTrustChange {
-            operation_id: Uuid::new_v4().to_string(), expected_generation: prior.trust_generation, target_generation: generation,
-            prior, target_catalog: catalog, overlap_not_after: expiry,
-            actor: authority_system_actor(&self.peers[source].application_node_id), reason: "controlled live complete trust catalog".into(), proposed_at: chrono::Utc::now(),
+            operation_id: Uuid::new_v4().to_string(),
+            expected_generation: prior.trust_generation,
+            target_generation: generation,
+            prior,
+            target_catalog: catalog,
+            overlap_not_after: expiry,
+            actor: authority_system_actor(&self.peers[source].application_node_id),
+            reason: "controlled live complete trust catalog".into(),
+            proposed_at: chrono::Utc::now(),
         }
     }
 
-    async fn settle(&self, plan: &crate::cluster_reconfiguration::ClusterReconfigurationPlan, count: usize) {
+    async fn settle(
+        &self,
+        plan: &crate::cluster_reconfiguration::ClusterReconfigurationPlan,
+        count: usize,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(25);
         loop {
-            let matched = self.contexts.iter().filter(|context| {
-                let (membership, local) = crate::cluster_consensus::read_cluster_reconfiguration(context).unwrap();
-                local.as_ref() == Some(plan) && plan.target.is_settled(&membership)
-            }).count();
-            if matched >= count { break; }
-            assert!(Instant::now() < deadline, "prepared target did not settle on {count} nodes; got {matched}");
+            let matched = self
+                .contexts
+                .iter()
+                .filter(|context| {
+                    let (membership, local) =
+                        crate::cluster_consensus::read_cluster_reconfiguration(context).unwrap();
+                    local.as_ref() == Some(plan) && plan.target.is_settled(&membership)
+                })
+                .count();
+            if matched >= count {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prepared target did not settle on {count} nodes; got {matched}"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
     async fn restart_all(&mut self, configs: Vec<ClusterRaftRuntimeConfig>) {
-        for runtime in &mut self.runtimes { runtime.take().unwrap().shutdown().await.unwrap(); }
+        for runtime in &mut self.runtimes {
+            runtime.take().unwrap().shutdown().await.unwrap();
+        }
         self.configs = configs;
         for index in 0..self.configs.len() {
             let config = self.configs[index].clone();
-            let listener = rebind_test_listener(config.listen_addr, "live fixture configured restart").await;
-            self.runtimes[index] = Some(ClusterRaftRuntime::start_on_listener(self.contexts[index].clone(), config, listener).await.unwrap());
+            let listener =
+                rebind_test_listener(config.listen_addr, "live fixture configured restart").await;
+            self.runtimes[index] = Some(
+                ClusterRaftRuntime::start_on_listener(
+                    self.contexts[index].clone(),
+                    config,
+                    listener,
+                )
+                .await
+                .unwrap(),
+            );
         }
         let (one, two, three, four) = tokio::join!(
-            self.runtimes[0].as_ref().unwrap().ensure_configured_membership(false),
-            self.runtimes[1].as_ref().unwrap().ensure_configured_membership(false),
-            self.runtimes[2].as_ref().unwrap().ensure_configured_membership(false),
-            self.runtimes[3].as_ref().unwrap().ensure_configured_membership(false),
+            self.runtimes[0]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(false),
+            self.runtimes[1]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(false),
+            self.runtimes[2]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(false),
+            self.runtimes[3]
+                .as_ref()
+                .unwrap()
+                .ensure_configured_membership(false),
         );
-        one.unwrap(); two.unwrap(); three.unwrap(); four.unwrap();
+        one.unwrap();
+        two.unwrap();
+        three.unwrap();
+        four.unwrap();
         wait_live_leader(&self.runtimes, "configured live fixture restart").await;
     }
 
     async fn close(self) {
-        for runtime in self.runtimes.into_iter().flatten() { runtime.shutdown().await.unwrap(); }
+        for runtime in self.runtimes.into_iter().flatten() {
+            runtime.shutdown().await.unwrap();
+        }
         drop(self.contexts);
-        self.root.close().expect("release all real native database handles");
+        self.root
+            .close()
+            .expect("release all real native database handles");
     }
 }
 
-fn prepared(response: AuthorityResponse) -> crate::cluster_reconfiguration::ClusterReconfigurationPlan {
+fn prepared(
+    response: AuthorityResponse,
+) -> crate::cluster_reconfiguration::ClusterReconfigurationPlan {
     match response {
-        AuthorityResponse::ReconfigurationPrepared { plan, replayed: false, .. } => *plan,
+        AuthorityResponse::ReconfigurationPrepared {
+            plan,
+            replayed: false,
+            ..
+        } => *plan,
         other => panic!("expected a newly prepared exact target, got {other:?}"),
     }
 }
@@ -179,31 +337,64 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
         // supported live API; generation-zero bootstrap is unchanged.
         let roots = certificate_fingerprints_from_pem(fixture.ca.pem().as_bytes()).unwrap();
         let mut versioned = fixture.configs.clone();
-        for config in &mut versioned { set_transport_trust_plan(config, 1, roots.clone(), None); }
+        for config in &mut versioned {
+            set_transport_trust_plan(config, 1, roots.clone(), None);
+        }
         fixture.restart_all(versioned).await;
         let prior = fixture.current(0).await;
-        let next_peers = (1..=4).map(|id| test_peer(&fixture.ca, id)).collect::<Vec<_>>();
-        let mut factory = fixture.runtimes[0].as_ref().unwrap().authority_handle().network.clone();
+        let next_peers = (1..=4)
+            .map(|id| test_peer(&fixture.ca, id))
+            .collect::<Vec<_>>();
+        let mut factory = fixture.runtimes[0]
+            .as_ref()
+            .unwrap()
+            .authority_handle()
+            .network
+            .clone();
         let cached_four = factory.new_client(4, prior.catalog.get(&4).unwrap()).await;
         let mut overlap = prior.catalog.clone();
         let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
         for (id, node) in &mut overlap {
             node.transport_trust_generation = 2;
             node.transport_trust_overlap_not_after = Some(expiry);
-            node.tls_client_certificate_sha256_overlap = vec![next_peers[(*id - 1) as usize].tls.client_certificate_sha256().into()];
+            node.tls_client_certificate_sha256_overlap = vec![next_peers[(*id - 1) as usize]
+                .tls
+                .client_certificate_sha256()
+                .into()];
         }
         let digest = configured_transport_catalog_sha256(&overlap);
-        for node in overlap.values_mut() { node.transport_catalog_sha256.clone_from(&digest); }
+        for node in overlap.values_mut() {
+            node.transport_catalog_sha256.clone_from(&digest);
+        }
         let command = fixture.trust_command(0, prior.clone(), overlap, 2, Some(expiry));
         let unsigned = command.clone();
-        assert!(fixture.runtimes[0].as_ref().unwrap().authority_handle().commit(unsigned.clone(), test_authority_delegation(&fixture.peers[0], &unsigned)).await.is_err(), "node keys alone must not authorize a transport change");
+        assert!(
+            fixture.runtimes[0]
+                .as_ref()
+                .unwrap()
+                .authority_handle()
+                .commit(
+                    unsigned.clone(),
+                    test_authority_delegation(&fixture.peers[0], &unsigned)
+                )
+                .await
+                .is_err(),
+            "node keys alone must not authorize a transport change"
+        );
         let plan = prepared(fixture.submit(0, command).await.unwrap());
         fixture.settle(&plan, 4).await;
         assert_eq!(plan.target.voter_ids, prior.voter_ids);
         assert_eq!(plan.target.voter_generation, prior.voter_generation);
         for context in &fixture.contexts {
-            let (membership, _) = crate::cluster_consensus::read_cluster_reconfiguration(context).unwrap();
-            assert_eq!(membership.nodes().map(|(id, node)| (*id, node.clone())).collect::<BTreeMap<_, _>>(), plan.target.catalog);
+            let (membership, _) =
+                crate::cluster_consensus::read_cluster_reconfiguration(context).unwrap();
+            assert_eq!(
+                membership
+                    .nodes()
+                    .map(|(id, node)| (*id, node.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+                plan.target.catalog
+            );
         }
         // A cached actual OpenRaft client must consult the current catalog.
         // Removing this non-voter makes that pre-existing client fail closed.
@@ -213,12 +404,26 @@ async fn live_trust_change_replaces_the_catalog_and_preserves_voters() {
             node.transport_trust_generation = 3;
         }
         let digest = configured_transport_catalog_sha256(&removed);
-        for node in removed.values_mut() { node.transport_catalog_sha256.clone_from(&digest); }
+        for node in removed.values_mut() {
+            node.transport_catalog_sha256.clone_from(&digest);
+        }
         let remove = fixture.trust_command(0, plan.target.clone(), removed, 3, Some(expiry));
         let removed_plan = prepared(fixture.submit(0, remove).await.unwrap());
         fixture.settle(&removed_plan, 3).await;
-        assert!(cached_four.call(RpcRequest::Vote(VoteRequest { vote: Vote::new(0, 1), last_log_id: None }), RPCOption::new(Duration::from_secs(3))).await.is_err());
-        drop(cached_four); drop(factory);
+        assert!(cached_four
+            .call(
+                RpcRequest::Vote(VoteRequest {
+                    vote: Vote::new(0, 1),
+                    last_log_id: None
+                }),
+                RPCOption::new(Duration::from_secs(3))
+            )
+            .await
+            .is_err());
+        drop(cached_four);
+        drop(factory);
         fixture.close().await;
-    }).await.expect("live complete-catalog proof is bounded");
+    })
+    .await
+    .expect("live complete-catalog proof is bounded");
 }

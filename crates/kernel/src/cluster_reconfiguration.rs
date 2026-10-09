@@ -19,7 +19,9 @@ pub(crate) const MAX_RECONFIGURATION_PLAN_BYTES: usize = 512 * 1024;
 pub(crate) fn retained_plan_bytes(plans: &[ClusterReconfigurationPlan]) -> io::Result<usize> {
     plans.iter().try_fold(0usize, |total, plan| {
         let bytes = serde_json::to_vec(plan).map_err(io::Error::other)?.len();
-        total.checked_add(bytes).ok_or_else(|| io::Error::other("retained live plan size overflow"))
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("retained live plan size overflow"))
     })
 }
 
@@ -110,8 +112,13 @@ impl ClusterReconfigurationTarget {
     ) -> bool {
         membership.membership().get_joint_config().len() == 1
             && Self::from_membership(membership).is_ok_and(|current| current == *self)
-            && self.voter_set_sha256 == crate::cluster_runtime::configured_voter_set_sha256(self.voter_generation, &self.voter_ids)
-            && self.catalog_sha256 == crate::cluster_runtime::configured_transport_catalog_sha256(&self.catalog)
+            && self.voter_set_sha256
+                == crate::cluster_runtime::configured_voter_set_sha256(
+                    self.voter_generation,
+                    &self.voter_ids,
+                )
+            && self.catalog_sha256
+                == crate::cluster_runtime::configured_transport_catalog_sha256(&self.catalog)
     }
 }
 

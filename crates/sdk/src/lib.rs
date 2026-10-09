@@ -2127,7 +2127,7 @@ impl KernelClient {
                 control,
                 observed_at,
                 signature_hex,
-                signed_capacity,
+                signed_capacity: signed_capacity.map(|report| *report),
                 agent_count,
                 running_agents,
                 live_agents,

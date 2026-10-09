@@ -1590,7 +1590,7 @@ struct RpcEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RpcRequest {
-    CapacityWrite(crate::cluster_capacity::SignedNodeCapacity),
+    CapacityWrite(Box<crate::cluster_capacity::SignedNodeCapacity>),
     AppendEntries(AppendEntriesRequest<ClusterRaftTypeConfig>),
     Vote(VoteRequest<ClusterRaftNodeId>),
     InstallSnapshot(InstallSnapshotRequest<ClusterRaftTypeConfig>),
@@ -1626,7 +1626,7 @@ struct RpcResponseEnvelope {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum RpcResponse {
-    CapacityWrite(Result<AuthorityResponse, String>),
+    CapacityWrite(Box<Result<AuthorityResponse, String>>),
     AppendEntries(Result<AppendEntriesResponse<ClusterRaftNodeId>, RaftError<ClusterRaftNodeId>>),
     Vote(Result<VoteResponse<ClusterRaftNodeId>, RaftError<ClusterRaftNodeId>>),
     InstallSnapshot(
@@ -2029,13 +2029,15 @@ impl ClusterAuthorityHandle {
             Err(error) => {
                 let (leader_id, leader_node) = leader_target(&error)?;
                 match self
-                    .forward(leader_id, &leader_node, RpcRequest::CapacityWrite(report))
+                    .forward(
+                        leader_id,
+                        &leader_node,
+                        RpcRequest::CapacityWrite(Box::new(report)),
+                    )
                     .await?
                 {
-                    RpcResponse::CapacityWrite(Ok(response)) => Ok(response),
-                    RpcResponse::CapacityWrite(Err(error)) => {
-                        Err(io::Error::new(io::ErrorKind::ConnectionRefused, error))
-                    }
+                    RpcResponse::CapacityWrite(result) => (*result)
+                        .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error)),
                     _ => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "capacity forwarding returned wrong response",
@@ -3449,6 +3451,7 @@ async fn handle_connection(
 
     let body = match request.body {
         RpcRequest::CapacityWrite(report) => {
+            let report = *report;
             let view = read_initialized_authority_view(&context)?;
             let member = view
                 .membership
@@ -3470,12 +3473,12 @@ async fn handle_connection(
                 report,
                 proposed_at: view.logical_time,
             };
-            RpcResponse::CapacityWrite(
+            RpcResponse::CapacityWrite(Box::new(
                 raft.client_write(command)
                     .await
                     .map(|response| response.data)
                     .map_err(|error| error.to_string()),
-            )
+            ))
         }
         RpcRequest::AppendEntries(request) => {
             RpcResponse::AppendEntries(raft.append_entries(request).await)

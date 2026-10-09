@@ -1589,7 +1589,7 @@ pub enum SyscallReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature_hex: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        signed_capacity: Option<crate::cluster_capacity::SignedNodeCapacity>,
+        signed_capacity: Option<Box<crate::cluster_capacity::SignedNodeCapacity>>,
         agent_count: usize,
         running_agents: usize,
         live_agents: usize,
@@ -4783,7 +4783,7 @@ async fn dispatch_scoped_inner_with_fence(
                 }
                 let c = &report.counters;
                 return SyscallReply::NodeInfo {
-                    control: Some(report.control.clone()), observed_at: Some(report.observed_at), signature_hex: Some(report.signature_hex.clone()), signed_capacity: Some(report.clone()),
+                    control: Some(report.control.clone()), observed_at: Some(report.observed_at), signature_hex: Some(report.signature_hex.clone()), signed_capacity: Some(Box::new(report.clone())),
                     agent_count: c.agent_count as usize, running_agents: c.running_agents as usize, live_agents: c.live_agents as usize,
                     queued_agents: c.queued_agents as usize, paused_agents: c.paused_agents as usize, stopped_agents: c.stopped_agents as usize,
                     active_turns: c.active_turns as usize, waiting_turns: c.waiting_turns as usize, turn_capacity: c.turn_capacity as usize,

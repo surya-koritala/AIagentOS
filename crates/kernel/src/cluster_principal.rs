@@ -187,6 +187,7 @@ pub fn authority_command_class(
             Ok(AuthorityCommandClass::PrincipalAdmin)
         }
         AuthorityCommand::Initialize { .. }
+        | AuthorityCommand::ReportNodeCapacity { .. }
         | AuthorityCommand::Barrier { .. }
         | AuthorityCommand::AdvanceTime { .. }
         | AuthorityCommand::Authorized { .. } => Err(PrincipalProofError::WrongCommandClass),

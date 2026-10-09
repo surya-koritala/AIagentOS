@@ -469,6 +469,9 @@
     "op": "node_info"
   },
   {
+    "op": "get_cluster_capacity"
+  },
+  {
     "challenge_hex": "00",
     "op": "prove_node_identity"
   },

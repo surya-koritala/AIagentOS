@@ -845,6 +845,9 @@ impl App {
             };
             self.node = NodeLoad {
                 control: None,
+                observed_at: None,
+                signature_hex: None,
+                signed_capacity: None,
                 agent_count: metrics.agent_count as usize,
                 running_agents: metrics.running_agents as usize,
                 live_agents: metrics.live_agents as usize,

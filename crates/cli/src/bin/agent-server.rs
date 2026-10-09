@@ -272,6 +272,7 @@ async fn main() {
             runtime.transport_catalog_sha256(),
         );
     }
+    let _capacity_publisher = cluster_runtime.as_ref().map(|runtime| runtime.authority_handle().start_capacity_publisher(&kernel));
     // Make SendMessage syscalls functional against the configured backend.
     register_providers(&kernel, &config);
     if config.service_dir.is_some() {

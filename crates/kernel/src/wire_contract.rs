@@ -22,6 +22,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "agent_gate_statistics",
     "authorized_cluster_membership",
     "cluster_principal_auth",
+    "signed_quorum_capacity",
     crate::cluster_operation_receipts::FEATURE,
     "bounded_certificate_rollout",
     "cluster_ownership_leases",
@@ -672,6 +673,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
         tag: "node_info",
         fields: &[],
     },
+    Variant { tag: "get_cluster_capacity", fields: &[] },
     Variant {
         tag: "prove_node_identity",
         fields: &[Field::required("challenge_hex", S)],
@@ -980,6 +982,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     "send_message_stream"
                         | "submit_signed_authority_command"
                         | "get_authority_principal_registry"
+                        | "get_cluster_capacity"
                         | "list_provider_models"
                         | "send_message_content"
                         | "send_message_content_stream"
@@ -1416,8 +1419,12 @@ const REPLY_VARIANTS: &[Variant] = &[
             Field::required("llm_requests_waiting", I),
             Field::required("llm_core_capacity", I),
             Field::optional("control", O),
+            Field::optional("observed_at", S),
+            Field::optional("signature_hex", S),
+            Field::optional("signed_capacity", O),
         ],
     },
+    Variant { tag: "cluster_capacity", fields: &[Field::required("snapshot", O)] },
     Variant {
         tag: "node_identity_proof",
         fields: &[

@@ -24,6 +24,7 @@ SUPPORTED_VERSIONS = (1, 2)
 V2_ONLY_OPERATIONS = {
     "submit_signed_authority_command",
     "get_authority_principal_registry",
+    "get_cluster_capacity",
     "abort_cluster_member_certificate_rollout",
     "cancel_request",
     "claim_cluster_agent_ownership",

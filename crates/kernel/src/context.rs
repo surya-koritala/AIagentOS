@@ -382,6 +382,11 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         deletion: "retain",
     },
     DurableDataClassification {
+        table: "cluster_capacity_cursor",
+        owner: "system",
+        deletion: "retain monotonic signed capacity replay fence",
+    },
+    DurableDataClassification {
         table: "cluster_node_control_audit",
         owner: "system",
         deletion: "retain",
@@ -1979,6 +1984,10 @@ impl SqliteContextManager {
                 profile_json TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_capacity_cursor (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                sequence INTEGER NOT NULL CHECK (sequence >= 0)
             );
             CREATE TABLE IF NOT EXISTS cluster_operation_receipts (
                 operation_id TEXT PRIMARY KEY CHECK (length(operation_id) = 36),

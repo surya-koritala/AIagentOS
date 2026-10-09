@@ -501,6 +501,15 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "retain"
     ),
     sqlite_entry!(
+        "cluster_capacity_cursor",
+        "system",
+        "none",
+        "monotonic signed capacity sample sequence",
+        "for installation lifetime",
+        "owner-only database file permissions and node signature replay checks",
+        "retain across restart; never reset independently of node identity"
+    ),
+    sqlite_entry!(
         "cluster_membership_authority",
         "system",
         "none",

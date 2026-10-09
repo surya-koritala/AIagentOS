@@ -138,6 +138,12 @@ pub struct AuthorityGenesis {
 /// a monotonic replicated authority clock before evaluating expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityCommand {
+    /// Narrow self-report channel; never grants operator or tenant authority.
+    ReportNodeCapacity {
+        operation_id: String,
+        report: crate::cluster_capacity::SignedNodeCapacity,
+        proposed_at: DateTime<Utc>,
+    },
     /// One independently signed caller envelope; nested/internal commands reject.
     Authorized {
         command: Box<AuthorityCommand>,
@@ -269,6 +275,7 @@ impl AuthorityCommand {
         match self {
             Self::Authorized { command, .. } => command.operation_id(),
             Self::Initialize { operation_id, .. }
+            | Self::ReportNodeCapacity { operation_id, .. }
             | Self::EnrollPrincipal { operation_id, .. }
             | Self::RevokePrincipal { operation_id, .. }
             | Self::Barrier { operation_id, .. }
@@ -291,6 +298,7 @@ impl AuthorityCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityRejection {
+    CapacityReport(crate::cluster_capacity::CapacityRejection),
     PrincipalAuthentication(crate::cluster_principal::PrincipalProofError),
     InvalidOperationId,
     OperationIdConflict,
@@ -306,6 +314,12 @@ pub enum AuthorityRejection {
 /// Response returned when an authority log entry is applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityResponse {
+    NodeCapacityReported {
+        operation_id: String,
+        node_id: String,
+        report_sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+    },
     PrincipalUpdated {
         operation_id: String,
         principal: crate::cluster_principal::AuthorityPrincipal,
@@ -404,6 +418,8 @@ struct AuthorityState {
     receipts: BTreeMap<String, StoredAuthorityReceipt>,
     #[serde(default)]
     control_plane: Option<ReplicatedControlPlaneState>,
+    #[serde(default)]
+    capacities: BTreeMap<String, crate::cluster_capacity::QuorumNodeCapacity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +478,17 @@ pub struct ReplicatedAuthorityView {
     pub ownerships: Vec<ClusterAgentOwnership>,
     pub ownership_audit: Vec<ClusterAgentOwnershipAudit>,
     pub logical_time: DateTime<Utc>,
+}
+
+pub(crate) fn read_capacity_snapshot(context: &SqliteContextManager) -> io::Result<crate::cluster_capacity::ClusterCapacitySnapshot> {
+    let connection = context.conn.lock().map_err(|_| io::Error::other("capacity projection lock is poisoned"))?;
+    let state = load_persistent_state(&connection).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let control = state.authority.control_plane.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "replicated capacity is not initialized"))?;
+    Ok(crate::cluster_capacity::ClusterCapacitySnapshot {
+        cluster_id: control.cluster_id, authority_time: control.logical_time,
+        staleness_seconds: crate::cluster_capacity::CAPACITY_STALENESS_SECONDS,
+        reports: state.authority.capacities.into_values().collect(), members: control.members.into_values().collect(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +781,12 @@ fn write_persistent_state(
 }
 
 fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
+    if state.capacities.len() > crate::cluster_capacity::MAX_CAPACITY_NODES {
+        return Err(read_io("capacity projection exceeds maximum enrolled nodes"));
+    }
+    if !state.capacities.is_empty() && state.control_plane.is_none() {
+        return Err(read_io("capacity projection has no authority genesis"));
+    }
     if state.receipts.len() > MAX_AUTHORITY_RECEIPTS {
         return Err(read_io(format!(
             "authority receipt count {} exceeds maximum {MAX_AUTHORITY_RECEIPTS}",
@@ -805,6 +838,17 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
     }
     if let Some(control) = &state.control_plane {
         validate_control_plane_state(control)?;
+        for (node_id, capacity) in &state.capacities {
+            let member = control.members.get(node_id).ok_or_else(|| read_io("capacity references an unknown node"))?;
+            let report = &capacity.report;
+            report.verify_origin(member, &control.cluster_id).map_err(|error| read_io(error.to_string()))?;
+            let historical_generation = control.membership_audit.iter().any(|audit| audit.node_id == *node_id && audit.member_generation == report.member_generation && audit.current == ClusterMemberState::Active);
+            if node_id != &report.node_id || !historical_generation || report.observed_at > capacity.committed_at
+                || capacity.committed_at > control.logical_time
+                || capacity.committed_at.signed_duration_since(report.observed_at) > chrono::Duration::seconds(crate::cluster_capacity::CAPACITY_STALENESS_SECONDS) {
+                return Err(read_io("capacity projection has invalid committed membership or time evidence"));
+            }
+        }
         for receipt in state.receipts.values() {
             let AuthorityCommand::Authorized {
                 principal_proof, ..
@@ -975,6 +1019,7 @@ fn successful_response_metadata(
             ..
         } => Some((operation_id, *sequence, *log_id, *replayed)),
         AuthorityResponse::MetadataApplied { .. }
+        | AuthorityResponse::NodeCapacityReported { .. }
         | AuthorityResponse::AuthorityTimeAdvanced { .. }
         | AuthorityResponse::Rejected { .. } => None,
     }
@@ -1637,6 +1682,9 @@ fn validate_persistent_state(state: &PersistentState) -> Result<(), AnyError> {
             .expect("validated receipts contain successful responses");
         validate_log_id_at_or_before(log_id, state.last_applied, "authority receipt")?;
     }
+    for capacity in state.authority.capacities.values() {
+        validate_log_id_at_or_before(capacity.log_id, state.last_applied, "node capacity report")?;
+    }
     Ok(())
 }
 
@@ -2235,6 +2283,23 @@ fn apply_authority_command(
             "authority operation_id must be a canonical lowercase UUID",
         );
     };
+    if let AuthorityCommand::ReportNodeCapacity { report, .. } = &command {
+        let Some(control) = state.control_plane.as_ref() else {
+            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::NotInitialized, "replicated capacity is not initialized");
+        };
+        let at = control.logical_time;
+        let validation = crate::cluster_capacity::validate_admission(
+            report, &control.members, &control.cluster_id, at, state.capacities.get(&report.node_id),
+        );
+        if let Err(error) = validation {
+            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::CapacityReport(error), error.to_string());
+        }
+        if !state.capacities.contains_key(&report.node_id) && state.capacities.len() >= crate::cluster_capacity::MAX_CAPACITY_NODES {
+            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::CapacityReached, "capacity node projection is full");
+        }
+        state.capacities.insert(report.node_id.clone(), crate::cluster_capacity::QuorumNodeCapacity { report: report.clone(), committed_at: at, log_id });
+        return AuthorityResponse::NodeCapacityReported { operation_id: canonical_id, node_id: report.node_id.clone(), report_sequence: report.sequence, log_id };
+    }
     if let AuthorityCommand::AdvanceTime { proposed_at, .. } = &command {
         let Some(control) = state.control_plane.as_mut() else {
             return rejected(
@@ -2534,6 +2599,7 @@ fn replay_response(response: &AuthorityResponse) -> AuthorityResponse {
             replayed: true,
         },
         AuthorityResponse::MetadataApplied { .. }
+        | AuthorityResponse::NodeCapacityReported { .. }
         | AuthorityResponse::AuthorityTimeAdvanced { .. }
         | AuthorityResponse::Rejected { .. } => {
             unreachable!("only successful normal-command responses are retained")
@@ -2554,6 +2620,7 @@ fn apply_new_authority_command(
             AuthorityRejection::InvalidCommand,
             "nested principal envelope is invalid".into(),
         )),
+        AuthorityCommand::ReportNodeCapacity { .. } => Err(invalid_command("capacity self-report must use its separate bounded channel")),
         AuthorityCommand::EnrollPrincipal {
             principal,
             expected_generation,

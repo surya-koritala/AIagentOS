@@ -728,6 +728,7 @@ pub enum Syscall {
     /// agents this kernel node hosts (total + currently running) so a cluster
     /// client can pick the least-loaded node. No side effects.
     NodeInfo,
+    GetClusterCapacity,
     /// Sign an operator nonce with the node's durable Ed25519 identity.
     ProveNodeIdentity {
         challenge_hex: String,
@@ -1583,6 +1584,12 @@ pub enum SyscallReply {
     NodeInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         control: Option<crate::cluster_control::NodeControlStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_capacity: Option<crate::cluster_capacity::SignedNodeCapacity>,
         agent_count: usize,
         running_agents: usize,
         live_agents: usize,
@@ -1595,6 +1602,9 @@ pub enum SyscallReply {
         llm_requests_in_flight: usize,
         llm_requests_waiting: usize,
         llm_core_capacity: usize,
+    },
+    ClusterCapacity {
+        snapshot: crate::cluster_capacity::ClusterCapacitySnapshot,
     },
     /// Signed proof that the server possesses the durable node private key.
     NodeIdentityProof {
@@ -2008,6 +2018,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListInstalledPackages => (AccessLevel::ReadOnly, "package.installed.list", None),
         Syscall::RunInstalledPackage { .. } => (AccessLevel::Admin, "package.run", None),
         Syscall::NodeInfo => (AccessLevel::System, "system.node_info", None),
+        Syscall::GetClusterCapacity => (AccessLevel::System, "cluster.capacity.read", None),
         Syscall::ProveNodeIdentity { .. } => (AccessLevel::System, "cluster.identity.prove", None),
         Syscall::SetNodeAvailability { .. } => {
             (AccessLevel::System, "cluster.node.availability.set", None)
@@ -2665,6 +2676,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::Ping
             | Syscall::Authenticate { .. }
             | Syscall::NodeInfo
+            | Syscall::GetClusterCapacity
             | Syscall::ProveNodeIdentity { .. }
             | Syscall::SetNodeAvailability { .. }
             | Syscall::SetNodeProfile { .. }
@@ -3087,6 +3099,7 @@ fn authority_command_error(response: AuthorityResponse) -> SyscallReply {
                 AuthorityRejection::PrincipalAuthentication(error) => {
                     return principal_proof_error(error)
                 }
+                AuthorityRejection::CapacityReport(_) => "replicated capacity report rejected",
                 AuthorityRejection::InvalidOperationId | AuthorityRejection::InvalidCommand => {
                     "invalid replicated authority command"
                 }
@@ -4751,6 +4764,20 @@ async fn dispatch_scoped_inner_with_fence(
             }
         }
         Syscall::NodeInfo => {
+            let signed = kernel.cluster_authority().ok().flatten()
+                .and_then(|_| crate::cluster_consensus::read_capacity_snapshot(&kernel.context_manager).ok())
+                .and_then(|snapshot| snapshot.reports.into_iter().find(|capacity| capacity.report.node_id == kernel.cluster_control.identity().node_id))
+                .map(|capacity| capacity.report);
+            if let Some(report) = signed {
+                let c = &report.counters;
+                return SyscallReply::NodeInfo {
+                    control: Some(report.control.clone()), observed_at: Some(report.observed_at), signature_hex: Some(report.signature_hex.clone()), signed_capacity: Some(report.clone()),
+                    agent_count: c.agent_count as usize, running_agents: c.running_agents as usize, live_agents: c.live_agents as usize,
+                    queued_agents: c.queued_agents as usize, paused_agents: c.paused_agents as usize, stopped_agents: c.stopped_agents as usize,
+                    active_turns: c.active_turns as usize, waiting_turns: c.waiting_turns as usize, turn_capacity: c.turn_capacity as usize,
+                    llm_requests_in_flight: c.llm_requests_in_flight as usize, llm_requests_waiting: c.llm_requests_waiting as usize, llm_core_capacity: c.llm_core_capacity as usize,
+                };
+            }
             let snapshot = crate::metrics::MetricsSnapshot::collect(kernel);
             let control = match kernel.cluster_control.status() {
                 Ok(control) => control,
@@ -4761,6 +4788,9 @@ async fn dispatch_scoped_inner_with_fence(
                 }
             };
             SyscallReply::NodeInfo {
+                observed_at: None,
+                signature_hex: None,
+                signed_capacity: None,
                 control: Some(control),
                 agent_count: snapshot.agent_count as usize,
                 running_agents: snapshot.running_agents as usize,
@@ -4774,6 +4804,17 @@ async fn dispatch_scoped_inner_with_fence(
                 llm_requests_in_flight: snapshot.llm_requests_in_flight as usize,
                 llm_requests_waiting: snapshot.llm_requests_waiting as usize,
                 llm_core_capacity: snapshot.llm_core_capacity as usize,
+            }
+        }
+        Syscall::GetClusterCapacity => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(Some(authority)) => authority,
+                Ok(None) => return SyscallReply::TypedError { code: WireErrorCode::Unavailable, message: "quorum capacity is not configured".into(), retryable: true },
+                Err(error) => return authority_io_error(error),
+            };
+            match authority.capacity_snapshot().await {
+                Ok(snapshot) => SyscallReply::ClusterCapacity { snapshot },
+                Err(error) => authority_io_error(error),
             }
         }
         Syscall::ProveNodeIdentity { challenge_hex } => {
@@ -7420,6 +7461,7 @@ impl SyscallServer {
                             Syscall::SendMessageStream { .. }
                                 | Syscall::SubmitSignedAuthorityCommand { .. }
                                 | Syscall::GetAuthorityPrincipalRegistry
+                                | Syscall::GetClusterCapacity
                                 | Syscall::ListProviderModels { .. }
                                 | Syscall::SendMessageContent { .. }
                                 | Syscall::SendMessageContentStream { .. }

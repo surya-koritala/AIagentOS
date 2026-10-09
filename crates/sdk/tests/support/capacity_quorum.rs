@@ -252,7 +252,9 @@ impl CapacityQuorum {
         self.kernels.clear();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while weak.iter().any(|kernel| kernel.strong_count() != 0)
-                || contexts.iter().any(|context| Arc::strong_count(context) != 1)
+                || contexts
+                    .iter()
+                    .any(|context| Arc::strong_count(context) != 1)
             {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

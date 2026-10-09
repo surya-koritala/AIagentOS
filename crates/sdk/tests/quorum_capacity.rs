@@ -443,7 +443,9 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         drop(kernels);
         tokio::time::timeout(Duration::from_secs(5), async {
             while weak.iter().any(|kernel| kernel.strong_count() != 0)
-                || contexts.iter().any(|context| Arc::strong_count(context) != 1)
+                || contexts
+                    .iter()
+                    .any(|context| Arc::strong_count(context) != 1)
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

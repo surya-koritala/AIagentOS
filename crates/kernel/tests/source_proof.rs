@@ -101,6 +101,10 @@ impl Fixture {
             .unwrap()
     }
 
+    fn output(&self, name: &str) -> PathBuf {
+        self.repository.parent().unwrap().join(name)
+    }
+
     fn replace(&self, proof: &serde_json::Value) {
         fs::write(
             self.context.join(source_proof::PROOF_FILE),
@@ -267,10 +271,11 @@ fn dirty_checkout_cannot_generate_a_qualified_context() {
     fs::write(fixture.repository.join("README.md"), "dirty working copy\n").unwrap();
     let output = prepare(
         &fixture.repository,
-        &fixture._root.path().join("dirty-context"),
+        &fixture.output("dirty-context"),
     );
     assert!(!output.status.success());
-    assert!(!fixture._root.path().join("dirty-context").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tracked source must be clean"));
+    assert!(!fixture.output("dirty-context").exists());
 }
 
 #[test]
@@ -297,10 +302,11 @@ fn tracked_credential_path_is_refused_before_context_publication() {
     );
     let output = prepare(
         &fixture.repository,
-        &fixture._root.path().join("credential-context"),
+        &fixture.output("credential-context"),
     );
     assert!(!output.status.success());
-    assert!(!fixture._root.path().join("credential-context").exists());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("rejects symlink ancestors"));
+    assert!(!fixture.output("credential-context").exists());
 }
 
 #[test]
@@ -333,10 +339,11 @@ fn env_token_and_os_credential_paths_are_refused_case_insensitively() {
         );
         let output = prepare(
             &fixture.repository,
-            &fixture._root.path().join("forbidden-context"),
+            &fixture.output("forbidden-context"),
         );
         assert!(!output.status.success());
-        assert!(!fixture._root.path().join("forbidden-context").exists());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("rejects symlink ancestors"));
+        assert!(!fixture.output("forbidden-context").exists());
     }
 }
 
@@ -364,7 +371,7 @@ fn exact_public_npm_directives_validate_but_auth_content_cannot_be_generated() {
             "test: public npm directives fixture",
         ],
     );
-    let context = fixture._root.path().join("public-context");
+    let context = fixture.output("public-context");
     let output = prepare(&fixture.repository, &context);
     assert!(
         output.status.success(),
@@ -404,10 +411,11 @@ fn exact_public_npm_directives_validate_but_auth_content_cannot_be_generated() {
     );
     let rejected = prepare(
         &fixture.repository,
-        &fixture._root.path().join("auth-context"),
+        &fixture.output("auth-context"),
     );
     assert!(!rejected.status.success());
-    assert!(!fixture._root.path().join("auth-context").exists());
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains("rejects symlink ancestors"));
+    assert!(!fixture.output("auth-context").exists());
 }
 
 #[cfg(unix)]

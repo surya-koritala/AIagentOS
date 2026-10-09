@@ -10,6 +10,7 @@ on:
       - 'crates/kernel/src/syscall_server.rs'
       - 'crates/kernel/src/wire_contract.rs'
       - 'crates/sdk/src/**'
+      - 'crates/sdk/tests/cluster_reconfiguration.rs'
       - 'protocol/**'
       - '.github/workflows/live-cluster-reconfiguration.yml'
   workflow_dispatch:
@@ -76,3 +77,6 @@ jobs:
           cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture
           cargo test -p kernel --lib --locked principal_history_requires_current_reader -- --nocapture
           cargo test -p kernel --lib --locked live_transport_proposals_remain_system_only -- --nocapture
+      - name: Exercise live proposals through actual public SDK clients
+        timeout-minutes: 5
+        run: cargo test -p agent-sdk --test cluster_reconfiguration --locked -- --nocapture

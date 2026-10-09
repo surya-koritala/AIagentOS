@@ -673,7 +673,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
         tag: "node_info",
         fields: &[],
     },
-    Variant { tag: "get_cluster_capacity", fields: &[] },
+    Variant {
+        tag: "get_cluster_capacity",
+        fields: &[],
+    },
     Variant {
         tag: "prove_node_identity",
         fields: &[Field::required("challenge_hex", S)],
@@ -1424,7 +1427,10 @@ const REPLY_VARIANTS: &[Variant] = &[
             Field::optional("signed_capacity", O),
         ],
     },
-    Variant { tag: "cluster_capacity", fields: &[Field::required("snapshot", O)] },
+    Variant {
+        tag: "cluster_capacity",
+        fields: &[Field::required("snapshot", O)],
+    },
     Variant {
         tag: "node_identity_proof",
         fields: &[

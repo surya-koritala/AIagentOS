@@ -2240,7 +2240,9 @@ impl ClusterControl {
             ));
         }
         if challenge.starts_with(crate::cluster_capacity::CAPACITY_DOMAIN) {
-            return Err(storage_error("reserved capacity signing domain is not a discovery nonce"));
+            return Err(storage_error(
+                "reserved capacity signing domain is not a discovery nonce",
+            ));
         }
         let connection = self
             .store
@@ -2290,27 +2292,66 @@ impl ClusterControl {
     ) -> Result<crate::cluster_capacity::SignedNodeCapacity, ContextError> {
         let control = self.status()?;
         let counters = crate::cluster_capacity::CapacityCounters::collect(kernel);
-        let mut connection = self.store.conn.lock().map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| storage_error(format!("capacity sequence transaction: {error}")))?;
-        transaction.execute("INSERT OR IGNORE INTO cluster_capacity_cursor(singleton, sequence) VALUES (1, 0)", [])
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO cluster_capacity_cursor(singleton, sequence) VALUES (1, 0)",
+                [],
+            )
             .map_err(|error| storage_error(format!("initialize capacity sequence: {error}")))?;
-        let old: i64 = transaction.query_row("SELECT sequence FROM cluster_capacity_cursor WHERE singleton = 1", [], |row| row.get(0))
+        let old: i64 = transaction
+            .query_row(
+                "SELECT sequence FROM cluster_capacity_cursor WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|error| storage_error(format!("read capacity sequence: {error}")))?;
-        if old < 0 { return Err(storage_error("capacity sequence is negative")); }
-        let next = old.checked_add(1).ok_or_else(|| storage_error("capacity sequence exhausted"))?;
+        if old < 0 {
+            return Err(storage_error("capacity sequence is negative"));
+        }
+        let next = old
+            .checked_add(1)
+            .ok_or_else(|| storage_error("capacity sequence exhausted"))?;
         let mut report = crate::cluster_capacity::SignedNodeCapacity {
-            version: 1, cluster_id: cluster_id.to_owned(), node_id: self.identity.node_id.clone(),
-            member_generation, control, observed_at, sequence: next as u64, counters, signature_hex: String::new(),
+            version: 1,
+            cluster_id: cluster_id.to_owned(),
+            node_id: self.identity.node_id.clone(),
+            member_generation,
+            control,
+            observed_at,
+            sequence: next as u64,
+            counters,
+            signature_hex: String::new(),
         };
-        let payload = report.payload().map_err(|error| storage_error(error.to_string()))?;
-        let private_key: Vec<u8> = transaction.query_row("SELECT private_key FROM cluster_node_identity WHERE singleton = 1", [], |row| row.get(0))
+        let payload = report
+            .payload()
+            .map_err(|error| storage_error(error.to_string()))?;
+        let private_key: Vec<u8> = transaction
+            .query_row(
+                "SELECT private_key FROM cluster_node_identity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|error| storage_error(format!("read capacity signing identity: {error}")))?;
-        let pair = Ed25519KeyPair::from_pkcs8(&private_key).map_err(|_| storage_error("persisted node identity is invalid"))?;
+        let pair = Ed25519KeyPair::from_pkcs8(&private_key)
+            .map_err(|_| storage_error("persisted node identity is invalid"))?;
         report.signature_hex = hex_encode(pair.sign(&payload).as_ref());
-        transaction.execute("UPDATE cluster_capacity_cursor SET sequence = ?1 WHERE singleton = 1", [next])
+        transaction
+            .execute(
+                "UPDATE cluster_capacity_cursor SET sequence = ?1 WHERE singleton = 1",
+                [next],
+            )
             .map_err(|error| storage_error(format!("persist capacity sequence: {error}")))?;
-        transaction.commit().map_err(|error| storage_error(format!("commit capacity sequence: {error}")))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit capacity sequence: {error}")))?;
         Ok(report)
     }
 }

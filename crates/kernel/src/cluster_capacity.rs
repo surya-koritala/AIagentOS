@@ -1,9 +1,11 @@
 //! Signed node-origin capacity samples, admitted and aged by quorum time.
 
-use std::collections::BTreeMap;
+use crate::cluster_control::{
+    ClusterControl, ClusterMember, ClusterMemberState, NodeControlStatus,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use crate::cluster_control::{ClusterControl, ClusterMember, ClusterMemberState, NodeControlStatus};
+use std::collections::BTreeMap;
 
 pub const CAPACITY_DOMAIN: &[u8] = b"AIagentOS signed node capacity v1\0";
 pub const CAPACITY_STALENESS_SECONDS: i64 = 15;
@@ -102,8 +104,11 @@ pub struct ClusterCapacitySnapshot {
 
 impl SignedNodeCapacity {
     pub fn payload(&self) -> Result<Vec<u8>, CapacityRejection> {
-        if self.version != 1 || self.sequence == 0 || self.member_generation == 0
-            || !canonical_uuid(&self.cluster_id) || !canonical_uuid(&self.node_id)
+        if self.version != 1
+            || self.sequence == 0
+            || self.member_generation == 0
+            || !canonical_uuid(&self.cluster_id)
+            || !canonical_uuid(&self.node_id)
             || self.node_id != self.control.identity.node_id
             || !canonical_hex(&self.control.identity.public_key, 32)
             || !canonical_hex(&self.control.identity.fingerprint, 32)
@@ -123,8 +128,13 @@ impl SignedNodeCapacity {
         Ok(payload)
     }
 
-    pub fn verify_origin(&self, member: &ClusterMember, cluster_id: &str) -> Result<(), CapacityRejection> {
-        if self.cluster_id != cluster_id || self.node_id != member.node_id
+    pub fn verify_origin(
+        &self,
+        member: &ClusterMember,
+        cluster_id: &str,
+    ) -> Result<(), CapacityRejection> {
+        if self.cluster_id != cluster_id
+            || self.node_id != member.node_id
             || self.control.identity.public_key != member.public_key
             || self.control.identity.fingerprint != member.fingerprint
         {
@@ -132,14 +142,20 @@ impl SignedNodeCapacity {
         }
         if !canonical_hex(&self.signature_hex, 64) { return Err(CapacityRejection::Forged); }
         let signature = crate::cluster_control::hex_decode(&self.signature_hex)
-            .filter(|signature| signature.len() == 64).ok_or(CapacityRejection::Forged)?;
+            .filter(|signature| signature.len() == 64)
+            .ok_or(CapacityRejection::Forged)?;
         if !ClusterControl::verify_challenge(&member.public_key, &self.payload()?, &signature) {
             return Err(CapacityRejection::Forged);
         }
         Ok(())
     }
 
-    pub fn verify_current(&self, member: &ClusterMember, cluster_id: &str, at: DateTime<Utc>) -> Result<(), CapacityRejection> {
+    pub fn verify_current(
+        &self,
+        member: &ClusterMember,
+        cluster_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(), CapacityRejection> {
         self.verify_origin(member, cluster_id)?;
         if member.state != ClusterMemberState::Active {
             return Err(CapacityRejection::Unenrolled);
@@ -153,7 +169,9 @@ impl SignedNodeCapacity {
         if self.observed_at > at {
             return Err(CapacityRejection::Future);
         }
-        if at.signed_duration_since(self.observed_at) > chrono::Duration::seconds(CAPACITY_STALENESS_SECONDS) {
+        if at.signed_duration_since(self.observed_at)
+            > chrono::Duration::seconds(CAPACITY_STALENESS_SECONDS)
+        {
             return Err(CapacityRejection::Stale);
         }
         Ok(())
@@ -167,18 +185,27 @@ pub(crate) fn validate_admission(
     at: DateTime<Utc>,
     previous: Option<&QuorumNodeCapacity>,
 ) -> Result<(), CapacityRejection> {
-    let member = members.get(&report.node_id).ok_or(CapacityRejection::Unenrolled)?;
+    let member = members
+        .get(&report.node_id)
+        .ok_or(CapacityRejection::Unenrolled)?;
     report.verify_current(member, cluster_id, at)?;
     if let Some(previous) = previous {
-        if report.sequence <= previous.report.sequence || report.observed_at <= previous.report.observed_at {
+        if report.sequence <= previous.report.sequence
+            || report.observed_at <= previous.report.observed_at
+        {
             return Err(CapacityRejection::Replay);
         }
         if report.control.generation < previous.report.control.generation
-            || (report.control.generation == previous.report.control.generation && report.control != previous.report.control)
+            || (report.control.generation == previous.report.control.generation
+                && report.control != previous.report.control)
         {
             return Err(CapacityRejection::Generation);
         }
-        if report.observed_at.signed_duration_since(previous.report.observed_at) < chrono::Duration::seconds(CAPACITY_PUBLISH_INTERVAL_SECONDS as i64) {
+        if report
+            .observed_at
+            .signed_duration_since(previous.report.observed_at)
+            < chrono::Duration::seconds(CAPACITY_PUBLISH_INTERVAL_SECONDS as i64)
+        {
             return Err(CapacityRejection::Cadence);
         }
     }
@@ -199,10 +226,15 @@ pub struct CapacityPublisher {
 }
 
 impl CapacityPublisher {
-    pub(crate) fn start(authority: crate::cluster_runtime::ClusterAuthorityHandle, kernel: std::sync::Weak<crate::AgentKernelImpl>) -> Self {
+    pub(crate) fn start(
+        authority: crate::cluster_runtime::ClusterAuthorityHandle,
+        kernel: std::sync::Weak<crate::AgentKernelImpl>,
+    ) -> Self {
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(CAPACITY_PUBLISH_INTERVAL_SECONDS));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                CAPACITY_PUBLISH_INTERVAL_SECONDS,
+            ));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -223,19 +255,26 @@ impl CapacityPublisher {
                 }
             }
         });
-        Self { stop, task: Some(task) }
+        Self {
+            stop,
+            task: Some(task),
+        }
     }
 
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() { let _ = task.await; }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
 impl Drop for CapacityPublisher {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() { task.abort(); }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -246,64 +285,161 @@ mod tests {
 
     fn member(control: &NodeControlStatus, at: DateTime<Utc>) -> ClusterMember {
         ClusterMember {
-            node_id: control.identity.node_id.clone(), fingerprint: control.identity.fingerprint.clone(), public_key: control.identity.public_key.clone(),
-            tls_server_certificate_fingerprint: None, endpoint: "127.0.0.1:1".into(), server_version: "capacity-fixture".into(), min_protocol_version: 1, protocol_version: 2,
-            state: ClusterMemberState::Active, generation: 1, joined_at: at, updated_at: at, reason: "actual node-key fixture".into(),
+            node_id: control.identity.node_id.clone(),
+            fingerprint: control.identity.fingerprint.clone(),
+            public_key: control.identity.public_key.clone(),
+            tls_server_certificate_fingerprint: None,
+            endpoint: "127.0.0.1:1".into(),
+            server_version: "capacity-fixture".into(),
+            min_protocol_version: 1,
+            protocol_version: 2,
+            state: ClusterMemberState::Active,
+            generation: 1,
+            joined_at: at,
+            updated_at: at,
+            reason: "actual node-key fixture".into(),
         }
     }
 
     #[test]
     fn unsigned_or_forged_capacity_is_never_used_for_placement() {
         let root = tempfile::tempdir().unwrap();
-        let kernel = Arc::new(crate::AgentKernelImpl::with_db_path(&root.path().join("capacity.db")).unwrap());
+        let kernel = Arc::new(
+            crate::AgentKernelImpl::with_db_path(&root.path().join("capacity.db")).unwrap(),
+        );
         let at = Utc::now();
         let cluster_id = uuid::Uuid::new_v4().to_string();
-        let report = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at).unwrap();
+        let report = kernel
+            .cluster_control
+            .sample_capacity(&kernel, &cluster_id, 1, at)
+            .unwrap();
         let current = member(&report.control, at);
         assert!(report.verify_current(&current, &cluster_id, at).is_ok());
-        let mut forged = report.clone(); forged.counters.turn_capacity = forged.counters.turn_capacity.saturating_add(1);
-        assert_eq!(forged.verify_current(&current, &cluster_id, at), Err(CapacityRejection::Forged));
-        forged = report.clone(); forged.signature_hex.clear();
-        assert_eq!(forged.verify_current(&current, &cluster_id, at), Err(CapacityRejection::Forged));
-        assert!(kernel.cluster_control.prove_challenge_hex(&crate::cluster_control::hex_encode(&report.payload().unwrap())).is_err(), "public nonce signer cannot manufacture capacity reports");
-        drop(kernel); root.close().unwrap();
+        let mut forged = report.clone();
+        forged.counters.turn_capacity = forged.counters.turn_capacity.saturating_add(1);
+        assert_eq!(
+            forged.verify_current(&current, &cluster_id, at),
+            Err(CapacityRejection::Forged)
+        );
+        forged = report.clone();
+        forged.signature_hex.clear();
+        assert_eq!(
+            forged.verify_current(&current, &cluster_id, at),
+            Err(CapacityRejection::Forged)
+        );
+        assert!(
+            kernel
+                .cluster_control
+                .prove_challenge_hex(&crate::cluster_control::hex_encode(
+                    &report.payload().unwrap()
+                ))
+                .is_err(),
+            "public nonce signer cannot manufacture capacity reports"
+        );
+        drop(kernel);
+        root.close().unwrap();
     }
 
     #[test]
     fn replayed_capacity_report_is_rejected_by_observed_at() {
         let root = tempfile::tempdir().unwrap();
-        let kernel = Arc::new(crate::AgentKernelImpl::with_db_path(&root.path().join("capacity.db")).unwrap());
-        let at = Utc::now(); let cluster_id = uuid::Uuid::new_v4().to_string();
-        let report = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at).unwrap();
+        let kernel = Arc::new(
+            crate::AgentKernelImpl::with_db_path(&root.path().join("capacity.db")).unwrap(),
+        );
+        let at = Utc::now();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let report = kernel
+            .cluster_control
+            .sample_capacity(&kernel, &cluster_id, 1, at)
+            .unwrap();
         let members = BTreeMap::from([(report.node_id.clone(), member(&report.control, at))]);
-        let committed = QuorumNodeCapacity { report: report.clone(), committed_at: at, log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 3) };
-        assert_eq!(validate_admission(&report, &members, &cluster_id, at, Some(&committed)), Err(CapacityRejection::Replay));
-        let next_same_time = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at).unwrap();
+        let committed = QuorumNodeCapacity {
+            report: report.clone(),
+            committed_at: at,
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
+        };
+        assert_eq!(
+            validate_admission(&report, &members, &cluster_id, at, Some(&committed)),
+            Err(CapacityRejection::Replay)
+        );
+        let next_same_time = kernel
+            .cluster_control
+            .sample_capacity(&kernel, &cluster_id, 1, at)
+            .unwrap();
         assert!(next_same_time.sequence > report.sequence);
-        assert_eq!(validate_admission(&next_same_time, &members, &cluster_id, at, Some(&committed)), Err(CapacityRejection::Replay));
-        let future = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at + chrono::Duration::seconds(1)).unwrap();
-        assert_eq!(validate_admission(&future, &members, &cluster_id, at, Some(&committed)), Err(CapacityRejection::Future));
-        assert_eq!(validate_admission(&report, &members, &cluster_id, at + chrono::Duration::seconds(16), None), Err(CapacityRejection::Stale));
-        let too_soon = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at + chrono::Duration::seconds(1)).unwrap();
-        assert_eq!(validate_admission(&too_soon, &members, &cluster_id, at + chrono::Duration::seconds(1), Some(&committed)), Err(CapacityRejection::Cadence));
-        drop(kernel); root.close().unwrap();
+        assert_eq!(
+            validate_admission(&next_same_time, &members, &cluster_id, at, Some(&committed)),
+            Err(CapacityRejection::Replay)
+        );
+        let future = kernel
+            .cluster_control
+            .sample_capacity(&kernel, &cluster_id, 1, at + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(
+            validate_admission(&future, &members, &cluster_id, at, Some(&committed)),
+            Err(CapacityRejection::Future)
+        );
+        assert_eq!(
+            validate_admission(
+                &report,
+                &members,
+                &cluster_id,
+                at + chrono::Duration::seconds(16),
+                None
+            ),
+            Err(CapacityRejection::Stale)
+        );
+        let too_soon = kernel
+            .cluster_control
+            .sample_capacity(&kernel, &cluster_id, 1, at + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(
+            validate_admission(
+                &too_soon,
+                &members,
+                &cluster_id,
+                at + chrono::Duration::seconds(1),
+                Some(&committed)
+            ),
+            Err(CapacityRejection::Cadence)
+        );
+        drop(kernel);
+        root.close().unwrap();
     }
 
     #[test]
     fn capacity_sequence_survives_restart_and_member_epochs_invalidate_samples() {
-        let root = tempfile::tempdir().unwrap(); let database = root.path().join("capacity.db");
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("capacity.db");
         let kernel = Arc::new(crate::AgentKernelImpl::with_db_path(&database).unwrap());
-        let at = Utc::now(); let cluster_id = uuid::Uuid::new_v4().to_string();
-        let report = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at).unwrap();
-        let mut enrolled = member(&report.control, at); enrolled.generation = 2;
-        assert_eq!(report.verify_current(&enrolled, &cluster_id, at), Err(CapacityRejection::Generation));
-        enrolled.generation = 1; enrolled.state = ClusterMemberState::Revoked;
-        assert_eq!(report.verify_current(&enrolled, &cluster_id, at), Err(CapacityRejection::Unenrolled));
+        let at = Utc::now();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let report = kernel
+            .cluster_control
+            .sample_capacity(&kernel, &cluster_id, 1, at)
+            .unwrap();
+        let mut enrolled = member(&report.control, at);
+        enrolled.generation = 2;
+        assert_eq!(
+            report.verify_current(&enrolled, &cluster_id, at),
+            Err(CapacityRejection::Generation)
+        );
+        enrolled.generation = 1;
+        enrolled.state = ClusterMemberState::Revoked;
+        assert_eq!(
+            report.verify_current(&enrolled, &cluster_id, at),
+            Err(CapacityRejection::Unenrolled)
+        );
         drop(kernel);
         let reopened = Arc::new(crate::AgentKernelImpl::with_db_path(&database).unwrap());
-        let next = reopened.cluster_control.sample_capacity(&reopened, &cluster_id, 1, at + chrono::Duration::seconds(5)).unwrap();
-        assert!(next.sequence > report.sequence); assert_eq!(next.node_id, report.node_id);
-        drop(reopened); root.close().unwrap();
+        let next = reopened
+            .cluster_control
+            .sample_capacity(&reopened, &cluster_id, 1, at + chrono::Duration::seconds(5))
+            .unwrap();
+        assert!(next.sequence > report.sequence);
+        assert_eq!(next.node_id, report.node_id);
+        drop(reopened);
+        root.close().unwrap();
     }
 
     #[test]

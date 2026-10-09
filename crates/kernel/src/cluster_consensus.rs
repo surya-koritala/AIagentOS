@@ -480,14 +480,27 @@ pub struct ReplicatedAuthorityView {
     pub logical_time: DateTime<Utc>,
 }
 
-pub(crate) fn read_capacity_snapshot(context: &SqliteContextManager) -> io::Result<crate::cluster_capacity::ClusterCapacitySnapshot> {
-    let connection = context.conn.lock().map_err(|_| io::Error::other("capacity projection lock is poisoned"))?;
-    let state = load_persistent_state(&connection).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let control = state.authority.control_plane.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "replicated capacity is not initialized"))?;
+pub(crate) fn read_capacity_snapshot(
+    context: &SqliteContextManager,
+) -> io::Result<crate::cluster_capacity::ClusterCapacitySnapshot> {
+    let connection = context
+        .conn
+        .lock()
+        .map_err(|_| io::Error::other("capacity projection lock is poisoned"))?;
+    let state = load_persistent_state(&connection)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let control = state.authority.control_plane.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "replicated capacity is not initialized",
+        )
+    })?;
     Ok(crate::cluster_capacity::ClusterCapacitySnapshot {
-        cluster_id: control.cluster_id, authority_time: control.logical_time,
+        cluster_id: control.cluster_id,
+        authority_time: control.logical_time,
         staleness_seconds: crate::cluster_capacity::CAPACITY_STALENESS_SECONDS,
-        reports: state.authority.capacities.into_values().collect(), members: control.members.into_values().collect(),
+        reports: state.authority.capacities.into_values().collect(),
+        members: control.members.into_values().collect(),
     })
 }
 
@@ -782,7 +795,9 @@ fn write_persistent_state(
 
 fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
     if state.capacities.len() > crate::cluster_capacity::MAX_CAPACITY_NODES {
-        return Err(read_io("capacity projection exceeds maximum enrolled nodes"));
+        return Err(read_io(
+            "capacity projection exceeds maximum enrolled nodes",
+        ));
     }
     if !state.capacities.is_empty() && state.control_plane.is_none() {
         return Err(read_io("capacity projection has no authority genesis"));
@@ -839,14 +854,32 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
     if let Some(control) = &state.control_plane {
         validate_control_plane_state(control)?;
         for (node_id, capacity) in &state.capacities {
-            let member = control.members.get(node_id).ok_or_else(|| read_io("capacity references an unknown node"))?;
+            let member = control
+                .members
+                .get(node_id)
+                .ok_or_else(|| read_io("capacity references an unknown node"))?;
             let report = &capacity.report;
-            report.verify_origin(member, &control.cluster_id).map_err(|error| read_io(error.to_string()))?;
-            let historical_generation = control.membership_audit.iter().any(|audit| audit.node_id == *node_id && audit.member_generation == report.member_generation && audit.current == ClusterMemberState::Active && audit.changed_at <= report.observed_at);
-            if node_id != &report.node_id || !historical_generation || report.observed_at > capacity.committed_at
+            report
+                .verify_origin(member, &control.cluster_id)
+                .map_err(|error| read_io(error.to_string()))?;
+            let historical_generation = control.membership_audit.iter().any(|audit| {
+                audit.node_id == *node_id
+                    && audit.member_generation == report.member_generation
+                    && audit.current == ClusterMemberState::Active
+                    && audit.changed_at <= report.observed_at
+            });
+            if node_id != &report.node_id
+                || !historical_generation
+                || report.observed_at > capacity.committed_at
                 || capacity.committed_at > control.logical_time
-                || capacity.committed_at.signed_duration_since(report.observed_at) > chrono::Duration::seconds(crate::cluster_capacity::CAPACITY_STALENESS_SECONDS) {
-                return Err(read_io("capacity projection has invalid committed membership or time evidence"));
+                || capacity
+                    .committed_at
+                    .signed_duration_since(report.observed_at)
+                    > chrono::Duration::seconds(crate::cluster_capacity::CAPACITY_STALENESS_SECONDS)
+            {
+                return Err(read_io(
+                    "capacity projection has invalid committed membership or time evidence",
+                ));
             }
         }
         for receipt in state.receipts.values() {
@@ -2285,20 +2318,56 @@ fn apply_authority_command(
     };
     if let AuthorityCommand::ReportNodeCapacity { report, .. } = &command {
         let Some(control) = state.control_plane.as_ref() else {
-            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::NotInitialized, "replicated capacity is not initialized");
+            return rejected(
+                canonical_id,
+                state.sequence,
+                log_id,
+                AuthorityRejection::NotInitialized,
+                "replicated capacity is not initialized",
+            );
         };
         let at = control.logical_time;
         let validation = crate::cluster_capacity::validate_admission(
-            report, &control.members, &control.cluster_id, at, state.capacities.get(&report.node_id),
+            report,
+            &control.members,
+            &control.cluster_id,
+            at,
+            state.capacities.get(&report.node_id),
         );
         if let Err(error) = validation {
-            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::CapacityReport(error), error.to_string());
+            return rejected(
+                canonical_id,
+                state.sequence,
+                log_id,
+                AuthorityRejection::CapacityReport(error),
+                error.to_string(),
+            );
         }
-        if !state.capacities.contains_key(&report.node_id) && state.capacities.len() >= crate::cluster_capacity::MAX_CAPACITY_NODES {
-            return rejected(canonical_id, state.sequence, log_id, AuthorityRejection::CapacityReached, "capacity node projection is full");
+        if !state.capacities.contains_key(&report.node_id)
+            && state.capacities.len() >= crate::cluster_capacity::MAX_CAPACITY_NODES
+        {
+            return rejected(
+                canonical_id,
+                state.sequence,
+                log_id,
+                AuthorityRejection::CapacityReached,
+                "capacity node projection is full",
+            );
         }
-        state.capacities.insert(report.node_id.clone(), crate::cluster_capacity::QuorumNodeCapacity { report: report.clone(), committed_at: at, log_id });
-        return AuthorityResponse::NodeCapacityReported { operation_id: canonical_id, node_id: report.node_id.clone(), report_sequence: report.sequence, log_id };
+        state.capacities.insert(
+            report.node_id.clone(),
+            crate::cluster_capacity::QuorumNodeCapacity {
+                report: report.clone(),
+                committed_at: at,
+                log_id,
+            },
+        );
+        return AuthorityResponse::NodeCapacityReported {
+            operation_id: canonical_id,
+            node_id: report.node_id.clone(),
+            report_sequence: report.sequence,
+            log_id,
+        };
     }
     if let AuthorityCommand::AdvanceTime { proposed_at, .. } = &command {
         let Some(control) = state.control_plane.as_mut() else {
@@ -2620,7 +2689,9 @@ fn apply_new_authority_command(
             AuthorityRejection::InvalidCommand,
             "nested principal envelope is invalid".into(),
         )),
-        AuthorityCommand::ReportNodeCapacity { .. } => Err(invalid_command("capacity self-report must use its separate bounded channel")),
+        AuthorityCommand::ReportNodeCapacity { .. } => Err(invalid_command(
+            "capacity self-report must use its separate bounded channel",
+        )),
         AuthorityCommand::EnrollPrincipal {
             principal,
             expected_generation,

@@ -1646,7 +1646,9 @@ impl RpcRequest {
             Self::AppendEntries(_) => RPCTypes::AppendEntries,
             Self::Vote(_) => RPCTypes::Vote,
             Self::InstallSnapshot(_) => RPCTypes::InstallSnapshot,
-            Self::AuthorityWrite(_) | Self::AuthorityRead | Self::CapacityWrite(_) => RPCTypes::AppendEntries,
+            Self::AuthorityWrite(_) | Self::AuthorityRead | Self::CapacityWrite(_) => {
+                RPCTypes::AppendEntries
+            }
         }
     }
 
@@ -1660,7 +1662,10 @@ impl RpcRequest {
     }
 
     fn is_authority_request(&self) -> bool {
-        matches!(self, Self::AuthorityWrite(_) | Self::AuthorityRead | Self::CapacityWrite(_))
+        matches!(
+            self,
+            Self::AuthorityWrite(_) | Self::AuthorityRead | Self::CapacityWrite(_)
+        )
     }
 }
 
@@ -1945,7 +1950,9 @@ impl fmt::Debug for ClusterAuthorityHandle {
 }
 
 impl ClusterAuthorityHandle {
-    pub async fn capacity_snapshot(&self) -> io::Result<crate::cluster_capacity::ClusterCapacitySnapshot> {
+    pub async fn capacity_snapshot(
+        &self,
+    ) -> io::Result<crate::cluster_capacity::ClusterCapacitySnapshot> {
         // A live quorum clock barrier is required even when every reporter stopped.
         self.capacity_time_barrier().await?;
         crate::cluster_consensus::read_capacity_snapshot(&self.context)
@@ -1971,37 +1978,88 @@ impl ClusterAuthorityHandle {
         }
     }
 
-    pub(crate) async fn report_capacity(&self, report: crate::cluster_capacity::SignedNodeCapacity) -> io::Result<AuthorityResponse> {
+    pub(crate) async fn report_capacity(
+        &self,
+        report: crate::cluster_capacity::SignedNodeCapacity,
+    ) -> io::Result<AuthorityResponse> {
         let view = read_initialized_authority_view(&self.context)?;
-        let member = view.membership.members.iter().find(|member| member.node_id == report.node_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, crate::cluster_capacity::CapacityRejection::Unenrolled))?;
-        report.verify_current(member, &view.genesis.cluster_id, view.logical_time)
+        let member = view
+            .membership
+            .members
+            .iter()
+            .find(|member| member.node_id == report.node_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    crate::cluster_capacity::CapacityRejection::Unenrolled,
+                )
+            })?;
+        report
+            .verify_current(member, &view.genesis.cluster_id, view.logical_time)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
-        let command = AuthorityCommand::ReportNodeCapacity { operation_id: uuid::Uuid::new_v4().to_string(), report: report.clone(), proposed_at: view.logical_time };
+        let command = AuthorityCommand::ReportNodeCapacity {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            report: report.clone(),
+            proposed_at: view.logical_time,
+        };
         match self.raft.client_write(command).await {
             Ok(response) => Ok(response.data),
             Err(error) => {
                 let (leader_id, leader_node) = leader_target(&error)?;
-                match self.forward(leader_id, &leader_node, RpcRequest::CapacityWrite(report)).await? {
+                match self
+                    .forward(leader_id, &leader_node, RpcRequest::CapacityWrite(report))
+                    .await?
+                {
                     RpcResponse::CapacityWrite(Ok(response)) => Ok(response),
-                    RpcResponse::CapacityWrite(Err(error)) => Err(io::Error::new(io::ErrorKind::ConnectionRefused, error)),
-                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "capacity forwarding returned wrong response")),
+                    RpcResponse::CapacityWrite(Err(error)) => {
+                        Err(io::Error::new(io::ErrorKind::ConnectionRefused, error))
+                    }
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "capacity forwarding returned wrong response",
+                    )),
                 }
             }
         }
     }
 
-    pub async fn publish_kernel_capacity(&self, kernel: &crate::AgentKernelImpl) -> io::Result<AuthorityResponse> {
+    pub async fn publish_kernel_capacity(
+        &self,
+        kernel: &crate::AgentKernelImpl,
+    ) -> io::Result<AuthorityResponse> {
         let view = self.capacity_time_barrier().await?;
         let identity = kernel.cluster_control.identity();
-        let member = view.membership.members.iter().find(|member| member.node_id == identity.node_id && member.state == crate::cluster_control::ClusterMemberState::Active)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "capacity publisher node is not enrolled and active"))?;
-        let report = kernel.cluster_control.sample_capacity(kernel, &view.genesis.cluster_id, member.generation, view.logical_time).map_err(io::Error::other)?;
+        let member = view
+            .membership
+            .members
+            .iter()
+            .find(|member| {
+                member.node_id == identity.node_id
+                    && member.state == crate::cluster_control::ClusterMemberState::Active
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "capacity publisher node is not enrolled and active",
+                )
+            })?;
+        let report = kernel
+            .cluster_control
+            .sample_capacity(
+                kernel,
+                &view.genesis.cluster_id,
+                member.generation,
+                view.logical_time,
+            )
+            .map_err(io::Error::other)?;
         self.report_capacity(report).await
     }
 
     /// Weak task ownership prevents a reporter from retaining a stopped kernel.
-    pub fn start_capacity_publisher(&self, kernel: &Arc<crate::AgentKernelImpl>) -> crate::cluster_capacity::CapacityPublisher {
+    pub fn start_capacity_publisher(
+        &self,
+        kernel: &Arc<crate::AgentKernelImpl>,
+    ) -> crate::cluster_capacity::CapacityPublisher {
         crate::cluster_capacity::CapacityPublisher::start(self.clone(), Arc::downgrade(kernel))
     }
 
@@ -3370,13 +3428,32 @@ async fn handle_connection(
     let body = match request.body {
         RpcRequest::CapacityWrite(report) => {
             let view = read_initialized_authority_view(&context)?;
-            let member = view.membership.members.iter().find(|member| member.node_id == report.node_id)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "capacity node is not enrolled"))?;
+            let member = view
+                .membership
+                .members
+                .iter()
+                .find(|member| member.node_id == report.node_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "capacity node is not enrolled",
+                    )
+                })?;
             // An admitted peer may relay only a genuine report; no operator command is accepted here.
-            report.verify_current(member, &view.genesis.cluster_id, view.logical_time)
+            report
+                .verify_current(member, &view.genesis.cluster_id, view.logical_time)
                 .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
-            let command = AuthorityCommand::ReportNodeCapacity { operation_id: uuid::Uuid::new_v4().to_string(), report, proposed_at: view.logical_time };
-            RpcResponse::CapacityWrite(raft.client_write(command).await.map(|response| response.data).map_err(|error| error.to_string()))
+            let command = AuthorityCommand::ReportNodeCapacity {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                report,
+                proposed_at: view.logical_time,
+            };
+            RpcResponse::CapacityWrite(
+                raft.client_write(command)
+                    .await
+                    .map(|response| response.data)
+                    .map_err(|error| error.to_string()),
+            )
         }
         RpcRequest::AppendEntries(request) => {
             RpcResponse::AppendEntries(raft.append_entries(request).await)

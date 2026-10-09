@@ -36,7 +36,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (13, "preserve-ordered-multipart-message-content"),
     (14, "retain-actor-bound-cluster-operation-receipts"),
     (15, "require-independent-principal-authority-history"),
-    (16, "retain-signed-quorum-capacity-and-monotonic-node-cursors"),
+    (
+        16,
+        "retain-signed-quorum-capacity-and-monotonic-node-cursors",
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

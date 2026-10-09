@@ -543,11 +543,21 @@ impl NodeLoad {
     fn from_signed_capacity(report: kernel::cluster_capacity::SignedNodeCapacity) -> Self {
         let c = &report.counters;
         Self {
-            control: Some(report.control.clone()), observed_at: Some(report.observed_at), signature_hex: Some(report.signature_hex.clone()),
-            agent_count: c.agent_count as usize, running_agents: c.running_agents as usize, live_agents: c.live_agents as usize,
-            queued_agents: c.queued_agents as usize, paused_agents: c.paused_agents as usize, stopped_agents: c.stopped_agents as usize,
-            active_turns: c.active_turns as usize, waiting_turns: c.waiting_turns as usize, turn_capacity: c.turn_capacity as usize,
-            llm_requests_in_flight: c.llm_requests_in_flight as usize, llm_requests_waiting: c.llm_requests_waiting as usize, llm_core_capacity: c.llm_core_capacity as usize,
+            control: Some(report.control.clone()),
+            observed_at: Some(report.observed_at),
+            signature_hex: Some(report.signature_hex.clone()),
+            agent_count: c.agent_count as usize,
+            running_agents: c.running_agents as usize,
+            live_agents: c.live_agents as usize,
+            queued_agents: c.queued_agents as usize,
+            paused_agents: c.paused_agents as usize,
+            stopped_agents: c.stopped_agents as usize,
+            active_turns: c.active_turns as usize,
+            waiting_turns: c.waiting_turns as usize,
+            turn_capacity: c.turn_capacity as usize,
+            llm_requests_in_flight: c.llm_requests_in_flight as usize,
+            llm_requests_waiting: c.llm_requests_waiting as usize,
+            llm_core_capacity: c.llm_core_capacity as usize,
             signed_capacity: Some(report),
         }
     }
@@ -2100,7 +2110,9 @@ impl KernelClient {
     }
 
     /// Read signed samples after a current quorum clock barrier from any member.
-    pub async fn cluster_capacity(&mut self) -> Result<kernel::cluster_capacity::ClusterCapacitySnapshot, SdkError> {
+    pub async fn cluster_capacity(
+        &mut self,
+    ) -> Result<kernel::cluster_capacity::ClusterCapacitySnapshot, SdkError> {
         match self.call(Syscall::GetClusterCapacity).await? {
             SyscallReply::ClusterCapacity { snapshot } => Ok(snapshot),
             other => Err(unexpected("ClusterCapacity", &other)),

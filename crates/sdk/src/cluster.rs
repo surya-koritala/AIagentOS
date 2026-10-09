@@ -840,22 +840,40 @@ impl ClusterClient {
                 }
             }
             current.ok_or_else(|| SdkError::Wire {
-                code: WireErrorCode::Unavailable, message: "no quorum-observed signed capacity is available".into(), retryable: true,
+                code: WireErrorCode::Unavailable,
+                message: "no quorum-observed signed capacity is available".into(),
+                retryable: true,
             })?
         };
-        let loads = self.nodes.iter().map(|node| {
-            let report = snapshot.reports.iter().find(|capacity| capacity.report.node_id == node.id);
-            let member = snapshot.members.iter().find(|member| member.node_id == node.id);
-            let verified = report.zip(member).filter(|(capacity, member)| {
-                node.fingerprint.as_deref() == Some(member.fingerprint.as_str())
-                    && self.authority.as_ref().is_none_or(|authority| authority.cluster_id == snapshot.cluster_id)
-                    && snapshot.staleness_seconds == kernel::cluster_capacity::CAPACITY_STALENESS_SECONDS
-                    && capacity.committed_at <= snapshot.authority_time
-                    && capacity.report.verify_current(member, &snapshot.cluster_id, snapshot.authority_time).is_ok()
-            });
-            let load = verified.map(|(capacity, _)| NodeLoad::from_signed_capacity(capacity.report.clone())).unwrap_or_default();
-            (node.id.clone(), load)
-        }).collect::<Vec<_>>();
+        let loads = self
+            .nodes
+            .iter()
+            .map(|node| {
+                let report = snapshot
+                    .reports
+                    .iter()
+                    .find(|capacity| capacity.report.node_id == node.id);
+                let member = snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.node_id == node.id);
+                let verified = report.zip(member).filter(|(capacity, member)| {
+                    node.fingerprint.as_deref() == Some(member.fingerprint.as_str())
+                        && self.authority.as_ref().is_none_or(|authority| authority.cluster_id == snapshot.cluster_id)
+                        && snapshot.staleness_seconds
+                            == kernel::cluster_capacity::CAPACITY_STALENESS_SECONDS
+                        && capacity.committed_at <= snapshot.authority_time
+                        && capacity
+                            .report
+                            .verify_current(member, &snapshot.cluster_id, snapshot.authority_time)
+                            .is_ok()
+                });
+                let load = verified
+                    .map(|(capacity, _)| NodeLoad::from_signed_capacity(capacity.report.clone()))
+                    .unwrap_or_default();
+                (node.id.clone(), load)
+            })
+            .collect::<Vec<_>>();
         let requirements = match &placement {
             Placement::Constrained(requirements) => Some(requirements),
             Placement::LeastLoaded | Placement::RoundRobin => None,
@@ -2075,7 +2093,8 @@ fn validate_destination_fence(
 }
 
 fn node_accepts(load: &NodeLoad, requirements: Option<&PlacementConstraints>) -> bool {
-    if load.signed_capacity.is_none() || load.observed_at.is_none() || load.signature_hex.is_none() {
+    if load.signed_capacity.is_none() || load.observed_at.is_none() || load.signature_hex.is_none()
+    {
         return false;
     }
     let Some(control) = load.control.as_ref() else {

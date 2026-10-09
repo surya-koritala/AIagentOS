@@ -27,6 +27,15 @@ Maintenance verifies recorded agents without loading service definitions or
 retiring stored services omitted from the current config. It does not start
 service supervision or provider work.
 
+An authenticated disaster or corruption restore can publish a verified database
+whose recorded workspaces belong to an older store. Its report then says
+`workspace_resolution_required` and `enforcement_rearmed = false`. This successful
+database restore is distinct from completed agent recovery. After inspecting and
+retaining the recorded UUIDs, restart the local list flow and run
+`agentctl backup-recovery-qualify CONFIG_FILE --confirm-offline` to obtain actual
+enforcement readiness. Missing workspace files must be restored separately at
+their recorded path; retention accepts no replacement path or empty substitute.
+
 ```sh
 agentctl workspace-ownership CONFIG_FILE list
 agentctl workspace-ownership CONFIG_FILE retain AGENT_UUID --confirm-offline

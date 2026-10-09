@@ -97,6 +97,7 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl backup-verify BACKUP_DIR [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] [--require-anchor ANCHOR_FILE]\n\
            agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] [--require-anchor ANCHOR_FILE] --confirm-offline\n\
            agentctl backup-disaster-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE --confirm-offline\n\
+           agentctl backup-recovery-qualify CONFIG_FILE --confirm-offline\n\
            agentctl backup-corruption-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE EXPECTED_INSTALLATION_ID --confirm-offline\n\
            agentctl backup-remote-publish BACKUP_DIR PUBLIC_TRUST_FILE ANCHOR_FILE ENDPOINT BUCKET PREFIX RETAIN_UNTIL [--region REGION] [--storage-key KEY_FILE] [--allow-loopback-http] --confirm-compliance-lock\n\
            agentctl backup-remote-fetch ENDPOINT BUCKET PREFIX PUBLICATION_REPORT DEST_BACKUP_DIR PUBLIC_TRUST_FILE ANCHOR_FILE [--region REGION] [--storage-key KEY_FILE] [--allow-loopback-http]\n\
@@ -692,6 +693,23 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
             }
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "restore report");
+            true
+        }
+        "backup-recovery-qualify" => {
+            let config_file = args.next().unwrap_or_else(|| usage());
+            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
+                usage();
+            }
+            let path = std::path::Path::new(&config_file);
+            if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+                fail_operator("recovery qualification requires an existing configuration file".into());
+            }
+            let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| {
+                fail_operator(format!("failed to load recovery configuration: {error}"))
+            });
+            let report = kernel::storage::qualify_storage_recovery_from_config(&config)
+                .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "recovery qualification report");
             true
         }
         "backup-disaster-recover" => {

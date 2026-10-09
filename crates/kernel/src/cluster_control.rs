@@ -2297,6 +2297,7 @@ impl ClusterControl {
             .map_err(|error| storage_error(format!("initialize capacity sequence: {error}")))?;
         let old: i64 = transaction.query_row("SELECT sequence FROM cluster_capacity_cursor WHERE singleton = 1", [], |row| row.get(0))
             .map_err(|error| storage_error(format!("read capacity sequence: {error}")))?;
+        if old < 0 { return Err(storage_error("capacity sequence is negative")); }
         let next = old.checked_add(1).ok_or_else(|| storage_error("capacity sequence exhausted"))?;
         let mut report = crate::cluster_capacity::SignedNodeCapacity {
             version: 1, cluster_id: cluster_id.to_owned(), node_id: self.identity.node_id.clone(),

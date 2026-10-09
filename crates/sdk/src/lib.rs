@@ -135,6 +135,7 @@ pub struct ReservedAgentIdentity {
 }
 
 pub mod cluster;
+pub use kernel::cluster_capacity::{CapacityCounters, CapacityRejection, ClusterCapacitySnapshot, QuorumNodeCapacity, SignedNodeCapacity};
 pub mod patterns;
 
 pub use cluster::{

@@ -434,11 +434,30 @@ paths are rejected.
 
 ## Consistency by object
 
+Capacity counters have their own `observed_at` and monotonic sequence. The node
+control `updated_at` records a control mutation and does not measure capacity
+freshness. `GetClusterCapacity` / `KernelClient::cluster_capacity` reads all
+replicated samples from any member after a current leader clock barrier. Report
+timestamps cannot advance the authority clock. A forged signature and a reused
+observation/sequence have distinct rejections; left/revoked or re-admitted
+membership invalidates old sample epochs. The latest projection retains at most
+31 node reports, independently of the permanent operator-operation receipt
+limit. Local sample cursors survive restart.
+
+`ClusterClient` scores only currently enrolled, verified, fresh quorum samples.
+If every candidate is missing, unsigned or stale, placement returns retryable
+`Unavailable`; it does not poll individual unsigned counters as a fallback.
+Older `NodeInfo` replies still parse with absent observation/signature fields,
+and are observational data rather than placement authority. A bounded weak
+publisher starts with enabled `agent-server` cluster mode and releases its
+kernel references when stopped. This engineering path requires its focused
+multi-node/native CI evidence before release qualification.
+
 | Object | System of record now | Current consistency | Production requirement |
 |---|---|---|---|
 | Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, requires independent principal key proof plus short-lived application-node delegation, binds the machine to the authenticated Raft source and active membership, and uses linearizable reads; principal enroll/revoke is quorum-backed; application leaves use bounded prepare/activate/finalize trust generations; voter changes use learner catch-up and joint consensus; separate digest-pinned transport-trust generations add/remove learners and rotate exact peer leaves/CA roots | Live administration, independently qualified compromised-host isolation, and external partition/clock qualification |
 | Node identity | Node-local Ed25519 key plus authority membership certificate fingerprint | Stable across restart; fresh challenges sign application-listener prepare and activation; candidate and previous leaf acceptance expire against replicated time; Raft peer leaves and roots use separately bounded trust epochs | Independent compromised-node and multi-host partition/clock qualification |
-| Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
+| Node availability and placement profile | Node-local generation-fenced control plus a bounded latest-per-node quorum capacity projection | Reports bind the complete control state and actual kernel counters to the enrolled node key, control/member generations, monotonic sample sequence and quorum-issued observation time; publishing is limited to a five-second cadence; placement reads advance replicated authority time and reject unsigned, future or older-than-fifteen-second samples | External multi-host clock/partition qualification, compromised-node capacity honesty and policy/quota coordination |
 | Agent identity | Authority reservation plus owning-node SQLite database | Managed creation reserves one UUID before exact destination creation; duplicates cannot overwrite a local agent | Quorum-allocated immutable identity and migration-aware placement record |
 | Agent ownership and routing | Quorum authority lease registry in enabled mode, destination fence tombstones, plus `ClusterClient` in-memory routes | Ownership mutations and reads are quorum-backed in enabled mode; a destination linearly confirms the exact active revision before fence install/retire; authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates exact term/generation/token/expiry agreement; expiry stops new destination admission; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes or expiry checks from crossing admitted work | Offline quorum certificate or explicitly online-only production contract, externally qualified partition/clock bounds, and migration admission |
 | Agent state and checkpoints | Owning node SQLite database | Transactional on one node; no cross-node replica or migration transaction | Checkpoint/handoff protocol with one committed owner, rollback point, and side-effect boundary |
@@ -463,7 +482,10 @@ Independent principal proof does not complete these requirements or epic #122.
   every active endpoint, proves the advertised identity and fingerprint, and
   re-reads membership. Any change during assembly returns a retryable conflict.
 - Placement considers the load and declared constraints reported by connected
-  active nodes. Capacity is advisory and has no signed freshness guarantee.
+  active nodes. Capacity signatures prove origin and freshness within the
+  replicated fifteen-second bound; they do not prove truthful hardware claims.
+  Node-local workload admission remains authoritative even when an earlier
+  active sample remains within that bound.
 - Managed agent creation allocates a UUID, commits an expiring authority
   reservation for that UUID/node, preinstalls the exact destination fence,
   creates the local agent while holding a shared fence guard, verifies the

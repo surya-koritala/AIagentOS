@@ -842,7 +842,7 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
             let member = control.members.get(node_id).ok_or_else(|| read_io("capacity references an unknown node"))?;
             let report = &capacity.report;
             report.verify_origin(member, &control.cluster_id).map_err(|error| read_io(error.to_string()))?;
-            let historical_generation = control.membership_audit.iter().any(|audit| audit.node_id == *node_id && audit.member_generation == report.member_generation && audit.current == ClusterMemberState::Active);
+            let historical_generation = control.membership_audit.iter().any(|audit| audit.node_id == *node_id && audit.member_generation == report.member_generation && audit.current == ClusterMemberState::Active && audit.changed_at <= report.observed_at);
             if node_id != &report.node_id || !historical_generation || report.observed_at > capacity.committed_at
                 || capacity.committed_at > control.logical_time
                 || capacity.committed_at.signed_duration_since(report.observed_at) > chrono::Duration::seconds(crate::cluster_capacity::CAPACITY_STALENESS_SECONDS) {
@@ -4645,6 +4645,42 @@ mod tests {
             operation_id: operation_id.to_string(),
             expected_sequence,
         }
+    }
+
+    #[test]
+    fn signed_capacity_projection_is_bounded_replay_safe_and_does_not_consume_operator_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(crate::AgentKernelImpl::with_db_path(&root.path().join("capacity-origin.db")).unwrap());
+        let identity = kernel.cluster_control.identity().clone();
+        let at = Utc::now();
+        let cluster_id = crate::cluster_principal::FIXTURE_CLUSTER_ID.to_owned();
+        let genesis = AuthorityGenesis { cluster_id: cluster_id.clone(), operator_principals: vec![crate::cluster_principal::fixture_operator()], members: vec![AuthorityGenesisMember {
+            node_id: identity.node_id, fingerprint: identity.fingerprint, public_key: identity.public_key,
+            tls_server_certificate_fingerprint: None, endpoint: "127.0.0.1:7001".into(), server_version: "capacity-fixture".into(), min_protocol_version: 1, protocol_version: 2,
+        }] };
+        let mut state = AuthorityState::default();
+        super::apply_authority_command(&mut state, AuthorityCommand::Initialize { operation_id: cluster_id.clone(), genesis, proposed_at: at }, log_id(1, 1));
+        let receipt_count = state.receipts.len(); let receipt_sequence = state.sequence;
+        for index in 0..40u64 {
+            let observed_at = at + chrono::Duration::seconds((index * 5) as i64);
+            super::apply_authority_command(&mut state, AuthorityCommand::AdvanceTime { operation_id: Uuid::new_v4().to_string(), proposed_at: observed_at }, log_id(1, index * 2 + 2));
+            let report = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, observed_at).unwrap();
+            let response = super::apply_authority_command(&mut state, AuthorityCommand::ReportNodeCapacity { operation_id: Uuid::new_v4().to_string(), report: report.clone(), proposed_at: observed_at }, log_id(1, index * 2 + 3));
+            assert!(matches!(response, AuthorityResponse::NodeCapacityReported { .. }), "{response:?}");
+            let unchanged = state.clone();
+            let response = super::apply_authority_command(&mut state, AuthorityCommand::ReportNodeCapacity { operation_id: Uuid::new_v4().to_string(), report: report.clone(), proposed_at: observed_at }, log_id(1, index * 2 + 4));
+            assert!(matches!(response, AuthorityResponse::Rejected { reason: AuthorityRejection::CapacityReport(crate::cluster_capacity::CapacityRejection::Replay), .. }));
+            assert_eq!(state, unchanged);
+            validate_authority_state(&state).unwrap();
+        }
+        assert_eq!(state.receipts.len(), receipt_count); assert_eq!(state.sequence, receipt_sequence); assert_eq!(state.capacities.len(), 1);
+        let original = state.clone();
+        state.capacities.values_mut().next().unwrap().report.counters.agent_count += 1;
+        assert!(validate_authority_state(&state).is_err(), "restored counters cannot drift behind a copied valid signature");
+        state = original;
+        state.capacities.values_mut().next().unwrap().report.member_generation = 999;
+        assert!(validate_authority_state(&state).is_err());
+        drop(kernel); root.close().unwrap();
     }
 
     fn normal_entry(

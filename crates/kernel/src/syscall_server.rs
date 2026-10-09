@@ -4769,6 +4769,18 @@ async fn dispatch_scoped_inner_with_fence(
                 .and_then(|snapshot| snapshot.reports.into_iter().find(|capacity| capacity.report.node_id == kernel.cluster_control.identity().node_id))
                 .map(|capacity| capacity.report);
             if let Some(report) = signed {
+                let live_control = match kernel.cluster_control.status() {
+                    Ok(control) => control,
+                    Err(error) => return SyscallReply::Error { message: format!("node control unavailable: {error}") },
+                };
+                if live_control != report.control {
+                    let snapshot = crate::cluster_capacity::CapacityCounters::collect(kernel);
+                    return SyscallReply::NodeInfo { control: Some(live_control), observed_at: None, signature_hex: None, signed_capacity: None,
+                        agent_count: snapshot.agent_count as usize, running_agents: snapshot.running_agents as usize, live_agents: snapshot.live_agents as usize,
+                        queued_agents: snapshot.queued_agents as usize, paused_agents: snapshot.paused_agents as usize, stopped_agents: snapshot.stopped_agents as usize,
+                        active_turns: snapshot.active_turns as usize, waiting_turns: snapshot.waiting_turns as usize, turn_capacity: snapshot.turn_capacity as usize,
+                        llm_requests_in_flight: snapshot.llm_requests_in_flight as usize, llm_requests_waiting: snapshot.llm_requests_waiting as usize, llm_core_capacity: snapshot.llm_core_capacity as usize };
+                }
                 let c = &report.counters;
                 return SyscallReply::NodeInfo {
                     control: Some(report.control.clone()), observed_at: Some(report.observed_at), signature_hex: Some(report.signature_hex.clone()), signed_capacity: Some(report.clone()),
@@ -11556,6 +11568,7 @@ memory = ["remember this"]
             .into_iter()
             .chain([
                 (Syscall::GetAuthorityPrincipalRegistry, AccessLevel::System),
+                (Syscall::GetClusterCapacity, AccessLevel::System),
                 (
                     Syscall::SubmitSignedAuthorityCommand {
                         command: Box::new(crate::cluster_principal::fixture_signed(

@@ -55,6 +55,14 @@ jobs:
       - name: Compile all public consumers before native qualification
         run: cargo check -p kernel -p agent-sdk -p agent-cli -p agent-tui --all-targets --locked
       - name: Verify exact node-origin and freshness fences
-        run: cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture
+        run: |
+          cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture
+          cargo test -p kernel --lib --locked signed_capacity_projection_is_bounded -- --nocapture
+      - name: Exercise actual SDK compatibility and quorum placement
+        run: |
+          cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture
+          cargo test -p agent-sdk --test quorum_capacity --locked -- --nocapture
+      - name: Reject old readers before signed capacity replay state can be lost
+        run: cargo test -p kernel --lib --locked capacity_cursor_requires_current_reader -- --nocapture
       - name: Preserve public wire contracts
         run: cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture

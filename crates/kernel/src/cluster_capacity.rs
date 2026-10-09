@@ -105,6 +105,8 @@ impl SignedNodeCapacity {
         if self.version != 1 || self.sequence == 0 || self.member_generation == 0
             || !canonical_uuid(&self.cluster_id) || !canonical_uuid(&self.node_id)
             || self.node_id != self.control.identity.node_id
+            || !canonical_hex(&self.control.identity.public_key, 32)
+            || !canonical_hex(&self.control.identity.fingerprint, 32)
             || self.control.reason.len() > 1024
             || crate::cluster_control::validate_profile(&self.control.profile).is_err()
         {
@@ -128,6 +130,7 @@ impl SignedNodeCapacity {
         {
             return Err(CapacityRejection::Unenrolled);
         }
+        if !canonical_hex(&self.signature_hex, 64) { return Err(CapacityRejection::Forged); }
         let signature = crate::cluster_control::hex_decode(&self.signature_hex)
             .filter(|signature| signature.len() == 64).ok_or(CapacityRejection::Forged)?;
         if !ClusterControl::verify_challenge(&member.public_key, &self.payload()?, &signature) {
@@ -184,6 +187,10 @@ pub(crate) fn validate_admission(
 
 fn canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
+}
+
+fn canonical_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub struct CapacityPublisher {
@@ -297,5 +304,41 @@ mod tests {
         let next = reopened.cluster_control.sample_capacity(&reopened, &cluster_id, 1, at + chrono::Duration::seconds(5)).unwrap();
         assert!(next.sequence > report.sequence); assert_eq!(next.node_id, report.node_id);
         drop(reopened); root.close().unwrap();
+    }
+
+    #[test]
+    fn control_mutation_time_is_not_capacity_observation_and_changes_require_new_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(crate::AgentKernelImpl::with_db_path(&root.path().join("capacity.db")).unwrap());
+        let at = Utc::now(); let cluster_id = uuid::Uuid::new_v4().to_string();
+        let first = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at).unwrap();
+        let current = member(&first.control, at);
+        let second = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at + chrono::Duration::seconds(5)).unwrap();
+        assert_eq!(first.control.updated_at, second.control.updated_at);
+        assert_eq!(first.control.generation, second.control.generation);
+        assert_ne!(first.observed_at, second.observed_at); assert!(second.sequence > first.sequence);
+        let committed = QuorumNodeCapacity { report: first.clone(), committed_at: at, log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 3) };
+        let members = BTreeMap::from([(current.node_id.clone(), current)]);
+        assert!(validate_admission(&second, &members, &cluster_id, second.observed_at, Some(&committed)).is_ok());
+        kernel.cluster_control.transition(crate::cluster_control::NodeAvailability::Draining, first.control.generation, "capacity-fixture", "actual drain changes control epoch").unwrap();
+        let third = kernel.cluster_control.sample_capacity(&kernel, &cluster_id, 1, at + chrono::Duration::seconds(10)).unwrap();
+        assert_eq!(third.control.generation, first.control.generation + 1);
+        assert_eq!(third.control.availability, crate::cluster_control::NodeAvailability::Draining);
+        let second_committed = QuorumNodeCapacity { report: second, committed_at: at + chrono::Duration::seconds(5), log_id: committed.log_id };
+        assert!(validate_admission(&third, &members, &cluster_id, third.observed_at, Some(&second_committed)).is_ok());
+        let third_committed = QuorumNodeCapacity { report: third.clone(), committed_at: third.observed_at, log_id: committed.log_id };
+        assert_eq!(validate_admission(&first, &members, &cluster_id, third.observed_at, Some(&third_committed)), Err(CapacityRejection::Replay));
+        drop(kernel); root.close().unwrap();
+    }
+
+    #[test]
+    fn capacity_cursor_requires_current_reader() {
+        let context = crate::context::SqliteContextManager::in_memory().unwrap();
+        let connection = context.conn.lock().unwrap();
+        let before: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert!(crate::schema::preflight_for_reader(&connection, 15).is_err());
+        let after: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(before, after);
+        crate::schema::preflight_for_reader(&connection, crate::schema::CURRENT_SCHEMA_VERSION).unwrap();
     }
 }

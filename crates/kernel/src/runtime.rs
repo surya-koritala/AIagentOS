@@ -49,6 +49,17 @@ impl KernelRuntime {
         if self.kernel.backup_maintenance.config().enabled {
             handles.push(self.spawn_backup_maintenance(generation));
         }
+        if let Ok(Some(authority)) = self.kernel.cluster_authority() {
+            let publisher = authority.start_capacity_publisher(&self.kernel);
+            let weak = Arc::downgrade(&self.kernel);
+            let running = self.running.clone(); let active_generation = self.generation.clone();
+            handles.push(tokio::spawn(async move {
+                while weak.strong_count() > 0 && running.load(std::sync::atomic::Ordering::SeqCst) && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                publisher.shutdown().await;
+            }));
+        }
         handles
     }
 

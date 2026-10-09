@@ -848,6 +848,7 @@ impl ClusterClient {
             let member = snapshot.members.iter().find(|member| member.node_id == node.id);
             let verified = report.zip(member).filter(|(capacity, member)| {
                 node.fingerprint.as_deref() == Some(member.fingerprint.as_str())
+                    && self.authority.as_ref().is_none_or(|authority| authority.cluster_id == snapshot.cluster_id)
                     && snapshot.staleness_seconds == kernel::cluster_capacity::CAPACITY_STALENESS_SECONDS
                     && capacity.committed_at <= snapshot.authority_time
                     && capacity.report.verify_current(member, &snapshot.cluster_id, snapshot.authority_time).is_ok()
@@ -2080,6 +2081,11 @@ fn node_accepts(load: &NodeLoad, requirements: Option<&PlacementConstraints>) ->
     let Some(control) = load.control.as_ref() else {
         return false;
     };
+    let Some(report) = load.signed_capacity.as_ref() else { return false; };
+    if &report.control != control || load.observed_at != Some(report.observed_at)
+        || load.signature_hex.as_deref() != Some(report.signature_hex.as_str()) {
+        return false;
+    }
     if control.availability != NodeAvailability::Active {
         return false;
     }
@@ -2133,6 +2139,13 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::{ClusterCertificateRollout, ClusterCertificateRolloutPhase};
+
+    #[test]
+    fn unsigned_or_forged_capacity_is_never_used_for_placement() {
+        assert!(!node_accepts(&NodeLoad::default(), None));
+        let load = NodeLoad { observed_at: Some(chrono::Utc::now()), signature_hex: Some("00".repeat(64)), ..Default::default() };
+        assert!(!node_accepts(&load, None), "optional observation and signature text alone cannot qualify counters");
+    }
 
     #[test]
     fn discovery_uses_replicated_time_and_fails_closed_outside_rollout_windows() {

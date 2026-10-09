@@ -89,6 +89,7 @@ async fn principal_history_requires_current_reader_and_retains_real_receipt14_be
         let metadata = crate::schema::read_storage_metadata(&connection).unwrap();
         assert_eq!(metadata.schema_version, crate::schema::CURRENT_SCHEMA_VERSION);
         assert_eq!(metadata.min_reader_schema_version, crate::schema::MIN_READER_SCHEMA_VERSION);
+        assert!(metadata.min_reader_schema_version >= 15);
         let migration: String = connection.query_row("SELECT name FROM schema_migrations WHERE version=14", [], |row| row.get(0)).unwrap();
         assert_eq!(migration, "retain-actor-bound-cluster-operation-receipts");
         let receipt_table: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='cluster_operation_receipts'", [], |row| row.get(0)).unwrap();

@@ -134,8 +134,20 @@ jobs:
           cargo test -p kernel wire_contract --lib 2>&1 | tee target/qualification/principal/wire-rust.txt
           cargo test -p agent-sdk --test cluster_principal 2>&1 | tee target/qualification/principal/sdk.txt
           python3 -m unittest discover -s scripts/tests -p test_verify_wire_fixtures.py 2>&1 | tee target/qualification/principal/wire-python.txt
+      - name: Capability inventory and existing streamed history contract
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p integration-tests capability_registry --lib 2>&1 | tee target/qualification/principal/capabilities.txt
+          cargo test -p integration-tests gemini_history --lib 2>&1 | tee target/qualification/principal/gemini-history.txt
+      - name: Actual shipped CLI independent signing and certificate replay
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p agent-cli principal --lib 2>&1 | tee target/qualification/principal/cli-principal.txt
+          cargo test -p agent-cli --test cluster_commands -- --test-threads=1 2>&1 | tee target/qualification/principal/cli-commands.txt
       - name: Warnings are errors
-        run: cargo clippy -p kernel -p agent-sdk --all-targets -- -D warnings
+        run: cargo clippy -p kernel -p agent-sdk -p agent-cli --all-targets -- -D warnings
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

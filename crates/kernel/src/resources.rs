@@ -156,6 +156,22 @@ pub(crate) fn normalize_filesystem_target(target: &str) -> Result<String, Resour
         ));
     }
 
+    // Windows canonicalize returns an extended-length DOS drive path. It is
+    // the same local filesystem target as the ordinary absolute drive form;
+    // UNC, volume GUID, device namespace and drive-relative forms stay denied.
+    #[cfg(windows)]
+    let target = if matches!(
+        std::path::Path::new(target).components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+    ) && std::path::Path::new(target).is_absolute()
+    {
+        target.get(4..).ok_or_else(|| {
+            ResourceError::OperationFailed("invalid canonical drive target".into())
+        })?
+    } else {
+        target
+    };
     let portable = target.replace('\\', "/");
     if portable.starts_with("//") {
         return Err(ResourceError::OperationFailed(
@@ -1316,6 +1332,52 @@ mod tests {
             normalize_filesystem_target(r"C:\workspace\file.txt").unwrap(),
             "C:/workspace/file.txt"
         );
+    }
+
+    #[test]
+    fn unc_device_volume_and_verbatim_traversal_targets_remain_denied() {
+        for target in [
+            r"\\server\share\secret",
+            r"\\?\UNC\server\share\secret",
+            r"\\.\PhysicalDrive0",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\secret",
+            r"\\?\C:relative.txt",
+            r"\\?\C:\allowed\..\denied",
+            "//?/C:/allowed/../denied",
+        ] {
+            assert!(normalize_filesystem_target(target).is_err(), "{target}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn actual_canonical_drive_target_has_one_tool_authorization_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        let target = canonical.join("side-effect.txt");
+        let target = target.to_str().unwrap();
+        let ordinary = target.strip_prefix(r"\\?\").unwrap();
+        let expected = normalize_filesystem_target(ordinary).unwrap();
+        assert_eq!(normalize_filesystem_target(target).unwrap(), expected);
+        let registry = crate::tools::ToolRegistry::new();
+        let (_, resource) = registry
+            .security_context(
+                "write_file",
+                &serde_json::json!({"path":target,"content":"proof"}),
+            )
+            .unwrap();
+        assert_eq!(resource, expected);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_hosts_do_not_reinterpret_extended_drive_prefixes() {
+        assert!(normalize_filesystem_target(r"\\?\C:\workspace\file.txt").is_err());
     }
 
     struct MockProvider;

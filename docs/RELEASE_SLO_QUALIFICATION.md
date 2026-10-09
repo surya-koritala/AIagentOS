@@ -101,9 +101,22 @@ expose the runtime's compiled source identity as five fixed
 `agentos_build_source_sha1{part}` gauges and
 `agentos_build_source_verified: 1`. The exporter reconstructs the actual commit
 and requires it to match the declared clean source throughout the window.
-Missing Git build metadata, dirty tracked source, and mixed builds fail closed.
+Missing Git build metadata without a valid packaged Git object proof, dirty or
+unattested source, and mixed builds fail closed. A source-qualified Docker build
+uses a context prepared on CI from clean Git objects. Its build script verifies
+the declared commit and every tree/blob against actual context bytes; `.git`
+and local credentials are excluded. This source binding does not complete any
+production observation window or change target qualification tiers.
 Provisioning and independent review also verify the installed artifact and
 keep the deployment binding valid throughout the window.
+
+```sh
+python3 scripts/prepare_source_context.py --output /controlled/source-context
+docker build --iidfile /controlled/image-id.txt /controlled/source-context
+```
+
+Missing or invalid source proof leaves ordinary keyless boot available with
+`agentos_build_source_verified = 0`; it cannot supply target SLO source evidence.
 
 ```bash
 python3 scripts/slo_observation.py \

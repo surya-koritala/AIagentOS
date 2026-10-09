@@ -2461,6 +2461,27 @@ impl KernelClient {
 
     /// Submit a caller-signed command. The caller retains its own private key;
     /// this method never creates a proof from a transport/API credential.
+    pub async fn submit_authority_command_with_signer(
+        &mut self,
+        command: AuthorityCommand,
+        cluster_id: &str,
+        principal_id: &str,
+        principal_generation: u64,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, PrincipalProofError>,
+    ) -> Result<AuthorityResponse, SdkError> {
+        let signed = sign_authority_principal(
+            command,
+            cluster_id,
+            principal_id,
+            principal_generation,
+            chrono::Utc::now(),
+            sign,
+        )
+        .map_err(|error| SdkError::Configuration(error.to_string()))?;
+        self.submit_signed_authority_command(signed).await
+    }
+
+    /// Submit an independently signed envelope without a token-only fallback.
     pub async fn submit_signed_authority_command(
         &mut self,
         command: AuthorityCommand,

@@ -47,7 +47,10 @@ impl AgentIdentityScope {
             (Self::System, AuthorityPrincipalKind::Operator, None) => Ok(()),
             (Self::Tenant { .. }, AuthorityPrincipalKind::Operator, None) => Ok(()),
             (Self::Tenant { tenant_id }, AuthorityPrincipalKind::Tenant, Some(actual))
-                if tenant_id == actual => Ok(()),
+                if tenant_id == actual =>
+            {
+                Ok(())
+            }
             _ => Err(PrincipalProofError::TenantScope),
         }
     }
@@ -139,7 +142,8 @@ pub struct DestinationCreationReceipt {
 
 impl DestinationCreationReceipt {
     pub fn sha256(&self) -> Result<String, AgentIdentityError> {
-        serde_json::to_vec(self).map(|bytes| sha256_hex(&bytes))
+        serde_json::to_vec(self)
+            .map(|bytes| sha256_hex(&bytes))
             .map_err(|_| AgentIdentityError::ReceiptMismatch)
     }
     pub fn validate(
@@ -229,7 +233,10 @@ impl AgentIdentityRecord {
             }
             AgentIdentityState::Deleted => self.revision == 4 && has_receipt,
         };
-        let tombstone = matches!(self.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted);
+        let tombstone = matches!(
+            self.state,
+            AgentIdentityState::Aborted | AgentIdentityState::Deleted
+        );
         if !legal
             || tombstone != self.tombstone_reason.is_some()
             || self.tombstone_reason.as_ref().is_some_and(|reason| {
@@ -247,7 +254,10 @@ impl AgentIdentityRecord {
         Ok(())
     }
 
-    pub fn authorize_creator(&self, principal: &AuthorityPrincipal) -> Result<(), PrincipalProofError> {
+    pub fn authorize_creator(
+        &self,
+        principal: &AuthorityPrincipal,
+    ) -> Result<(), PrincipalProofError> {
         self.reservation.scope.authorize(principal)?;
         if principal.principal_id != self.reservation.creator_principal_id {
             return Err(PrincipalProofError::TenantScope);
@@ -298,7 +308,11 @@ pub(crate) fn verify_identity_command_scope(
 ) -> Result<(), PrincipalProofError> {
     use crate::cluster_consensus::AuthorityCommand;
     match command {
-        AuthorityCommand::PrepareAgentIdentity { scope, creator_principal_id, .. } => {
+        AuthorityCommand::PrepareAgentIdentity {
+            scope,
+            creator_principal_id,
+            ..
+        } => {
             scope.authorize(principal)?;
             if creator_principal_id != &principal.principal_id {
                 return Err(PrincipalProofError::TenantScope);
@@ -306,12 +320,16 @@ pub(crate) fn verify_identity_command_scope(
         }
         AuthorityCommand::RecordAgentCreation { agent_id, .. }
         | AuthorityCommand::PublishAgentIdentity { agent_id, .. } => {
-            identities.get(agent_id).ok_or(PrincipalProofError::TenantScope)?
+            identities
+                .get(agent_id)
+                .ok_or(PrincipalProofError::TenantScope)?
                 .authorize_creator(principal)?;
         }
         AuthorityCommand::AbortAgentIdentity { agent_id, .. }
         | AuthorityCommand::DeleteAgentIdentity { agent_id, .. } => {
-            let record = identities.get(agent_id).ok_or(PrincipalProofError::TenantScope)?;
+            let record = identities
+                .get(agent_id)
+                .ok_or(PrincipalProofError::TenantScope)?;
             record.reservation.scope.authorize(principal)?;
             if principal.kind != AuthorityPrincipalKind::Operator {
                 record.authorize_creator(principal)?;
@@ -324,7 +342,9 @@ pub(crate) fn verify_identity_command_scope(
 
 fn canonical_hex(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Hash only the exact creation arguments, excluding renewable fence proofs.
@@ -334,21 +354,37 @@ pub fn creation_command_sha256(
 ) -> Result<String, AgentIdentityError> {
     use crate::syscall_server::Syscall;
     let value = match call {
-        Syscall::CreateAgent { agent_id: Some(agent_id), name, task, provider, profile, priority, .. }
-            if canonical_uuid(agent_id) => serde_json::json!({
-                "create": { "agent_id": agent_id, "name": name, "task": task,
-                "provider": provider, "profile": profile, "priority": priority }
-            }),
-        Syscall::CloneAgent { agent_id, child_agent_id, name, drop_capabilities, .. }
-            if canonical_uuid(agent_id) && canonical_uuid(child_agent_id) && agent_id != child_agent_id => {
-                let drops = crate::cloning::clone_attenuation(drop_capabilities)
-                    .map_err(|_| AgentIdentityError::InvalidIdentity)?;
-                serde_json::json!({ "clone": { "agent_id": agent_id,
+        Syscall::CreateAgent {
+            agent_id: Some(agent_id),
+            name,
+            task,
+            provider,
+            profile,
+            priority,
+            ..
+        } if canonical_uuid(agent_id) => serde_json::json!({
+            "create": { "agent_id": agent_id, "name": name, "task": task,
+            "provider": provider, "profile": profile, "priority": priority }
+        }),
+        Syscall::CloneAgent {
+            agent_id,
+            child_agent_id,
+            name,
+            drop_capabilities,
+            ..
+        } if canonical_uuid(agent_id)
+            && canonical_uuid(child_agent_id)
+            && agent_id != child_agent_id =>
+        {
+            let drops = crate::cloning::clone_attenuation(drop_capabilities)
+                .map_err(|_| AgentIdentityError::InvalidIdentity)?;
+            serde_json::json!({ "clone": { "agent_id": agent_id,
                     "child_agent_id": child_agent_id, "name": name,
                     "drop_capabilities": drops } })
-            }
+        }
         _ => return Err(AgentIdentityError::InvalidIdentity),
     };
-    serde_json::to_vec(&value).map(|bytes| sha256_hex(&bytes))
+    serde_json::to_vec(&value)
+        .map(|bytes| sha256_hex(&bytes))
         .map_err(|_| AgentIdentityError::InvalidIdentity)
 }

@@ -489,7 +489,11 @@ pub fn verify_authority_principal_view(
     let existing = ownership_agent(inner)
         .is_some_and(|agent| view.ownerships.iter().any(|row| row.agent_id == agent));
     if crate::cluster_agent_identity::identity_command_agent(inner).is_some() {
-        crate::cluster_agent_identity::verify_identity_command_scope(principal, inner, &view.agent_identities)?;
+        crate::cluster_agent_identity::verify_identity_command_scope(
+            principal,
+            inner,
+            &view.agent_identities,
+        )?;
     } else {
         verify_tenant_ownership_scope(principal, inner, &view.ownership_tenant_scopes, existing)?;
     }

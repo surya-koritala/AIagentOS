@@ -1,6 +1,16 @@
 name: Immutable quorum agent identity
 
 on:
+  push:
+    branches: [codex/quorum-agent-identity]
+    paths:
+      - '.github/workflows/quorum-agent-identity.yml'
+      - 'crates/kernel/src/cluster_*.rs'
+      - 'crates/kernel/src/context.rs'
+      - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/lib.rs'
+      - 'crates/sdk/**'
   workflow_dispatch:
     inputs:
       stage:
@@ -68,7 +78,7 @@ jobs:
   evidence:
     name: Immutable identity protocol and quorum evidence
     needs: format
-    if: github.event_name == 'pull_request' || inputs.stage != 'format'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.stage != 'format'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -92,7 +102,7 @@ jobs:
           set -o pipefail
           cargo check -p kernel -p agent-sdk --all-targets 2>&1 | tee target/qualification/agent-identity/compiler.txt
       - name: Immutable identity transitions and corruption refusal
-        if: github.event_name == 'pull_request' || inputs.stage == 'focused'
+        if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.stage == 'focused'
         shell: bash
         run: |
           set -o pipefail

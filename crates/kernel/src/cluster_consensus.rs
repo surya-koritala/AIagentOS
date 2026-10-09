@@ -28,6 +28,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cluster_agent_identity::{
+    AgentIdentityRecord, AgentIdentityReservation, AgentIdentityScope, AgentIdentityState,
+    DestinationCreationReceipt, IDENTITY_VERSION, MAX_AGENT_IDENTITIES,
+};
 use crate::cluster_control::{
     hex_decode, membership_join_payload, ownership_expiry, sha256_hex,
     validate_member_registration, validate_ownership_identity, validate_ownership_request,
@@ -39,10 +43,6 @@ use crate::cluster_control::{
     MIN_CERTIFICATE_ROLLOUT_SECONDS, MIN_JOIN_CHALLENGE_TTL_SECONDS,
 };
 use crate::context::SqliteContextManager;
-use crate::cluster_agent_identity::{
-    AgentIdentityRecord, AgentIdentityReservation, AgentIdentityScope, AgentIdentityState,
-    DestinationCreationReceipt, IDENTITY_VERSION, MAX_AGENT_IDENTITIES,
-};
 
 /// Stable numeric identifier used by the Raft protocol.
 pub type ClusterRaftNodeId = u64;
@@ -1206,25 +1206,39 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
                 .values()
                 .any(|principal| principal.tenant_id.as_deref() == Some(tenant.as_str()))
                 && !control.agent_identities.get(agent).is_some_and(|record| {
-                    record.reservation.scope == AgentIdentityScope::Tenant { tenant_id: tenant.clone() }
+                    record.reservation.scope
+                        == AgentIdentityScope::Tenant {
+                            tenant_id: tenant.clone(),
+                        }
                 }))
         {
             return Err(read_io("immutable ownership tenant scope is invalid"));
         }
     }
     if control.agent_identities.len() > MAX_AGENT_IDENTITIES {
-        return Err(read_io("immutable agent identity directory exceeds bounded capacity"));
+        return Err(read_io(
+            "immutable agent identity directory exceeds bounded capacity",
+        ));
     }
     let mut creation_operations = BTreeSet::new();
     let mut destination_receipts = BTreeSet::new();
     for (agent, identity) in &control.agent_identities {
-        identity.validate().map_err(|error| read_io(error.to_string()))?;
+        identity
+            .validate()
+            .map_err(|error| read_io(error.to_string()))?;
         let reservation = &identity.reservation;
-        let ownership = control.ownerships.get(agent)
+        let ownership = control
+            .ownerships
+            .get(agent)
             .ok_or_else(|| read_io("immutable agent identity has no retained ownership"))?;
-        let initial = control.ownership_audit.iter().find(|audit| {
-            audit.agent_id == *agent && audit.generation == reservation.initial_authority_generation
-        }).ok_or_else(|| read_io("immutable agent identity has no initial ownership evidence"))?;
+        let initial = control
+            .ownership_audit
+            .iter()
+            .find(|audit| {
+                audit.agent_id == *agent
+                    && audit.generation == reservation.initial_authority_generation
+            })
+            .ok_or_else(|| read_io("immutable agent identity has no initial ownership evidence"))?;
         if agent != &reservation.agent_id
             || reservation.cluster_id != control.cluster_id
             || identity.changed_at > control.logical_time
@@ -1234,22 +1248,36 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
             || initial.fencing_token != reservation.initial_fencing_token
             || initial.changed_at != reservation.prepared_at
             || initial.actor != format!("principal:{}", reservation.creator_principal_id)
-            || matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted)
-                && ownership.state != ClusterOwnershipState::Released
+            || matches!(
+                identity.state,
+                AgentIdentityState::Aborted | AgentIdentityState::Deleted
+            ) && ownership.state != ClusterOwnershipState::Released
             || match &reservation.scope {
                 AgentIdentityScope::System => control.ownership_tenant_scopes.contains_key(agent),
-                AgentIdentityScope::Tenant { tenant_id } =>
-                    control.ownership_tenant_scopes.get(agent) != Some(tenant_id),
+                AgentIdentityScope::Tenant { tenant_id } => {
+                    control.ownership_tenant_scopes.get(agent) != Some(tenant_id)
+                }
             }
         {
-            return Err(read_io("immutable agent identity conflicts with its retained history"));
+            return Err(read_io(
+                "immutable agent identity conflicts with its retained history",
+            ));
         }
         if let Some(receipt) = &identity.creation_receipt {
-            let member = control.members.get(&receipt.destination_node_id)
+            let member = control
+                .members
+                .get(&receipt.destination_node_id)
                 .ok_or_else(|| read_io("destination creation receipt has no retained member"))?;
-            receipt.verify_signature(&member.public_key).map_err(|error| read_io(error.to_string()))?;
-            if !destination_receipts.insert((receipt.destination_installation_id.clone(), receipt.local_receipt_id.clone())) {
-                return Err(read_io("destination creation receipt is reused by another identity"));
+            receipt
+                .verify_signature(&member.public_key)
+                .map_err(|error| read_io(error.to_string()))?;
+            if !destination_receipts.insert((
+                receipt.destination_installation_id.clone(),
+                receipt.local_receipt_id.clone(),
+            )) {
+                return Err(read_io(
+                    "destination creation receipt is reused by another identity",
+                ));
             }
         }
     }
@@ -2419,10 +2447,17 @@ fn apply_authority_command(
             let existing = crate::cluster_principal::ownership_agent(inner)
                 .is_some_and(|agent| control.ownerships.contains_key(agent));
             if crate::cluster_agent_identity::identity_command_agent(inner).is_some() {
-                crate::cluster_agent_identity::verify_identity_command_scope(principal, inner, &control.agent_identities)?;
+                crate::cluster_agent_identity::verify_identity_command_scope(
+                    principal,
+                    inner,
+                    &control.agent_identities,
+                )?;
             } else {
                 crate::cluster_principal::verify_tenant_ownership_scope(
-                    principal, inner, &control.ownership_tenant_scopes, existing,
+                    principal,
+                    inner,
+                    &control.ownership_tenant_scopes,
+                    existing,
                 )?;
             }
             crate::cluster_principal::verify_member_key_separation(inner, &control.principals)?;
@@ -2575,11 +2610,19 @@ fn commands_are_same_retry(previous: &AuthorityCommand, current: &AuthorityComma
 
 fn replay_response(response: &AuthorityResponse) -> AuthorityResponse {
     match response {
-        AuthorityResponse::AgentIdentityUpdated { operation_id, identity, sequence, log_id, .. } =>
-            AuthorityResponse::AgentIdentityUpdated {
-                operation_id: operation_id.clone(), identity: identity.clone(),
-                sequence: *sequence, log_id: *log_id, replayed: true,
-            },
+        AuthorityResponse::AgentIdentityUpdated {
+            operation_id,
+            identity,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::AgentIdentityUpdated {
+            operation_id: operation_id.clone(),
+            identity: identity.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
         AuthorityResponse::PrincipalUpdated {
             operation_id,
             principal,
@@ -3077,128 +3120,293 @@ fn apply_new_authority_command(
             })
         }
         AuthorityCommand::PrepareAgentIdentity {
-            agent_id, scope, creator_principal_id, creation_operation_id, creation_sha256,
-            owner_node_id, ttl_seconds, actor, reason, proposed_at, ..
+            agent_id,
+            scope,
+            creator_principal_id,
+            creation_operation_id,
+            creation_sha256,
+            owner_node_id,
+            ttl_seconds,
+            actor,
+            reason,
+            proposed_at,
+            ..
         } => {
             validate_reason(reason).map_err(invalid_command)?;
             let control = control_plane_mut(state)?;
             let mut next = control.clone();
             if next.agent_identities.len() >= MAX_AGENT_IDENTITIES {
-                return Err((AuthorityRejection::CapacityReached, "immutable agent identity directory is full".into()));
+                return Err((
+                    AuthorityRejection::CapacityReached,
+                    "immutable agent identity directory is full".into(),
+                ));
             }
             if operation_id != *creation_operation_id
                 || next.agent_identities.contains_key(agent_id)
                 || next.ownerships.contains_key(agent_id)
-                || next.agent_identities.values().any(|record| record.reservation.creation_operation_id == *creation_operation_id)
+                || next.agent_identities.values().any(|record| {
+                    record.reservation.creation_operation_id == *creation_operation_id
+                })
                 || actor != &format!("principal:{creator_principal_id}")
             {
-                return Err(conflict("immutable identity or creation operation is already reserved"));
+                return Err(conflict(
+                    "immutable identity or creation operation is already reserved",
+                ));
             }
-            let ownership = apply_claim_ownership(&mut next, agent_id, owner_node_id,
-                *ttl_seconds, None, actor, reason, *proposed_at, authority_term)?;
+            let ownership = apply_claim_ownership(
+                &mut next,
+                agent_id,
+                owner_node_id,
+                *ttl_seconds,
+                None,
+                actor,
+                reason,
+                *proposed_at,
+                authority_term,
+            )?;
             let reservation = AgentIdentityReservation {
-                version: IDENTITY_VERSION, cluster_id: next.cluster_id.clone(),
-                agent_id: agent_id.clone(), scope: scope.clone(),
+                version: IDENTITY_VERSION,
+                cluster_id: next.cluster_id.clone(),
+                agent_id: agent_id.clone(),
+                scope: scope.clone(),
                 creator_principal_id: creator_principal_id.clone(),
-                creation_operation_id: creation_operation_id.clone(), creation_sha256: creation_sha256.clone(),
-                initial_owner_node_id: owner_node_id.clone(), initial_authority_term: ownership.authority_term,
-                initial_authority_generation: ownership.generation, initial_fencing_token: ownership.fencing_token,
-                initial_lease_expires_at: ownership.lease_expires_at, prepared_at: ownership.updated_at,
+                creation_operation_id: creation_operation_id.clone(),
+                creation_sha256: creation_sha256.clone(),
+                initial_owner_node_id: owner_node_id.clone(),
+                initial_authority_term: ownership.authority_term,
+                initial_authority_generation: ownership.generation,
+                initial_fencing_token: ownership.fencing_token,
+                initial_lease_expires_at: ownership.lease_expires_at,
+                prepared_at: ownership.updated_at,
                 reservation_revision: 1,
             };
             reservation.validate().map_err(invalid_command)?;
             let identity = AgentIdentityRecord {
-                reservation, state: AgentIdentityState::Prepared, revision: 1,
-                creation_receipt: None, changed_at: ownership.updated_at,
-                last_operation_id: operation_id.clone(), changed_by_principal_id: creator_principal_id.clone(),
+                reservation,
+                state: AgentIdentityState::Prepared,
+                revision: 1,
+                creation_receipt: None,
+                changed_at: ownership.updated_at,
+                last_operation_id: operation_id.clone(),
+                changed_by_principal_id: creator_principal_id.clone(),
                 tombstone_reason: None,
             };
             if let AgentIdentityScope::Tenant { tenant_id } = scope {
-                next.ownership_tenant_scopes.insert(agent_id.clone(), tenant_id.clone());
+                next.ownership_tenant_scopes
+                    .insert(agent_id.clone(), tenant_id.clone());
             }
-            next.agent_identities.insert(agent_id.clone(), identity.clone());
+            next.agent_identities
+                .insert(agent_id.clone(), identity.clone());
             *control = next;
-            Ok(AuthorityResponse::AgentIdentityUpdated { operation_id, identity, sequence, log_id, replayed: false })
+            Ok(AuthorityResponse::AgentIdentityUpdated {
+                operation_id,
+                identity,
+                sequence,
+                log_id,
+                replayed: false,
+            })
         }
-        AuthorityCommand::RecordAgentCreation { agent_id, expected_revision, receipt, actor, reason, proposed_at, .. } => {
+        AuthorityCommand::RecordAgentCreation {
+            agent_id,
+            expected_revision,
+            receipt,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
             let control = control_plane_mut(state)?;
             let mut next = control.clone();
-            let mut identity = identity_for_transition(&next, agent_id, *expected_revision)?.clone();
+            let mut identity =
+                identity_for_transition(&next, agent_id, *expected_revision)?.clone();
             if identity.state != AgentIdentityState::Prepared {
                 return Err(conflict("creation receipt requires a prepared identity"));
             }
-            receipt.validate(&identity.reservation).map_err(invalid_command)?;
+            receipt
+                .validate(&identity.reservation)
+                .map_err(invalid_command)?;
             if receipt.schema_version != crate::schema::CURRENT_SCHEMA_VERSION
                 || receipt.min_reader_schema_version != crate::schema::MIN_READER_SCHEMA_VERSION
-                || next.agent_identities.values().filter_map(|row| row.creation_receipt.as_ref()).any(|other| {
-                    other.destination_installation_id == receipt.destination_installation_id
-                        && other.local_receipt_id == receipt.local_receipt_id
-                })
+                || next
+                    .agent_identities
+                    .values()
+                    .filter_map(|row| row.creation_receipt.as_ref())
+                    .any(|other| {
+                        other.destination_installation_id == receipt.destination_installation_id
+                            && other.local_receipt_id == receipt.local_receipt_id
+                    })
             {
-                return Err(conflict("creation receipt schema or local receipt identity conflicts"));
+                return Err(conflict(
+                    "creation receipt schema or local receipt identity conflicts",
+                ));
             }
             require_replicated_active_member(&next, &receipt.destination_node_id)?;
-            let member = next.members.get(&receipt.destination_node_id)
+            let member = next
+                .members
+                .get(&receipt.destination_node_id)
                 .ok_or_else(|| conflict("creation receipt destination is unknown"))?;
-            if receipt.protocol_version < member.min_protocol_version || receipt.protocol_version > member.protocol_version {
+            if receipt.protocol_version < member.min_protocol_version
+                || receipt.protocol_version > member.protocol_version
+            {
                 return Err(conflict("creation receipt protocol is incompatible"));
             }
-            receipt.verify_signature(&member.public_key).map_err(invalid_command)?;
+            receipt
+                .verify_signature(&member.public_key)
+                .map_err(invalid_command)?;
             let changed_at = advance_authority_time(&mut next, *proposed_at)?;
             require_identity_destination_ownership(&next, &identity, changed_at)?;
             if receipt.created_at > changed_at {
-                return Err(conflict("creation receipt attests a future destination result"));
+                return Err(conflict(
+                    "creation receipt attests a future destination result",
+                ));
             }
-            advance_identity(&mut identity, AgentIdentityState::Created, &operation_id, actor, reason, changed_at)?;
+            advance_identity(
+                &mut identity,
+                AgentIdentityState::Created,
+                &operation_id,
+                actor,
+                reason,
+                changed_at,
+            )?;
             identity.creation_receipt = Some(receipt.clone());
             identity.validate().map_err(invalid_command)?;
-            next.agent_identities.insert(agent_id.clone(), identity.clone());
+            next.agent_identities
+                .insert(agent_id.clone(), identity.clone());
             *control = next;
-            Ok(AuthorityResponse::AgentIdentityUpdated { operation_id, identity, sequence, log_id, replayed: false })
+            Ok(AuthorityResponse::AgentIdentityUpdated {
+                operation_id,
+                identity,
+                sequence,
+                log_id,
+                replayed: false,
+            })
         }
-        AuthorityCommand::PublishAgentIdentity { agent_id, expected_revision, receipt_sha256, actor, reason, proposed_at, .. } => {
+        AuthorityCommand::PublishAgentIdentity {
+            agent_id,
+            expected_revision,
+            receipt_sha256,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
             let control = control_plane_mut(state)?;
             let mut next = control.clone();
-            let mut identity = identity_for_transition(&next, agent_id, *expected_revision)?.clone();
+            let mut identity =
+                identity_for_transition(&next, agent_id, *expected_revision)?.clone();
             if identity.state != AgentIdentityState::Created
-                || identity.creation_receipt.as_ref().map(DestinationCreationReceipt::sha256).transpose().map_err(invalid_command)?.as_ref() != Some(receipt_sha256)
+                || identity
+                    .creation_receipt
+                    .as_ref()
+                    .map(DestinationCreationReceipt::sha256)
+                    .transpose()
+                    .map_err(invalid_command)?
+                    .as_ref()
+                    != Some(receipt_sha256)
             {
-                return Err(conflict("publication requires the exact committed creation receipt"));
+                return Err(conflict(
+                    "publication requires the exact committed creation receipt",
+                ));
             }
             let changed_at = advance_authority_time(&mut next, *proposed_at)?;
             require_identity_destination_ownership(&next, &identity, changed_at)?;
-            advance_identity(&mut identity, AgentIdentityState::Published, &operation_id, actor, reason, changed_at)?;
+            advance_identity(
+                &mut identity,
+                AgentIdentityState::Published,
+                &operation_id,
+                actor,
+                reason,
+                changed_at,
+            )?;
             identity.validate().map_err(invalid_command)?;
-            next.agent_identities.insert(agent_id.clone(), identity.clone());
+            next.agent_identities
+                .insert(agent_id.clone(), identity.clone());
             *control = next;
-            Ok(AuthorityResponse::AgentIdentityUpdated { operation_id, identity, sequence, log_id, replayed: false })
+            Ok(AuthorityResponse::AgentIdentityUpdated {
+                operation_id,
+                identity,
+                sequence,
+                log_id,
+                replayed: false,
+            })
         }
-        AuthorityCommand::AbortAgentIdentity { agent_id, expected_revision, actor, reason, proposed_at, .. }
-        | AuthorityCommand::DeleteAgentIdentity { agent_id, expected_revision, actor, reason, proposed_at, .. } => {
+        AuthorityCommand::AbortAgentIdentity {
+            agent_id,
+            expected_revision,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        }
+        | AuthorityCommand::DeleteAgentIdentity {
+            agent_id,
+            expected_revision,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
             let deleting = matches!(command, AuthorityCommand::DeleteAgentIdentity { .. });
             let control = control_plane_mut(state)?;
             let mut next = control.clone();
-            let mut identity = identity_for_transition(&next, agent_id, *expected_revision)?.clone();
-            if if deleting { identity.state != AgentIdentityState::Published } else {
-                !matches!(identity.state, AgentIdentityState::Prepared | AgentIdentityState::Created)
+            let mut identity =
+                identity_for_transition(&next, agent_id, *expected_revision)?.clone();
+            if if deleting {
+                identity.state != AgentIdentityState::Published
+            } else {
+                !matches!(
+                    identity.state,
+                    AgentIdentityState::Prepared | AgentIdentityState::Created
+                )
             } {
-                return Err(conflict("identity tombstone conflicts with the committed creation state"));
+                return Err(conflict(
+                    "identity tombstone conflicts with the committed creation state",
+                ));
             }
-            let ownership = next.ownerships.get(agent_id).cloned()
+            let ownership = next
+                .ownerships
+                .get(agent_id)
+                .cloned()
                 .ok_or_else(|| conflict("identity tombstone has no retained ownership"))?;
             let changed_at = if ownership.state == ClusterOwnershipState::Active {
-                apply_release_ownership(&mut next, agent_id, &ownership.owner_node_id,
-                    ownership.fencing_token, actor, reason, *proposed_at, authority_term)?.updated_at
+                apply_release_ownership(
+                    &mut next,
+                    agent_id,
+                    &ownership.owner_node_id,
+                    ownership.fencing_token,
+                    actor,
+                    reason,
+                    *proposed_at,
+                    authority_term,
+                )?
+                .updated_at
             } else {
                 advance_authority_time(&mut next, *proposed_at)?
             };
-            advance_identity(&mut identity, if deleting { AgentIdentityState::Deleted } else { AgentIdentityState::Aborted },
-                &operation_id, actor, reason, changed_at)?;
+            advance_identity(
+                &mut identity,
+                if deleting {
+                    AgentIdentityState::Deleted
+                } else {
+                    AgentIdentityState::Aborted
+                },
+                &operation_id,
+                actor,
+                reason,
+                changed_at,
+            )?;
             identity.tombstone_reason = Some(reason.clone());
             identity.validate().map_err(invalid_command)?;
-            next.agent_identities.insert(agent_id.clone(), identity.clone());
+            next.agent_identities
+                .insert(agent_id.clone(), identity.clone());
             *control = next;
-            Ok(AuthorityResponse::AgentIdentityUpdated { operation_id, identity, sequence, log_id, replayed: false })
+            Ok(AuthorityResponse::AgentIdentityUpdated {
+                operation_id,
+                identity,
+                sequence,
+                log_id,
+                replayed: false,
+            })
         }
         AuthorityCommand::ClaimOwnership {
             agent_id,
@@ -3313,7 +3521,9 @@ fn identity_for_transition<'a>(
     agent_id: &str,
     expected_revision: u64,
 ) -> Result<&'a AgentIdentityRecord, (AuthorityRejection, String)> {
-    let identity = control.agent_identities.get(agent_id)
+    let identity = control
+        .agent_identities
+        .get(agent_id)
         .ok_or_else(|| conflict("immutable agent identity is not reserved"))?;
     if identity.revision != expected_revision {
         return Err(conflict("immutable agent identity revision conflicts"));
@@ -3328,11 +3538,18 @@ fn require_identity_destination_ownership(
 ) -> Result<(), (AuthorityRejection, String)> {
     let reservation = &identity.reservation;
     require_replicated_active_member(control, &reservation.initial_owner_node_id)?;
-    if control.ownerships.get(&reservation.agent_id).is_none_or(|ownership| {
-        ownership.owner_node_id != reservation.initial_owner_node_id
-            || ownership.state != ClusterOwnershipState::Active || ownership.lease_expires_at <= now
-    }) {
-        return Err(conflict("identity creation destination has no current ownership lease"));
+    if control
+        .ownerships
+        .get(&reservation.agent_id)
+        .is_none_or(|ownership| {
+            ownership.owner_node_id != reservation.initial_owner_node_id
+                || ownership.state != ClusterOwnershipState::Active
+                || ownership.lease_expires_at <= now
+        })
+    {
+        return Err(conflict(
+            "identity creation destination has no current ownership lease",
+        ));
     }
     Ok(())
 }
@@ -3346,10 +3563,13 @@ fn advance_identity(
     changed_at: DateTime<Utc>,
 ) -> Result<(), (AuthorityRejection, String)> {
     validate_reason(reason).map_err(invalid_command)?;
-    let principal_id = actor.strip_prefix("principal:")
+    let principal_id = actor
+        .strip_prefix("principal:")
         .filter(|id| crate::cluster_agent_identity::canonical_uuid(id))
         .ok_or_else(|| conflict("identity transition has no independently verified principal"))?;
-    identity.revision = identity.revision.checked_add(1)
+    identity.revision = identity
+        .revision
+        .checked_add(1)
         .filter(|revision| *revision <= crate::cluster_agent_identity::MAX_IDENTITY_REVISION)
         .ok_or_else(|| conflict("identity revision is exhausted"))?;
     identity.state = state;
@@ -4312,12 +4532,20 @@ fn apply_claim_ownership(
 ) -> Result<ClusterAgentOwnership, (AuthorityRejection, String)> {
     validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)
         .map_err(invalid_command)?;
-    if control.agent_identities.get(agent_id).is_some_and(|identity| {
-        matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted)
-            || identity.state != AgentIdentityState::Published
+    if control
+        .agent_identities
+        .get(agent_id)
+        .is_some_and(|identity| {
+            matches!(
+                identity.state,
+                AgentIdentityState::Aborted | AgentIdentityState::Deleted
+            ) || identity.state != AgentIdentityState::Published
                 && identity.reservation.initial_owner_node_id != owner_node_id
-    }) {
-        return Err(conflict("immutable identity tombstone or incomplete placement refuses ownership transfer"));
+        })
+    {
+        return Err(conflict(
+            "immutable identity tombstone or incomplete placement refuses ownership transfer",
+        ));
     }
     require_replicated_active_member(control, owner_node_id)?;
     if control.ownerships.len() >= 1_000_000 && !control.ownerships.contains_key(agent_id) {

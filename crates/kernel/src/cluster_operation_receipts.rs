@@ -217,7 +217,9 @@ pub(crate) fn complete(
                 | WireErrorCode::Provider
         )
     ) {
-        return Err(failure(WireErrorCode::Conflict, "cluster operation outcome is unresolved; pending receipt retained; reconcile node state before using any new operation id"));
+        // Preserve the original diagnostic; retaining Pending still prevents
+        // every subsequent attempt from re-executing an ambiguous mutation.
+        return Err(reply.clone());
     }
     let json = serde_json::to_string(reply).map_err(|_| storage_failure())?;
     if json.len() > MAX_REPLY_BYTES {
@@ -569,5 +571,18 @@ mod tests {
         assert!(!encoded.contains("receipt fixture"));
         assert!(!encoded.contains("draining"));
         assert_eq!(kernel.cluster_control.status().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn unresolved_error_keeps_original_diagnostic_but_never_reexecutes_on_retry() {
+        let store = SqliteContextManager::in_memory().unwrap();
+        let original = call(uuid::Uuid::new_v4());
+        let receipt = prepared(&store, &original, None);
+        let diagnostic = SyscallReply::Error { message: "TLS certificate binding cannot be removed during rejoin".into() };
+        let returned = complete(&store, receipt, &diagnostic).unwrap_err();
+        assert_eq!(serde_json::to_value(returned).unwrap(), serde_json::to_value(diagnostic).unwrap());
+        code(prepare(&store, "receipt-node", &original, None).err().unwrap(), WireErrorCode::Conflict);
+        let pending: bool = store.conn.lock().unwrap().query_row("SELECT phase = 'pending' AND reply_json IS NULL FROM cluster_operation_receipts", [], |row| row.get(0)).unwrap();
+        assert!(pending);
     }
 }

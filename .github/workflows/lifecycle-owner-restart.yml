@@ -1,0 +1,86 @@
+name: Interrupted lifecycle workspace ownership
+
+on:
+  push:
+    branches: [codex/lifecycle-owner-restart-proof]
+    paths:
+      - 'tests/src/lifecycle_coordinator.rs'
+      - '.github/workflows/lifecycle-owner-restart.yml'
+  pull_request:
+    paths:
+      - 'tests/src/lifecycle_coordinator.rs'
+      - '.github/workflows/lifecycle-owner-restart.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lifecycle-owner-restart-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formatting:
+    name: Lifecycle ownership fixture formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Retain exact hosted formatting patch
+        run: |
+          git rev-parse HEAD > lifecycle-format-source.txt
+          cargo fmt --all
+          git diff --binary > lifecycle-format.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: lifecycle-owner-format-${{ github.run_id }}
+          path: |
+            lifecycle-format-source.txt
+            lifecycle-format.patch
+          retention-days: 30
+      - name: Require committed formatting
+        run: git diff --exit-code
+
+  lifecycle:
+    name: Actual lifecycle ownership and peer preservation (${{ matrix.os }})
+    needs: formatting
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_INCREMENTAL: 0
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Source and actual lifecycle controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > lifecycle-source.txt
+          cargo test -p integration-tests --lib --locked lifecycle_coordinator -- --nocapture 2>&1 | tee lifecycle-controls.log
+          cargo clippy -p integration-tests --all-targets --locked -- -D warnings 2>&1 | tee lifecycle-clippy.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: lifecycle-owner-${{ runner.os }}-${{ github.run_id }}
+          path: |
+            lifecycle-source.txt
+            lifecycle-controls.log
+            lifecycle-clippy.log
+          retention-days: 30
+          if-no-files-found: error

@@ -3159,8 +3159,8 @@ async fn dispatch_scoped_inner_with_fence(
     ) {
         Ok(crate::cluster_operation_receipts::Admission::Legacy) => None,
         Ok(crate::cluster_operation_receipts::Admission::Prepared(receipt)) => Some(receipt),
-        Ok(crate::cluster_operation_receipts::Admission::Replay(reply)) => return reply,
-        Err(reply) => return reply,
+        Ok(crate::cluster_operation_receipts::Admission::Replay(reply)) => return *reply,
+        Err(reply) => return *reply,
     };
     let reply = async { match call {
         Syscall::CreateTenant { name } => {
@@ -6020,7 +6020,7 @@ async fn dispatch_scoped_inner_with_fence(
         if let Err(error) =
             crate::cluster_operation_receipts::complete(&kernel.context_manager, receipt, &reply)
         {
-            return error;
+            return *error;
         }
     }
     reply

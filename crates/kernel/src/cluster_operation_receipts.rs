@@ -27,7 +27,7 @@ pub(crate) struct Prepared {
 pub(crate) enum Admission {
     Legacy,
     Prepared(Prepared),
-    Replay(SyscallReply),
+    Replay(Box<SyscallReply>),
 }
 
 #[derive(Clone, Copy)]
@@ -86,15 +86,15 @@ fn valid_reply(kind: ReplyKind, reply: &SyscallReply) -> bool {
     )
 }
 
-fn failure(code: WireErrorCode, message: &str) -> SyscallReply {
-    SyscallReply::TypedError {
+fn failure(code: WireErrorCode, message: &str) -> Box<SyscallReply> {
+    Box::new(SyscallReply::TypedError {
         code,
         message: message.into(),
         retryable: false,
-    }
+    })
 }
 
-fn storage_failure() -> SyscallReply {
+fn storage_failure() -> Box<SyscallReply> {
     failure(WireErrorCode::Internal, "cluster operation receipt storage failed; reconcile the mutation outcome before using a new operation id")
 }
 
@@ -103,7 +103,7 @@ pub(crate) fn prepare(
     node_id: &str,
     call: &Syscall,
     principal: Option<&Principal>,
-) -> Result<Admission, SyscallReply> {
+) -> Result<Admission, Box<SyscallReply>> {
     let Some((Some(raw_id), reply_kind)) = mutation(call) else {
         return Ok(Admission::Legacy);
     };
@@ -169,7 +169,7 @@ pub(crate) fn prepare(
         if !valid_reply(reply_kind, &reply) {
             return Err(storage_failure());
         }
-        return Ok(Admission::Replay(reply));
+        return Ok(Admission::Replay(Box::new(reply)));
     }
     let (count, reserved): (i64, i64) = transaction.query_row(
         "SELECT COUNT(*), COALESCE(SUM(COALESCE(length(CAST(reply_json AS BLOB)), ?1)), 0) FROM cluster_operation_receipts",
@@ -198,7 +198,7 @@ pub(crate) fn complete(
     store: &SqliteContextManager,
     prepared: Prepared,
     reply: &SyscallReply,
-) -> Result<(), SyscallReply> {
+) -> Result<(), Box<SyscallReply>> {
     if !valid_reply(prepared.reply_kind, reply) {
         return Err(storage_failure());
     }
@@ -219,7 +219,7 @@ pub(crate) fn complete(
     ) {
         // Preserve the original diagnostic; retaining Pending still prevents
         // every subsequent attempt from re-executing an ambiguous mutation.
-        return Err(reply.clone());
+        return Err(Box::new(reply.clone()));
     }
     let json = serde_json::to_string(reply).map_err(|_| storage_failure())?;
     if json.len() > MAX_REPLY_BYTES {
@@ -263,9 +263,9 @@ mod tests {
         }
     }
 
-    fn code(error: SyscallReply, expected: WireErrorCode) {
+    fn code(error: impl AsRef<SyscallReply>, expected: WireErrorCode) {
         assert!(
-            matches!(error, SyscallReply::TypedError { code, retryable: false, .. } if code == expected)
+            matches!(error.as_ref(), SyscallReply::TypedError { code, retryable: false, .. } if *code == expected)
         );
     }
 

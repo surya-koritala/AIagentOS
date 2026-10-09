@@ -70,13 +70,15 @@ fn main() {
         }
     } else if let Some(root) = packaged_root {
         let proof_path = root.join(source_proof::PROOF_FILE);
-        if std::fs::symlink_metadata(&proof_path).is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink()) {
+        if std::fs::symlink_metadata(&proof_path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
             println!("cargo:rerun-if-changed={}", proof_path.display());
         }
         match source_proof::verify_packaged_source(root) {
             Ok(value) => {
-                commit=value.commit;
-                verified=true;
+                commit = value.commit;
+                verified = true;
                 for path in value.files.into_iter().chain(value.directories) {
                     println!("cargo:rerun-if-changed={}", root.join(path).display());
                 }

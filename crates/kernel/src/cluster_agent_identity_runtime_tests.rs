@@ -72,7 +72,9 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
         .collect::<Vec<_>>();
     let directory = TempDir::new().unwrap();
     let contexts = (1..=3)
-        .map(|node| context(&directory, node))
+        .map(|node| if node == 1 {
+            Arc::new(SqliteContextManager::new(&directory.path().join("node-1.db")).unwrap())
+        } else { context(&directory, node) })
         .collect::<Vec<_>>();
     {
         let connection = contexts[0].locked_conn();

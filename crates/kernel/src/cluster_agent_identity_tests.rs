@@ -368,3 +368,64 @@ fn immutable_identity_abort_never_becomes_a_new_creation_or_published_agent() {
         ));
     }
 }
+
+#[test]
+fn immutable_identity_expired_ownership_recovers_the_same_exact_receipt_without_reallocation() {
+    let mut fixture = IdentityFixture::new();
+    let agent = Uuid::new_v4().to_string();
+    fixture.apply(fixture.prepare(&agent, &Uuid::new_v4().to_string()));
+    let identity = fixture.record(&agent);
+    let receipt = fixture.receipt(&identity);
+    let after_expiry = identity.reservation.initial_lease_expires_at + TimeDelta::seconds(1);
+    fixture.index += 1;
+    apply_authority_command(&mut fixture.state, AuthorityCommand::AdvanceTime {
+        operation_id: Uuid::new_v4().to_string(), proposed_at: after_expiry,
+    }, LogId::new(openraft::CommittedLeaderId::new(2, 1), fixture.index));
+    assert!(matches!(fixture.apply(AuthorityCommand::RecordAgentCreation {
+        operation_id: Uuid::new_v4().to_string(), agent_id: agent.clone(), expected_revision: 1,
+        receipt: receipt.clone(), actor: "fixture".into(), reason: "expired ownership must reject publication".into(), proposed_at: after_expiry,
+    }), AuthorityResponse::Rejected { .. }));
+    let renewed = fixture.apply(AuthorityCommand::ClaimOwnership {
+        operation_id: Uuid::new_v4().to_string(), agent_id: agent.clone(), owner_node_id: fixture.node.clone(),
+        ttl_seconds: 60, expected_fencing_token: Some(1), actor: "fixture".into(),
+        reason: "recover exact creation after expired ownership".into(), proposed_at: after_expiry,
+    });
+    assert!(matches!(renewed, AuthorityResponse::OwnershipUpdated { ownership: ClusterAgentOwnership { fencing_token: 2, .. }, .. }));
+    let created = fixture.apply(AuthorityCommand::RecordAgentCreation {
+        operation_id: Uuid::new_v4().to_string(), agent_id: agent.clone(), expected_revision: 1,
+        receipt: receipt.clone(), actor: "fixture".into(), reason: "recover retained pre-expiry receipt".into(), proposed_at: after_expiry + TimeDelta::seconds(1),
+    });
+    assert!(matches!(created, AuthorityResponse::AgentIdentityUpdated { .. }));
+    let published = fixture.apply(AuthorityCommand::PublishAgentIdentity {
+        operation_id: Uuid::new_v4().to_string(), agent_id: agent.clone(), expected_revision: 2,
+        receipt_sha256: receipt.sha256().unwrap(), actor: "fixture".into(), reason: "publish recovered exact identity".into(), proposed_at: after_expiry + TimeDelta::seconds(2),
+    });
+    assert!(matches!(published, AuthorityResponse::AgentIdentityUpdated { .. }));
+    assert_eq!(fixture.record(&agent).reservation, identity.reservation);
+    assert_eq!(fixture.record(&agent).creation_receipt.as_ref(), Some(&receipt));
+}
+
+#[test]
+fn immutable_identity_current_principal_checks_precede_all_receipt_replay() {
+    let mut fixture = IdentityFixture::new();
+    let agent = Uuid::new_v4().to_string();
+    let command = fixture.prepare(&agent, &Uuid::new_v4().to_string());
+    fixture.index += 1;
+    let unsigned = apply_authority_command(&mut fixture.state, command.clone(),
+        LogId::new(openraft::CommittedLeaderId::new(1, 1), fixture.index));
+    assert!(matches!(unsigned, AuthorityResponse::Rejected { reason: AuthorityRejection::PrincipalAuthentication(crate::cluster_principal::PrincipalProofError::Missing), .. }));
+    let mut wrong_creator = command.clone();
+    if let AuthorityCommand::PrepareAgentIdentity { creator_principal_id, .. } = &mut wrong_creator {
+        *creator_principal_id = Uuid::new_v4().to_string();
+    }
+    assert!(matches!(fixture.apply(wrong_creator), AuthorityResponse::Rejected { reason: AuthorityRejection::PrincipalAuthentication(crate::cluster_principal::PrincipalProofError::TenantScope), .. }));
+    fixture.apply(command.clone());
+    assert!(matches!(fixture.apply(command.clone()), AuthorityResponse::AgentIdentityUpdated { replayed: true, .. }));
+    assert!(matches!(fixture.apply(AuthorityCommand::RevokePrincipal {
+        operation_id: Uuid::new_v4().to_string(), principal_id: crate::cluster_principal::fixture_operator().principal_id,
+        expected_generation: 1, actor: "fixture".into(), reason: "current caller key revocation".into(), proposed_at: Utc::now(),
+    }), AuthorityResponse::PrincipalUpdated { .. }));
+    let current = fixture.state.clone();
+    assert!(matches!(fixture.apply(command), AuthorityResponse::Rejected { reason: AuthorityRejection::PrincipalAuthentication(crate::cluster_principal::PrincipalProofError::Revoked), .. }));
+    assert_eq!(fixture.state, current);
+}

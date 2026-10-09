@@ -434,7 +434,7 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         let weak = kernels.iter().map(Arc::downgrade).collect::<Vec<_>>();
         let contexts = kernels
             .iter()
-            .map(|kernel| Arc::downgrade(&kernel.context_manager))
+            .map(|kernel| Arc::clone(&kernel.context_manager))
             .collect::<Vec<_>>();
         for task in serving {
             task.abort();
@@ -443,7 +443,7 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         drop(kernels);
         tokio::time::timeout(Duration::from_secs(5), async {
             while weak.iter().any(|kernel| kernel.strong_count() != 0)
-                || contexts.iter().any(|context| context.strong_count() != 0)
+                || contexts.iter().any(|context| Arc::strong_count(context) != 1)
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -451,16 +451,22 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "public quorum retained kernel owners {:?} or Context owners {:?}",
+                "public quorum retained kernel owners {:?} or additional Context owners {:?}",
                 weak.iter()
                     .map(std::sync::Weak::strong_count)
                     .collect::<Vec<_>>(),
-                contexts
-                    .iter()
-                    .map(std::sync::Weak::strong_count)
-                    .collect::<Vec<_>>()
+                contexts.iter().map(Arc::strong_count).collect::<Vec<_>>()
             )
         });
+        for context in contexts {
+            let context = Arc::try_unwrap(context).unwrap_or_else(|context| {
+                panic!(
+                    "public quorum reacquired a Context owner: {}",
+                    Arc::strong_count(&context)
+                )
+            });
+            drop(context);
+        }
         root.close().unwrap();
     })
     .await

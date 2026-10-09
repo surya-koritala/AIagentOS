@@ -5592,21 +5592,31 @@ mod tests {
             for runtime in runtimes.into_iter().flatten() {
                 runtime.shutdown().await.unwrap();
             }
-            drop(contexts);
             tokio::time::timeout(Duration::from_secs(5), async {
-                while weak.iter().any(|context| context.strong_count() != 0) {
+                while weak.iter().any(|context| context.strong_count() != 1) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "shutdown retained actual Context owners: {:?}",
+                    "shutdown retained additional Context owners: {:?}",
                     weak.iter()
                         .map(std::sync::Weak::strong_count)
                         .collect::<Vec<_>>()
                 )
             });
+            // Retain the final owner so SQLite closes synchronously here.
+            // A zero weak count can precede another task's destructor completion.
+            for context in contexts {
+                let context = Arc::try_unwrap(context).unwrap_or_else(|context| {
+                    panic!(
+                        "shutdown reacquired a Context owner: {}",
+                        Arc::strong_count(&context)
+                    )
+                });
+                drop(context);
+            }
             root.close().unwrap();
         })
         .await

@@ -180,7 +180,7 @@ def metric_key(name: str, labels: Any) -> MetricKey:
     elif name == "agentos_quota_denied_total":
         valid = set(labels) == {"scope", "dimension"} and (labels["scope"], labels["dimension"]) in {
             ("provider", "requests"), ("provider", "tokens"),
-            ("cgroup", "requests"), ("cgroup", "tokens"), ("migration", "fence"),
+            ("cgroup", "requests"), ("cgroup", "tokens"), ("provider", "migration_fence"),
         }
     elif name == "agentos_telemetry_contract_info":
         valid = labels == {"version": "2"}

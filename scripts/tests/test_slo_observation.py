@@ -32,7 +32,7 @@ def snapshot(elapsed=0, *, reboot=False, unhealthy="0"):
     ])
     for sample in samples:
         if sample["name"] == "agentos_process_uptime_seconds":
-            sample["value"] = runtime
+            sample["value"] = int(runtime)
         elif sample["name"] == "agentos_quota_storage_healthy_seconds_total":
             sample["value"] = str(runtime - Decimal(unhealthy))
         elif sample["name"] == "agentos_quota_storage_unhealthy_seconds_total":
@@ -49,6 +49,7 @@ def snapshot(elapsed=0, *, reboot=False, unhealthy="0"):
         for boundary in producer.BUCKETS:
             samples.append({"name": "agentos_request_class_duration_seconds_bucket", "labels": {**labels, "le": str(boundary)}, "value": count if boundary >= Decimal("0.250") else 0})
     samples.append({"name": "agentos_requests_total", "labels": {"subsystem": "system", "outcome": "success"}, "value": int(runtime)})
+    samples.append({"name": "agentos_quota_denied_total", "labels": {"scope": "provider", "dimension": "migration_fence"}, "value": 0})
     return samples
 
 
@@ -166,6 +167,19 @@ class SloObservationTests(unittest.TestCase):
             metadata, targets = evaluator._validate_observation(generated, "a" * 40, "target-rootless-1", "v1.0.0-rc.1")
             self.assertEqual(len(targets), 9)
             self.assertEqual(metadata["window"]["duration_seconds"], 2_592_000)
+            from test_release_slo_qualification import valid_game_day, valid_incident, valid_soak
+            soak, incident, game = valid_soak(), valid_incident(), valid_game_day()
+            soak["environment"]["environment_id"] = environment["environment_id"]
+            game["environment"]["environment_id"] = environment["environment_id"]
+            game["environment"]["configuration_sha256"] = environment["configuration_sha256"]
+            paths = [Path(directory) / name for name in ("observation.json", "soak.json", "incident.json", "game.json")]
+            generated["alert_firings"] = producer.alert_history(history(binding(environment), [notification("firing")]), binding(environment), START, END)
+            for path, report in zip(paths, (generated, soak, incident, game)):
+                path.write_text(json.dumps(report))
+            evaluated = evaluator.evaluate(*paths, expected_commit="a" * 40, expected_environment=environment["environment_id"], release_candidate="v1.0.0-rc.1")
+            self.assertTrue(evaluated["report_generated"])
+            self.assertIn("unresolved_alerts", evaluated["eligibility_blockers"])
+            self.assertEqual(len(evaluated["targets"]), 9)
             config.write_bytes(b"changed configuration")
             with self.assertRaisesRegex(producer.ObservationError, "digest differs"):
                 producer.build_observation(deployment, config, dataset, [], history(binding(environment)), START, END)

@@ -714,9 +714,18 @@ const REQUEST_VARIANTS: &[Variant] = &[
         tag: "get_authority_principal_registry",
         fields: &[],
     },
-    Variant { tag: "propose_cluster_voter_change", fields: &[Field::required("command", O)] },
-    Variant { tag: "propose_cluster_trust_change", fields: &[Field::required("command", O)] },
-    Variant { tag: "get_cluster_reconfiguration_status", fields: &[] },
+    Variant {
+        tag: "propose_cluster_voter_change",
+        fields: &[Field::required("command", O)],
+    },
+    Variant {
+        tag: "propose_cluster_trust_change",
+        fields: &[Field::required("command", O)],
+    },
+    Variant {
+        tag: "get_cluster_reconfiguration_status",
+        fields: &[],
+    },
     Variant {
         tag: "register_cluster_member",
         fields: &[

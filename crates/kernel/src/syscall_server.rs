@@ -1850,10 +1850,21 @@ fn role_allows(role: Role, required: AccessLevel) -> bool {
 
 fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
     match call {
-        Syscall::ProposeClusterVoterChange { .. } => (AccessLevel::System, "cluster.voters.change", None),
-        Syscall::ProposeClusterTrustChange { .. } => (AccessLevel::System, "cluster.trust.change", None),
-        Syscall::GetClusterReconfigurationStatus => (AccessLevel::System, "cluster.reconfiguration.status", None),
-        Syscall::SubmitSignedAuthorityCommand { command } if crate::cluster_principal::authority_command_class(command) == Ok(crate::cluster_principal::AuthorityCommandClass::TransportAdmin) => (AccessLevel::System, "cluster.transport.change", None),
+        Syscall::ProposeClusterVoterChange { .. } => {
+            (AccessLevel::System, "cluster.voters.change", None)
+        }
+        Syscall::ProposeClusterTrustChange { .. } => {
+            (AccessLevel::System, "cluster.trust.change", None)
+        }
+        Syscall::GetClusterReconfigurationStatus => {
+            (AccessLevel::System, "cluster.reconfiguration.status", None)
+        }
+        Syscall::SubmitSignedAuthorityCommand { command }
+            if crate::cluster_principal::authority_command_class(command)
+                == Ok(crate::cluster_principal::AuthorityCommandClass::TransportAdmin) =>
+        {
+            (AccessLevel::System, "cluster.transport.change", None)
+        }
         Syscall::SubmitSignedAuthorityCommand { .. } => {
             (AccessLevel::User, "cluster.principal.submit", None)
         }
@@ -2364,13 +2375,19 @@ async fn authorize(
     // This precedes trusted-system shortcuts and local operation-receipt
     // lookup. A cached response never substitutes for current key authority.
     if let Syscall::SubmitSignedAuthorityCommand { command }
-        | Syscall::ProposeClusterVoterChange { command }
-        | Syscall::ProposeClusterTrustChange { command } = call {
-        let inner = crate::cluster_principal::unsigned_authority_command(command).map_err(principal_proof_error)?;
-        if (matches!(call, Syscall::ProposeClusterVoterChange { .. }) && !matches!(inner, AuthorityCommand::ProposeClusterVoterChange { .. }))
-            || (matches!(call, Syscall::ProposeClusterTrustChange { .. }) && !matches!(inner, AuthorityCommand::ProposeClusterTrustChange { .. }))
+    | Syscall::ProposeClusterVoterChange { command }
+    | Syscall::ProposeClusterTrustChange { command } = call
+    {
+        let inner = crate::cluster_principal::unsigned_authority_command(command)
+            .map_err(principal_proof_error)?;
+        if (matches!(call, Syscall::ProposeClusterVoterChange { .. })
+            && !matches!(inner, AuthorityCommand::ProposeClusterVoterChange { .. }))
+            || (matches!(call, Syscall::ProposeClusterTrustChange { .. })
+                && !matches!(inner, AuthorityCommand::ProposeClusterTrustChange { .. }))
         {
-            return Err(principal_proof_error(crate::cluster_principal::PrincipalProofError::WrongCommandClass));
+            return Err(principal_proof_error(
+                crate::cluster_principal::PrincipalProofError::WrongCommandClass,
+            ));
         }
         let authority = configured_cluster_authority(kernel)
             .map_err(authority_io_error)?
@@ -7466,9 +7483,9 @@ impl SyscallServer {
                                 | Syscall::ProposeClusterVoterChange { .. }
                                 | Syscall::ProposeClusterTrustChange { .. }
                                 | Syscall::GetClusterReconfigurationStatus
-            | Syscall::ProposeClusterVoterChange { .. }
-            | Syscall::ProposeClusterTrustChange { .. }
-            | Syscall::GetClusterReconfigurationStatus
+                                | Syscall::ProposeClusterVoterChange { .. }
+                                | Syscall::ProposeClusterTrustChange { .. }
+                                | Syscall::GetClusterReconfigurationStatus
                                 | Syscall::ListProviderModels { .. }
                                 | Syscall::SendMessageContent { .. }
                                 | Syscall::SendMessageContentStream { .. }

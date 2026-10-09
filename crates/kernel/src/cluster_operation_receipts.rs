@@ -239,15 +239,37 @@ pub(crate) fn complete(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn independently_signed_authority_uses_verified_replicated_identity_not_system_node_local_replay() {
+    fn independently_signed_authority_uses_verified_replicated_identity_not_system_node_local_replay(
+    ) {
         let store = crate::context::SqliteContextManager::in_memory().unwrap();
-        let signed = crate::cluster_principal::fixture_signed(crate::cluster_consensus::AuthorityCommand::IssueJoinChallenge {
-            operation_id: uuid::Uuid::new_v4().to_string(), challenge_hex: "00".repeat(32), ttl_seconds: 5, proposed_at: chrono::Utc::now(),
-        }, crate::cluster_principal::FIXTURE_CLUSTER_ID);
-        let call = crate::syscall_server::Syscall::SubmitSignedAuthorityCommand { command: Box::new(signed) };
-        assert!(matches!(super::prepare(&store, "fixture-node", &call, None).unwrap(), super::Admission::Legacy));
-        let count: i64 = store.locked_conn().query_row("SELECT COUNT(*) FROM cluster_operation_receipts", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, 0, "signed principal identity must not collapse into a shared system-node journal actor");
+        let signed = crate::cluster_principal::fixture_signed(
+            crate::cluster_consensus::AuthorityCommand::IssueJoinChallenge {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                challenge_hex: "00".repeat(32),
+                ttl_seconds: 5,
+                proposed_at: chrono::Utc::now(),
+            },
+            crate::cluster_principal::FIXTURE_CLUSTER_ID,
+        );
+        let call = crate::syscall_server::Syscall::SubmitSignedAuthorityCommand {
+            command: Box::new(signed),
+        };
+        assert!(matches!(
+            super::prepare(&store, "fixture-node", &call, None).unwrap(),
+            super::Admission::Legacy
+        ));
+        let count: i64 = store
+            .locked_conn()
+            .query_row(
+                "SELECT COUNT(*) FROM cluster_operation_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "signed principal identity must not collapse into a shared system-node journal actor"
+        );
     }
     use super::*;
     use crate::auth::Role;

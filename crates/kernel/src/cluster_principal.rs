@@ -183,7 +183,10 @@ pub fn authority_command_class(
         AuthorityCommand::ClaimOwnership { .. }
         | AuthorityCommand::RenewOwnership { .. }
         | AuthorityCommand::ReleaseOwnership { .. } => Ok(AuthorityCommandClass::Ownership),
-        AuthorityCommand::ProposeClusterVoterChange { .. } | AuthorityCommand::ProposeClusterTrustChange { .. } => Ok(AuthorityCommandClass::TransportAdmin),
+        AuthorityCommand::ProposeClusterVoterChange { .. }
+        | AuthorityCommand::ProposeClusterTrustChange { .. } => {
+            Ok(AuthorityCommandClass::TransportAdmin)
+        }
         AuthorityCommand::EnrollPrincipal { .. } | AuthorityCommand::RevokePrincipal { .. } => {
             Ok(AuthorityCommandClass::PrincipalAdmin)
         }

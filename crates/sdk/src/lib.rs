@@ -45,7 +45,6 @@ use tokio::net::ToSocketAddrs;
 pub use kernel::auth::{ApiKeyDescriptor, IssuedApiKey, Role, Tenant, User};
 pub use kernel::cloning::CloneResult;
 pub use kernel::cluster_consensus::{AuthorityCommand, AuthorityResponse};
-pub use kernel::cluster_reconfiguration::{ClusterReconfigurationPlan, ClusterReconfigurationStatus, ClusterReconfigurationTarget};
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
     ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,
@@ -56,6 +55,9 @@ pub use kernel::cluster_control::{
 pub use kernel::cluster_principal::{
     sign_authority_principal, AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind,
     AuthorityPrincipalProof, PrincipalProofError,
+};
+pub use kernel::cluster_reconfiguration::{
+    ClusterReconfigurationPlan, ClusterReconfigurationStatus, ClusterReconfigurationTarget,
 };
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
@@ -2495,7 +2497,8 @@ impl KernelClient {
         operation_id: &str,
         command: AuthorityCommand,
     ) -> Result<ClusterReconfigurationPlan, SdkError> {
-        self.submit_live_cluster_proposal(operation_id, command, true).await
+        self.submit_live_cluster_proposal(operation_id, command, true)
+            .await
     }
 
     pub async fn propose_cluster_voter_change(
@@ -2503,7 +2506,8 @@ impl KernelClient {
         command: AuthorityCommand,
     ) -> Result<ClusterReconfigurationPlan, SdkError> {
         let operation_id = command.operation_id().to_owned();
-        self.propose_cluster_voter_change_with_operation_id(&operation_id, command).await
+        self.propose_cluster_voter_change_with_operation_id(&operation_id, command)
+            .await
     }
 
     /// The complete target must use the runtime's already provisioned CA set.
@@ -2512,7 +2516,8 @@ impl KernelClient {
         operation_id: &str,
         command: AuthorityCommand,
     ) -> Result<ClusterReconfigurationPlan, SdkError> {
-        self.submit_live_cluster_proposal(operation_id, command, false).await
+        self.submit_live_cluster_proposal(operation_id, command, false)
+            .await
     }
 
     pub async fn propose_cluster_trust_change(
@@ -2520,7 +2525,8 @@ impl KernelClient {
         command: AuthorityCommand,
     ) -> Result<ClusterReconfigurationPlan, SdkError> {
         let operation_id = command.operation_id().to_owned();
-        self.propose_cluster_trust_change_with_operation_id(&operation_id, command).await
+        self.propose_cluster_trust_change_with_operation_id(&operation_id, command)
+            .await
     }
 
     async fn submit_live_cluster_proposal(
@@ -2529,30 +2535,59 @@ impl KernelClient {
         command: AuthorityCommand,
         voters: bool,
     ) -> Result<ClusterReconfigurationPlan, SdkError> {
-        let valid_id = uuid::Uuid::parse_str(operation_id).is_ok_and(|id| id.to_string() == operation_id);
-        let inner = kernel::cluster_principal::unsigned_authority_command(&command).map_err(|error| SdkError::Configuration(error.to_string()))?;
-        if !valid_id || command.operation_id() != operation_id
+        let valid_id =
+            uuid::Uuid::parse_str(operation_id).is_ok_and(|id| id.to_string() == operation_id);
+        let inner = kernel::cluster_principal::unsigned_authority_command(&command)
+            .map_err(|error| SdkError::Configuration(error.to_string()))?;
+        if !valid_id
+            || command.operation_id() != operation_id
             || !matches!(command, AuthorityCommand::Authorized { .. })
             || (voters && !matches!(inner, AuthorityCommand::ProposeClusterVoterChange { .. }))
             || (!voters && !matches!(inner, AuthorityCommand::ProposeClusterTrustChange { .. }))
         {
-            return Err(SdkError::Configuration("live proposal requires a matching caller-stable UUID and signed transport command".into()));
+            return Err(SdkError::Configuration(
+                "live proposal requires a matching caller-stable UUID and signed transport command"
+                    .into(),
+            ));
         }
         let protocol = self.hello().await?;
-        if !protocol.features.iter().any(|feature| feature == "live_cluster_reconfiguration")
-            || !protocol.features.iter().any(|feature| feature == "cluster_principal_auth")
+        if !protocol
+            .features
+            .iter()
+            .any(|feature| feature == "live_cluster_reconfiguration")
+            || !protocol
+                .features
+                .iter()
+                .any(|feature| feature == "cluster_principal_auth")
         {
-            return Err(SdkError::Configuration("server does not support independently authorized live cluster reconfiguration".into()));
+            return Err(SdkError::Configuration(
+                "server does not support independently authorized live cluster reconfiguration"
+                    .into(),
+            ));
         }
-        let call = if voters { Syscall::ProposeClusterVoterChange { command: Box::new(command) } }
-            else { Syscall::ProposeClusterTrustChange { command: Box::new(command) } };
+        let call = if voters {
+            Syscall::ProposeClusterVoterChange {
+                command: Box::new(command),
+            }
+        } else {
+            Syscall::ProposeClusterTrustChange {
+                command: Box::new(command),
+            }
+        };
         match self.call(call).await? {
-            SyscallReply::AuthorityCommandCommitted { response: AuthorityResponse::ReconfigurationPrepared { plan, .. } } => Ok(*plan),
-            other => Err(unexpected("AuthorityCommandCommitted(ReconfigurationPrepared)", &other)),
+            SyscallReply::AuthorityCommandCommitted {
+                response: AuthorityResponse::ReconfigurationPrepared { plan, .. },
+            } => Ok(*plan),
+            other => Err(unexpected(
+                "AuthorityCommandCommitted(ReconfigurationPrepared)",
+                &other,
+            )),
         }
     }
 
-    pub async fn cluster_reconfiguration_status(&mut self) -> Result<ClusterReconfigurationStatus, SdkError> {
+    pub async fn cluster_reconfiguration_status(
+        &mut self,
+    ) -> Result<ClusterReconfigurationStatus, SdkError> {
         match self.call(Syscall::GetClusterReconfigurationStatus).await? {
             SyscallReply::ClusterReconfigurationStatus { status } => Ok(status),
             other => Err(unexpected("ClusterReconfigurationStatus", &other)),

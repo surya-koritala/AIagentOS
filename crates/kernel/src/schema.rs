@@ -16,7 +16,8 @@ pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 16;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 // Older readers flatten native stream boundaries and cannot retain ordered
 // multipart user content, durable cluster-operation receipts, or independent
-// principal genesis/proofs and their committed clock evidence. Refuse them
+// principal genesis/proofs, signed live transport plans, or their committed
+// clock evidence. Refuse them
 // before mutation or snapshot replay can discard required authorization.
 pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 16;
 

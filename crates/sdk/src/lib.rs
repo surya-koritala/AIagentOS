@@ -2589,7 +2589,9 @@ impl KernelClient {
         &mut self,
     ) -> Result<ClusterReconfigurationStatus, SdkError> {
         match self.call(Syscall::GetClusterReconfigurationStatus).await? {
-            SyscallReply::ClusterReconfigurationStatus { reconfiguration: status } => Ok(status),
+            SyscallReply::ClusterReconfigurationStatus {
+                reconfiguration: status,
+            } => Ok(status),
             other => Err(unexpected("ClusterReconfigurationStatus", &other)),
         }
     }

@@ -89,6 +89,55 @@ They are listed in help and fail with a nonzero exit until their kernels exist.
 Issue #307 retains that complete dependency scope and must not close merely
 because the currently backed commands can land first.
 
+## Live voter and transport proposals
+
+Protocol v2 exposes `ProposeClusterVoterChange`, `ProposeClusterTrustChange`, and
+`GetClusterReconfigurationStatus`. A mutation carries an `Authorized` command
+with a caller-stable UUID, independently enrolled operator TransportAdmin proof,
+exact prior membership, expected current generation, explicit next generation,
+and a bounded reason. The dedicated SDK methods verify the UUID and required
+server features before I/O. Tenant credentials cannot use these system resources,
+including through the generic signed-command route. Current principal and node
+authority are checked before durable receipt replay; node keys or the API token
+cannot manufacture operator authority.
+
+A successful mutation reply is a **prepared target**, not proof of convergence.
+Poll `cluster_reconfiguration_status()` until `settled` is true and the current
+catalog/voters equal the proposed target. The elected running leader consumes
+the same durable intent, learner catch-up, and joint-consensus path used at
+startup. Followers use the locally applied authorized catalog for inbound and
+outbound peer checks; cached OpenRaft clients refresh it before each connection.
+A removed voter remains a replicated learner. Trust replacement preserves every
+current voter and its identity. Concurrent voter/trust proposals fail closed while
+an earlier target remains unresolved. Replaying a completed UUID returns its
+historical prepared record and does not restore that target.
+
+The first live trust contract requires a prior versioned trust catalog and the
+**unchanged exact CA set already provisioned from PEM on every participating
+runtime**. It can replace the complete catalog and bounded leaf overlap while
+retaining running local TLS credentials. Fingerprints cannot install absent CA
+certificates; root addition/removal and private leaf-key reload are unsupported
+by this live API. Opaque prebuilt rustls configurations lack root-material
+evidence and cannot satisfy this admission check. Provisioning and root rotation
+remain explicit operator operations through the existing startup configuration.
+
+Operator config is never rewritten. Before restart, the operator must update
+its generations, voter IDs, and complete peer catalog to the exact durable live
+target; old or conflicting configuration fails closed, including a crash after
+proposal commit but before the membership intent is applied. Schema 16 refuses
+older readers before writes or snapshot installation can discard signed plans.
+At most 64 immutable plans are retained, bounded independently of the existing
+receipt capacity; exhaustion denies a new proposal before mutation. No automatic
+plan eviction or implicit resolution of a pending target exists.
+
+Controlled CI fixtures exercise actual mutual-TLS four-node catch-up, live
+membership/catalog updates, cached-client removal, current authorization before
+replay, and configured restart. These fixtures do not establish production
+availability, deployment topology, hardware portability, power-loss durability,
+or independent review. The full live-administration issue #306 remains open;
+`agentctl` wiring, broader qualification, and its #307/#310/#314 dependencies
+must remain tracked separately.
+
 ## Current maturity and authority model
 
 The default, single-node configuration retains the original designated

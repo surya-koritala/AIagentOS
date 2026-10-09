@@ -2769,13 +2769,21 @@ impl ClusterRaftRuntime {
         if let Some(task) = self.reconfiguration_task.take() {
             match task.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => { failure = Some(error); }
-                Err(error) => { failure = Some(io::Error::other(format!("live reconfiguration task failed: {error}"))); }
+                Ok(Err(error)) => {
+                    failure = Some(error);
+                }
+                Err(error) => {
+                    failure = Some(io::Error::other(format!(
+                        "live reconfiguration task failed: {error}"
+                    )));
+                }
             }
         }
         if let Some(task) = self.listener_task.take() {
             match task.await {
-                Ok(Err(error)) => { failure.get_or_insert(error); }
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
                 Ok(Ok(())) => {}
                 Err(error) if error.is_cancelled() => {}
                 Err(error) => {
@@ -2785,13 +2793,13 @@ impl ClusterRaftRuntime {
                 }
             }
         }
-        if let Err(error) = self.raft
-            .shutdown()
-            .await
-        {
+        if let Err(error) = self.raft.shutdown().await {
             failure.get_or_insert(io::Error::other(format!("Raft shutdown failed: {error}")));
         }
-        match failure { Some(error) => Err(error), None => Ok(()) }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3712,11 +3720,31 @@ fn validate_new_live_proposal(
     live: Option<&LiveTransportCatalog>,
     command: &AuthorityCommand,
 ) -> io::Result<()> {
-    let inner = crate::cluster_principal::unsigned_authority_command(command).map_err(invalid_input)?;
-    if let AuthorityCommand::ProposeClusterTrustChange { prior, target_catalog, expected_generation, target_generation, overlap_not_after, .. } = inner {
-        if crate::cluster_consensus::has_committed_reconfiguration(context, command.operation_id())? { return Ok(()); }
-        let target = crate::cluster_reconfiguration::prepare_trust_target(prior, target_catalog, *expected_generation, *target_generation, *overlap_not_after, chrono::Utc::now())?;
-        live.ok_or_else(|| invalid_input("live trust runtime is unavailable"))?.check_target(&target)?;
+    let inner =
+        crate::cluster_principal::unsigned_authority_command(command).map_err(invalid_input)?;
+    if let AuthorityCommand::ProposeClusterTrustChange {
+        prior,
+        target_catalog,
+        expected_generation,
+        target_generation,
+        overlap_not_after,
+        ..
+    } = inner
+    {
+        if crate::cluster_consensus::has_committed_reconfiguration(context, command.operation_id())?
+        {
+            return Ok(());
+        }
+        let target = crate::cluster_reconfiguration::prepare_trust_target(
+            prior,
+            target_catalog,
+            *expected_generation,
+            *target_generation,
+            *overlap_not_after,
+            chrono::Utc::now(),
+        )?;
+        live.ok_or_else(|| invalid_input("live trust runtime is unavailable"))?
+            .check_target(&target)?;
     }
     Ok(())
 }

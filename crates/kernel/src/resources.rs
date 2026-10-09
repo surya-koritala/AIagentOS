@@ -489,10 +489,16 @@ impl ProviderTaskGuard {
         parameters: serde_json::Value,
         permit: OwnedSemaphorePermit,
         cancellation: CancellationToken,
+        peripheral: bool,
     ) -> Self {
         let provider_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
             let _permit = permit;
+            if peripheral && provider_cancellation.is_cancelled() {
+                return Err(ResourceError::OperationFailed(
+                    "peripheral use revoked".into(),
+                ));
+            }
             provider
                 .execute_controlled(&operation, &parameters, &provider_cancellation)
                 .await
@@ -1079,6 +1085,7 @@ impl ResourceBrokerImpl {
                     .take()
                     .expect("generic provider execution owns its admission permit"),
                 provider_cancellation,
+                request.resource_type == ResourceType::Peripheral,
             );
             match tokio::time::timeout(PROVIDER_EXECUTION_TIMEOUT, task.join()).await {
                 Ok(result) => {
@@ -1199,6 +1206,40 @@ impl Drop for ResourceWaitGuard<'_> {
 #[cfg(test)]
 pub(crate) struct RevocablePeripheralProvider {
     pub(crate) started: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+pub(crate) struct PeripheralCallbackCounter(pub(crate) Arc<AtomicUsize>);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ResourceProvider for PeripheralCallbackCounter {
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Peripheral
+    }
+    fn supported_operations(&self) -> Vec<String> {
+        vec!["capture_image".into()]
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
+        panic!("controlled callback required");
+    }
+    async fn execute_controlled(
+        &self,
+        _: &str,
+        _: &serde_json::Value,
+        _: &CancellationToken,
+    ) -> Result<serde_json::Value, ResourceError> {
+        // Count entry before cancellation inspection: the broker must refuse
+        // an already-revoked admission before this test callback is entered.
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(ResourceError::OperationFailed(
+            "peripheral use revoked".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

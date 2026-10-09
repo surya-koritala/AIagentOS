@@ -123,6 +123,23 @@ pub(crate) struct GateAdmissionContract<'a> {
     pub(crate) approval_contract: &'a str,
     pub(crate) request_identity: &'a str,
     pub(crate) track_peripheral_activity: bool,
+    pub(crate) expected_registration: Option<u64>,
+}
+
+pub(crate) struct LocalPeripheralContract<'a> {
+    pub agent_id: uuid::Uuid,
+    pub registration: u64,
+    pub tool_name: &'a str,
+    pub resource: &'a str,
+    pub contract: &'a str,
+    pub required: crate::tools::ApprovalPolicy,
+    pub activity: &'a str,
+}
+
+pub(crate) enum LocalPeripheralAction {
+    Inspect,
+    Approve,
+    Revoke,
 }
 
 struct AuthorizedToolCall {
@@ -1209,6 +1226,69 @@ impl SyscallGate {
         self.cancel_peripheral_for_agent_locked(kid)
     }
 
+    pub(crate) fn peripheral_registration(&self, kid: uuid::Uuid) -> Option<u64> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        self.records
+            .get(&kid)
+            .filter(|record| record.accepting_tool_calls)
+            .map(|record| record.registration_revision)
+    }
+
+    /// Native UI records refer to an immutable registry contract and one agent
+    /// registration. A stale record can never grant or revoke a replacement
+    /// agent's calls. All three operations share the admission mutation fence.
+    pub(crate) fn local_peripheral_contract(
+        &self,
+        contract: LocalPeripheralContract<'_>,
+        action: LocalPeripheralAction,
+    ) -> Option<(bool, usize)> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let record = self.records.get(&contract.agent_id)?;
+        if record.registration_revision != contract.registration {
+            return None;
+        }
+        let key = (
+            contract.agent_id,
+            contract.registration,
+            contract.tool_name.to_string(),
+            crate::resources::opaque_identity(contract.resource.as_bytes()),
+            contract.contract.to_string(),
+        );
+        let tokens = self
+            .peripheral_activity
+            .iter()
+            .filter_map(|entry| {
+                let (agent, identity, _) = entry.key();
+                (*agent == contract.agent_id && identity == contract.activity)
+                    .then(|| entry.value().clone())
+            })
+            .collect::<Vec<_>>();
+        match action {
+            LocalPeripheralAction::Inspect => Some((
+                self.approvals
+                    .get(&key)
+                    .is_some_and(|approval| (*approval).satisfies(contract.required)),
+                tokens.len(),
+            )),
+            LocalPeripheralAction::Approve => {
+                if !record.accepting_tool_calls
+                    || contract.required == crate::tools::ApprovalPolicy::None
+                {
+                    return None;
+                }
+                self.approvals.insert(key, contract.required);
+                Some((true, tokens.len()))
+            }
+            LocalPeripheralAction::Revoke => {
+                let revoked = self.approvals.remove(&key).is_some();
+                for token in &tokens {
+                    token.cancel();
+                }
+                Some((revoked, tokens.len()))
+            }
+        }
+    }
+
     fn cancel_peripheral_for_agent_locked(&self, kid: uuid::Uuid) -> usize {
         let tokens = self
             .peripheral_activity
@@ -1421,6 +1501,7 @@ impl SyscallGate {
                     approval_contract: &approval_contract,
                     request_identity: "legacy-test-request",
                     track_peripheral_activity: false,
+                    expected_registration: None,
                 },
             )
             .await?;
@@ -1448,6 +1529,7 @@ impl SyscallGate {
             approval_contract,
             request_identity,
             track_peripheral_activity,
+            expected_registration,
         } = admission;
         let authorized = self
             .check_tool_call_contract(
@@ -1463,6 +1545,16 @@ impl SyscallGate {
                 false,
             )
             .await?;
+        if let Some(expected) = expected_registration {
+            let observed = authorized
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.agent.registration_revision)
+                .or_else(|| self.peripheral_registration(kid));
+            if observed != Some(expected) {
+                return Err(GateDenial::AuthorizationStateChanged);
+            }
+        }
         let guard = if self.unconfined {
             self.cgroups
                 .acquire_tool_call_checked(self.cgroups.root())

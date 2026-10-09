@@ -266,7 +266,13 @@ impl LiveFixture {
         for runtime in self.runtimes.into_iter().flatten() {
             runtime.shutdown().await.unwrap();
         }
+        let stores = self.contexts.iter().map(Arc::downgrade).collect::<Vec<_>>();
         drop(self.contexts);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stores.iter().any(|store| store.upgrade().is_some()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("shutdown releases every durable Raft context owner before native deletion");
         self.root
             .close()
             .expect("release all real native database handles");

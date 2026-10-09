@@ -420,7 +420,7 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
                 .await
                 .unwrap();
         }
-        for client in &mut clients {
+        for client in clients.drain(..) {
             client.close().await.unwrap();
         }
         drop(clients);

@@ -1,6 +1,7 @@
 use agent_sdk::{
     AuthorityCommandClass, AuthorityPrincipal, AuthorityPrincipalKind, AuthoritySigner,
 };
+use kernel::agent::AgentKernel;
 use kernel::cluster_runtime::{ClusterRaftRuntime, ClusterRaftRuntimeConfig};
 use kernel::config::{ClusterRaftConfig, ClusterRaftMemberConfig};
 use kernel::syscall_server::SyscallServer;

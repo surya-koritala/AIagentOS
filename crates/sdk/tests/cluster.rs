@@ -235,11 +235,9 @@ struct ManagedCluster {
 }
 
 impl ManagedCluster {
-    async fn close(mut self) {
+    async fn close(self) {
         self.authority.close().await.unwrap();
         self.member.close().await.unwrap();
-        drop(self.authority);
-        drop(self.member);
         drop(self.member_kernel);
         self.quorum.close().await;
     }
@@ -1175,8 +1173,6 @@ async fn discovered_cluster_publishes_renews_rebuilds_and_enforces_fenced_routes
     drop(rebuilt);
     authority.close().await.unwrap();
     member.close().await.unwrap();
-    drop(authority);
-    drop(member);
     drop(member_kernel);
     quorum.close().await;
 }

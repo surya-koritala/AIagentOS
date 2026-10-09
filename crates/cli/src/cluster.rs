@@ -4,13 +4,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agent_sdk::{
-    AgentMutationFenceProof, ClusterAdmissionOperationIds, ClusterClient, ClusterMemberState,
+    AgentMutationFenceProof, AuthorityCommand, AuthorityResponse, ClusterAdmissionOperationIds, ClusterClient, ClusterMemberState,
     ConnectionProfile, ConnectionTransport, NodeAvailability, NodeProfile, SdkError,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::OperatorClient;
+
+#[path = "cluster_principal.rs"]
+mod principal;
+use principal::{PrincipalOptions, PrincipalSigner};
 
 pub const USAGE: &str = "Usage: agentctl [SERVER OPTIONS] cluster COMMAND [OPTIONS]
   node-availability <active|draining|quarantined> <reason> --generation N
@@ -34,6 +38,9 @@ Without an explicit challenge id, it is deterministically derived from the mutat
 Two-endpoint operations accept --node-token TOKEN, --node-ca PATH and --node-server-name NAME.
 The authority uses the common AGENTOS_TLS_CA/AGENTOS_TLS_SERVER_NAME profile.
 The node inherits that secure profile unless its own verified TLS profile is supplied.
+Replicated membership writes require --principal-id UUID --principal-generation N
+--principal-cluster-id UUID and --principal-key PATH to a bounded owner-only Ed25519 PKCS#8 DER file.
+The principal key signs on this client; API credentials and node keys cannot replace it.
 Certificate activation connects to the candidate leaf and re-admits the exact member generation.
 Draining rejects new work; it does not report completed migration or safe-to-stop status.
 
@@ -46,6 +53,7 @@ Pending operation receipts require reconciliation; they never trigger automatic 
 pub struct Command {
     action: Action,
     operation_id: Option<Uuid>,
+    principal: Option<PrincipalOptions>,
 }
 
 enum Action {
@@ -220,6 +228,7 @@ pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Command, String
         return Ok(Command {
             action: Action::Unavailable(message),
             operation_id: None,
+            principal: None,
         });
     }
     let mut arguments = Arguments::default();
@@ -260,6 +269,10 @@ pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Command, String
     } else {
         None
     };
+    let principal = PrincipalOptions::parse(&mut arguments.options)?;
+    if principal.is_some() && !matches!(name.as_str(), "join" | "cert-activate" | "cert-prepare" | "cert-abort" | "cert-finalize" | "member-state") {
+        return Err("principal signing options require a replicated membership mutation".into());
+    }
     let action = match name.as_str() {
         "members" => {
             arguments.positional(0)?;
@@ -394,6 +407,7 @@ pub fn parse(values: impl IntoIterator<Item = String>) -> Result<Command, String
     Ok(Command {
         action,
         operation_id,
+        principal,
     })
 }
 
@@ -452,6 +466,9 @@ pub async fn run(
     if let Action::Join(join) | Action::CertificatePrepare { join, .. } = &command.action {
         profile.address = join.authority.clone();
     }
+    // Read and validate the explicitly supplied caller key before any I/O to
+    // a server. No key is inferred from API credentials or node identity.
+    let mut signer = command.principal.map(PrincipalSigner::load).transpose()?;
     let mut client = OperatorClient::connect_profile(&profile, token).await?;
     if command.operation_id.is_some()
         && !client
@@ -500,7 +517,10 @@ pub async fn run(
         )?,
         Action::Join(join) => {
             let mut node = node_client(&join, &profile, token).await?;
-            let result = ClusterClient::admit_node_with_operation_ids(
+            let result = if let Some(signer) = signer.as_mut() {
+                signer.admit(&mut client, &mut node, &join).await
+            } else {
+                ClusterClient::admit_node_with_operation_ids(
                 &mut client,
                 &mut node,
                 &join.node,
@@ -508,7 +528,8 @@ pub async fn run(
                 &join.reason,
                 join.ids,
             )
-            .await;
+                .await
+            };
             let closed = node.close().await;
             let member = result?;
             closed?;
@@ -521,7 +542,10 @@ pub async fn run(
             overlap,
         } => {
             let mut node = node_client(&join, &profile, token).await?;
-            let result = ClusterClient::prepare_node_certificate_rollout_with_operation_ids(
+            let result = if let Some(signer) = signer.as_mut() {
+                signer.prepare(&mut client, &mut node, &join, fingerprint, (ttl, overlap)).await
+            } else {
+                ClusterClient::prepare_node_certificate_rollout_with_operation_ids(
                 &mut client,
                 &mut node,
                 &join.node,
@@ -532,7 +556,8 @@ pub async fn run(
                 &join.reason,
                 join.ids,
             )
-            .await;
+                .await
+            };
             let closed = node.close().await;
             let (member, rollout) = result?;
             closed?;
@@ -543,8 +568,15 @@ pub async fn run(
             state,
             generation,
             reason,
-        } => json_value(
-            &client
+        } => {
+            let member = if let Some(signer) = signer.as_mut() {
+                let actor = signer.actor(&mut client).await?;
+                signer.member(&mut client, AuthorityCommand::SetMemberState {
+                    operation_id: id.clone().expect("write id"), node_id, state,
+                    expected_generation: generation, actor, reason, proposed_at: chrono::Utc::now(),
+                }).await?
+            } else {
+                client
                 .set_cluster_member_state_with_operation_id(
                     id.as_deref().expect("write id"),
                     node_id,
@@ -552,15 +584,29 @@ pub async fn run(
                     generation,
                     reason,
                 )
-                .await?,
-        )?,
+                .await?
+            };
+            json_value(&member)?
+        },
         Action::CertificateFinish {
             node_id,
             abort,
             generation,
             reason,
         } => {
-            let member = if abort {
+            let member = if let Some(signer) = signer.as_mut() {
+                let actor = signer.actor(&mut client).await?;
+                let operation_id = id.clone().expect("write id");
+                let command = if abort {
+                    AuthorityCommand::AbortMemberCertificateRollout {operation_id, node_id, expected_generation: generation, actor, reason, proposed_at: chrono::Utc::now()}
+                } else {
+                    AuthorityCommand::FinalizeMemberCertificateRollout {operation_id, node_id, expected_generation: generation, actor, reason, proposed_at: chrono::Utc::now()}
+                };
+                match signer.submit(&mut client, command).await? {
+                    AuthorityResponse::CertificateRolloutUpdated {member, ..} => member,
+                    _ => return Err(SdkError::Kernel("unexpected signed certificate response".into())),
+                }
+            } else if abort {
                 client
                     .abort_cluster_member_certificate_rollout_with_operation_id(
                         id.as_deref().expect("write id"),

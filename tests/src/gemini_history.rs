@@ -120,11 +120,13 @@ async fn streamed_native_signed_boundaries_survive_governed_tools_and_restart() 
         && entries[1] == json!({"role": "model", "parts": [second.clone()]})));
     let connection = rusqlite::Connection::open(&db).unwrap();
     let versions: (i64, i64) = connection.query_row("SELECT schema_version, min_reader_schema_version FROM storage_meta WHERE singleton = 1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    let installed_version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
     assert_eq!(
         versions,
-        (13, 13),
+        (installed_version, installed_version),
         "readers that flatten short signed chunks must be excluded"
     );
+    assert!(versions.1 >= 13);
     drop(connection);
     server.reset().await;
     Mock::given(method("POST"))

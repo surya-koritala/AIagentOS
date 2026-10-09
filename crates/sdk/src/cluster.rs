@@ -1029,13 +1029,13 @@ impl ClusterClient {
         for listed in ownerships {
             let local_index = local_agents.get(&listed.agent_id).copied();
             let identity = identities.get(&listed.agent_id).ok_or_else(|| route_conflict(
-                "ownership without an immutable quorum identity requires explicit reconciliation".into()
+                "ownership without an immutable quorum identity requires explicit reconciliation"
             ))?;
             match identity.state {
                 AgentIdentityState::Prepared | AgentIdentityState::Created => {
                     if local_index.is_some() {
                         return Err(route_conflict(
-                            "unpublished immutable identity was exposed by a destination".into(),
+                            "unpublished immutable identity was exposed by a destination",
                         ));
                     }
                     report.pending_reservations += 1;
@@ -1044,7 +1044,7 @@ impl ClusterClient {
                 AgentIdentityState::Aborted | AgentIdentityState::Deleted => {
                     if local_index.is_some() {
                         return Err(route_conflict(
-                            "terminal immutable identity was exposed by a destination".into(),
+                            "terminal immutable identity was exposed by a destination",
                         ));
                     }
                     continue;
@@ -1062,7 +1062,7 @@ impl ClusterClient {
             }
 
             let Some(index) = local_index else {
-                return Err(route_conflict("published immutable identity has no exact destination row; reconciliation must retain this gap".into()));
+                return Err(route_conflict("published immutable identity has no exact destination row; reconciliation must retain this gap"));
             };
 
             if self.nodes[index].id != listed.owner_node_id {
@@ -1077,8 +1077,7 @@ impl ClusterClient {
                 .await?
                 .ok_or_else(|| {
                     route_conflict(
-                        "published immutable identity has no exact destination creation receipt"
-                            .into(),
+                        "published immutable identity has no exact destination creation receipt",
                     )
                 })?;
             receipt
@@ -1086,7 +1085,7 @@ impl ClusterClient {
                 .map_err(|error| route_conflict(error.to_string()))?;
             if identity.creation_receipt.as_ref() != Some(&receipt) {
                 return Err(route_conflict(
-                    "destination receipt differs from the immutable majority publication".into(),
+                    "destination receipt differs from the immutable majority publication",
                 ));
             }
             let authority = self
@@ -1184,7 +1183,7 @@ impl ClusterClient {
                     || records.insert(id.clone(), identity).is_some()
                     || records.len() > kernel::cluster_agent_identity::MAX_AGENT_IDENTITIES
                 {
-                    return Err(route_conflict("immutable identity directory contains conflicting or out-of-order evidence".into()));
+                    return Err(route_conflict("immutable identity directory contains conflicting or out-of-order evidence"));
                 }
                 cursor = Some(id);
             }

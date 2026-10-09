@@ -5483,7 +5483,7 @@ mod tests {
                 RPCOption::new(Duration::from_secs(5)),
             )
             .await
-            .expect("receive distinct leader principal rejection");
+            .unwrap_or_else(|_| panic!("receive distinct leader principal rejection"));
         assert!(matches!(
             rejection,
             RpcResponse::AuthorityPrincipalRejected(

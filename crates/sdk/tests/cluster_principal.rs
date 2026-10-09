@@ -40,7 +40,12 @@ async fn sdk_uses_own_key_proof_and_never_falls_back_to_node_or_token_authority(
     let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
     let independent = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
     assert_ne!(
-        kernel::cluster_control::hex_encode(independent.public_key().as_ref()),
+        independent
+            .public_key()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
         node.identity.public_key
     );
     let signed = sign_authority_principal(

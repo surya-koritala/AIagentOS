@@ -3,7 +3,6 @@ use crate::cluster_principal::{
     PrincipalProofError, FIXTURE_CLUSTER_ID,
 };
 use openraft::storage::RaftStateMachine;
-use ring::signature::KeyPair as _;
 
 fn principal_entry(
     index: u64,

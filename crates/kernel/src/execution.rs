@@ -9,7 +9,7 @@ use crate::connector::{LlmSession, StandardMessage};
 use crate::context::{ContextManager, Fact, FactCategory, SqliteContextManager};
 use crate::resources::ResourceBroker;
 use crate::tools::ToolRegistry;
-use crate::{AgentId, KernelError};
+use crate::{AgentId, ConnectorError, KernelError};
 
 /// Maximum tool call rounds before forcing termination.
 const MAX_ITERATIONS: usize = 10;

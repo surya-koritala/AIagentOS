@@ -1626,7 +1626,7 @@ pub enum SyscallReply {
         response: crate::cluster_consensus::AuthorityResponse,
     },
     ClusterReconfigurationStatus {
-        status: crate::cluster_reconfiguration::ClusterReconfigurationStatus,
+        reconfiguration: crate::cluster_reconfiguration::ClusterReconfigurationStatus,
     },
     AuthorityPrincipalRegistry {
         principals: Vec<crate::cluster_principal::AuthorityPrincipal>,
@@ -4929,7 +4929,7 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(error) => return authority_io_error(error),
             };
             match authority.reconfiguration_status().await {
-                Ok(status) => SyscallReply::ClusterReconfigurationStatus { status },
+                Ok(status) => SyscallReply::ClusterReconfigurationStatus { reconfiguration: status },
                 Err(error) => authority_io_error(error),
             }
         }
@@ -7768,6 +7768,28 @@ impl SyscallClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_transport_proposals_remain_system_only_through_every_public_route() {
+        let prior = crate::cluster_reconfiguration::ClusterReconfigurationTarget {
+            catalog: Default::default(), voter_ids: Default::default(), voter_generation: 0,
+            voter_set_sha256: String::new(), trust_generation: 0, catalog_sha256: String::new(), overlap_not_after: None,
+        };
+        let command = crate::cluster_principal::fixture_signed(AuthorityCommand::ProposeClusterVoterChange {
+            operation_id: uuid::Uuid::new_v4().to_string(), prior, target_voter_ids: Default::default(),
+            expected_generation: 0, target_generation: 1, actor: "system-node:fixture".into(), reason: "policy fixture".into(), proposed_at: chrono::Utc::now(),
+        }, crate::cluster_principal::FIXTURE_CLUSTER_ID);
+        for (call, action) in [
+            (Syscall::ProposeClusterVoterChange { command: Box::new(command.clone()) }, "cluster.voters.change"),
+            (Syscall::SubmitSignedAuthorityCommand { command: Box::new(command) }, "cluster.transport.change"),
+            (Syscall::GetClusterReconfigurationStatus, "cluster.reconfiguration.status"),
+        ] {
+            let (level, resource, _) = syscall_policy(&call);
+            assert_eq!(level, AccessLevel::System);
+            assert_eq!(resource, action);
+            for role in [Role::ReadOnly, Role::User, Role::Admin] { assert!(!role_allows(role, level)); }
+        }
+    }
 
     struct SlowHealthProvider {
         id: crate::ProviderId,

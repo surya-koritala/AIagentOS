@@ -1459,6 +1459,7 @@ const REPLY_VARIANTS: &[Variant] = &[
         tag: "authority_command_committed",
         fields: &[Field::required("response", O)],
     },
+    Variant { tag: "cluster_reconfiguration_status", fields: &[Field::required("reconfiguration", O)] },
     Variant {
         tag: "authority_principal_registry",
         fields: &[Field::required("principals", A)],

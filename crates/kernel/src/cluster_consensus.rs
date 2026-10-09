@@ -645,6 +645,12 @@ pub(crate) fn read_cluster_reconfiguration(
     Ok((state.membership, plan))
 }
 
+pub(crate) fn has_committed_reconfiguration(context: &SqliteContextManager, operation_id: &str) -> io::Result<bool> {
+    let connection = context.conn.lock().map_err(|error| io::Error::other(format!("lock retained reconfiguration operation: {error}")))?;
+    let state = load_persistent_state(&connection).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(state.authority.control_plane.is_some_and(|control| control.reconfiguration_plans.iter().any(|plan| plan.operation_id == operation_id)))
+}
+
 /// Read the locally applied replicated control-plane projection.
 ///
 /// Callers serving external reads must first complete
@@ -1095,7 +1101,8 @@ fn successful_response_metadata(
             log_id,
             replayed,
             ..
-        } => Some((operation_id, *sequence, *log_id, *replayed)),
+        }
+        | AuthorityResponse::ReconfigurationPrepared { operation_id, sequence, log_id, replayed, .. } => Some((operation_id, *sequence, *log_id, *replayed)),
         AuthorityResponse::MetadataApplied { .. }
         | AuthorityResponse::AuthorityTimeAdvanced { .. }
         | AuthorityResponse::Rejected { .. } => None,

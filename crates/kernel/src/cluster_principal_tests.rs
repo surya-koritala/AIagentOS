@@ -93,7 +93,8 @@ async fn principal_history_requires_current_reader_and_retains_real_receipt14_be
         assert_eq!(migration, "retain-actor-bound-cluster-operation-receipts");
         let receipt_table: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='cluster_operation_receipts'", [], |row| row.get(0)).unwrap();
         assert_eq!(receipt_table, 1);
-        assert!(matches!(crate::schema::preflight_for_reader(&connection, 14), Err(crate::ContextError::DatabaseTooNew { found, supported: 14 } if found == crate::schema::CURRENT_SCHEMA_VERSION)));
+        let refusal = crate::schema::preflight_for_reader(&connection, 14).unwrap_err();
+        assert!(matches!(refusal, crate::ContextError::DatabaseTooNew { found, supported: 14 } if found == crate::schema::CURRENT_SCHEMA_VERSION));
         connection.pragma_update(None, "user_version", 14).unwrap();
         connection.execute("UPDATE storage_meta SET schema_version=14,min_reader_schema_version=14", []).unwrap();
     }

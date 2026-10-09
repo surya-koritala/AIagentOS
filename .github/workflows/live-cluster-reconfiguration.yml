@@ -67,3 +67,12 @@ jobs:
       - name: Check exact generation and provisioned-root validation
         timeout-minutes: 5
         run: cargo test -p kernel --lib --locked cluster_reconfiguration::tests -- --nocapture
+      - name: Check actual four-node live membership and transport behavior
+        timeout-minutes: 5
+        run: cargo test -p kernel --lib --locked live_reconfiguration:: -- --nocapture
+      - name: Preserve generated protocol fixtures and principal storage fences
+        timeout-minutes: 5
+        run: |
+          cargo test -p kernel --lib --locked wire_contract::tests -- --nocapture
+          cargo test -p kernel --lib --locked principal_history_requires_current_reader -- --nocapture
+          cargo test -p kernel --lib --locked live_transport_proposals_remain_system_only -- --nocapture

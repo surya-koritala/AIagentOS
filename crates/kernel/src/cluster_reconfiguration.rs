@@ -53,10 +53,18 @@ impl ClusterReconfigurationTarget {
         membership: &StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
     ) -> io::Result<Self> {
         if membership.log_id().is_none() || membership.membership().get_joint_config().is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "Raft membership is not initialized"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Raft membership is not initialized",
+            ));
         }
-        let catalog = membership.nodes().map(|(id, node)| (*id, node.clone())).collect::<BTreeMap<_, _>>();
-        let first = catalog.values().next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Raft membership has no catalog"))?;
+        let catalog = membership
+            .nodes()
+            .map(|(id, node)| (*id, node.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let first = catalog.values().next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Raft membership has no catalog")
+        })?;
         let target = Self {
             voter_ids: membership.voter_ids().collect(),
             voter_generation: first.voter_set_generation,
@@ -89,14 +97,22 @@ pub(crate) fn prepare_voter_target(
     target_generation: u64,
     at: DateTime<Utc>,
 ) -> io::Result<ClusterReconfigurationTarget> {
-    check_generation(current.voter_generation, expected_generation, target_generation)?;
+    check_generation(
+        current.voter_generation,
+        expected_generation,
+        target_generation,
+    )?;
     if target_voter_ids == &current.voter_ids {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "voter proposal has no voter-set change"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "voter proposal has no voter-set change",
+        ));
     }
     let mut target = current.clone();
     target.voter_ids = target_voter_ids.clone();
     target.voter_generation = target_generation;
-    target.voter_set_sha256 = crate::cluster_runtime::configured_voter_set_sha256(target_generation, target_voter_ids);
+    target.voter_set_sha256 =
+        crate::cluster_runtime::configured_voter_set_sha256(target_generation, target_voter_ids);
     for node in target.catalog.values_mut() {
         node.voter_set_generation = target_generation;
         node.voter_set_sha256.clone_from(&target.voter_set_sha256);
@@ -113,7 +129,11 @@ pub(crate) fn prepare_trust_target(
     overlap_not_after: Option<DateTime<Utc>>,
     at: DateTime<Utc>,
 ) -> io::Result<ClusterReconfigurationTarget> {
-    check_generation(current.trust_generation, expected_generation, target_generation)?;
+    check_generation(
+        current.trust_generation,
+        expected_generation,
+        target_generation,
+    )?;
     let target = ClusterReconfigurationTarget {
         catalog: target_catalog.clone(),
         voter_ids: current.voter_ids.clone(),
@@ -125,8 +145,17 @@ pub(crate) fn prepare_trust_target(
     };
     // The live API cannot install roots from fingerprints. Every node must
     // already have this exact CA set provisioned in its startup TLS config.
-    let prior_roots = current.catalog.values().next().map(|node| &node.transport_peer_ca_sha256);
-    if prior_roots.is_none_or(|roots| roots.is_empty()) || target.catalog.values().any(|node| Some(&node.transport_peer_ca_sha256) != prior_roots) {
+    let prior_roots = current
+        .catalog
+        .values()
+        .next()
+        .map(|node| &node.transport_peer_ca_sha256);
+    if prior_roots.is_none_or(|roots| roots.is_empty())
+        || target
+            .catalog
+            .values()
+            .any(|node| Some(&node.transport_peer_ca_sha256) != prior_roots)
+    {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "live trust changes require the unchanged preprovisioned CA fingerprint set and a versioned prior catalog"));
     }
     target.validate(at)?;
@@ -208,13 +237,22 @@ mod tests {
 
 fn check_generation(current: u64, expected: u64, target: u64) -> io::Result<()> {
     if expected != current {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "reconfiguration expected generation does not match current generation"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconfiguration expected generation does not match current generation",
+        ));
     }
     if target <= current {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "reconfiguration target generation reuses a committed generation"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconfiguration target generation reuses a committed generation",
+        ));
     }
     if current.checked_add(1) != Some(target) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "reconfiguration target generation skips a generation"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconfiguration target generation skips a generation",
+        ));
     }
     Ok(())
 }

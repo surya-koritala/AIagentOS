@@ -915,15 +915,25 @@ pub(crate) fn validate_reconfiguration_target(
     target: &crate::cluster_reconfiguration::ClusterReconfigurationTarget,
     now: chrono::DateTime<chrono::Utc>,
 ) -> io::Result<()> {
-    if target.catalog.is_empty() || target.catalog.len() > 31 || target.voter_ids.is_empty()
-        || target.voter_ids.iter().any(|id| !target.catalog.contains_key(id))
+    if target.catalog.is_empty()
+        || target.catalog.len() > 31
+        || target.voter_ids.is_empty()
+        || target
+            .voter_ids
+            .iter()
+            .any(|id| !target.catalog.contains_key(id))
     {
-        return Err(invalid_input("live Raft target must contain 1 to 31 nodes and a nonempty catalog-backed voter set"));
+        return Err(invalid_input(
+            "live Raft target must contain 1 to 31 nodes and a nonempty catalog-backed voter set",
+        ));
     }
-    if configured_voter_set_sha256(target.voter_generation, &target.voter_ids) != target.voter_set_sha256
+    if configured_voter_set_sha256(target.voter_generation, &target.voter_ids)
+        != target.voter_set_sha256
         || configured_transport_catalog_sha256(&target.catalog) != target.catalog_sha256
     {
-        return Err(invalid_input("live Raft target digest does not authenticate its catalog and voter set"));
+        return Err(invalid_input(
+            "live Raft target digest does not authenticate its catalog and voter set",
+        ));
     }
     let mut endpoints = BTreeSet::new();
     let mut server_fingerprints = BTreeSet::new();
@@ -1007,9 +1017,11 @@ pub(crate) fn validate_reconfiguration_target(
                     "Raft transport trust overlap requires an absolute expiration",
                 ))
             }
-            (false, Some(_)) => return Err(invalid_input(
-                "Raft transport trust overlap expiration exists without overlap credentials",
-            )),
+            (false, Some(_)) => {
+                return Err(invalid_input(
+                    "Raft transport trust overlap expiration exists without overlap credentials",
+                ))
+            }
             (false, None) => {}
         }
         let mut member_server_fingerprints = BTreeSet::new();
@@ -1282,7 +1294,10 @@ fn validated_durable_transport_catalog(
     Ok(nodes)
 }
 
-pub(crate) fn configured_voter_set_sha256(generation: u64, voters: &BTreeSet<ClusterRaftNodeId>) -> String {
+pub(crate) fn configured_voter_set_sha256(
+    generation: u64,
+    voters: &BTreeSet<ClusterRaftNodeId>,
+) -> String {
     if generation == 0 {
         return String::new();
     }
@@ -2798,8 +2813,13 @@ fn inspect_durable_membership(
         ))
     })?;
     inspect_membership_target(
-        metrics.membership_config.as_ref(), trusted, desired_transport_catalog_sha256,
-        desired_transport_trust_generation, desired_voters, desired_generation, desired_sha256,
+        metrics.membership_config.as_ref(),
+        trusted,
+        desired_transport_catalog_sha256,
+        desired_transport_trust_generation,
+        desired_voters,
+        desired_generation,
+        desired_sha256,
     )
 }
 

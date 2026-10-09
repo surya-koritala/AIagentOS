@@ -3230,6 +3230,7 @@ async fn dispatch_scoped_inner_with_fence(
                 };
             }
             let request_fence = crate::ActiveRequestFence {
+                caller: None,
                 cluster_id: proof.cluster_id,
                 owner_node_id: proof.owner_node_id,
                 authority_term: proof.authority_term,
@@ -6464,6 +6465,7 @@ where
     let mutation_fence_barrier = kernel.agent_mutation_fence_barrier(parsed_agent);
     let _mutation_fence_read = mutation_fence_barrier.read_owned().await;
     let request_fence = fence.as_ref().map(|(_, proof)| crate::ActiveRequestFence {
+        caller: None,
         cluster_id: proof.cluster_id.clone(),
         owner_node_id: proof.owner_node_id.clone(),
         authority_term: proof.authority_term,
@@ -9423,6 +9425,7 @@ mod tests {
             crate::ActiveRequestHandle {
                 cancellation: old_cancellation.clone(),
                 fence: Some(crate::ActiveRequestFence {
+                    caller: None,
                     cluster_id: cluster_id.clone(),
                     owner_node_id: owner_node_id.clone(),
                     authority_term: 2,
@@ -9512,6 +9515,7 @@ mod tests {
             crate::ActiveRequestHandle {
                 cancellation: new_cancellation.clone(),
                 fence: Some(crate::ActiveRequestFence {
+                    caller: None,
                     cluster_id,
                     owner_node_id,
                     authority_term: 3,

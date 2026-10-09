@@ -1277,8 +1277,20 @@ struct ActiveTurnRegistration<'a> {
     request_id: Option<String>,
 }
 
+/// Identity captured by a verified signed admission; no private credential data.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ActiveRequestCaller {
+    pub principal_id: String,
+    pub principal_generation: u64,
+    pub tenant_id: String,
+    pub user_id: Option<String>,
+    pub credential_kind: Option<String>,
+    pub credential_id: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ActiveRequestFence {
+    pub caller: Option<ActiveRequestCaller>,
     pub cluster_id: String,
     pub owner_node_id: String,
     pub authority_term: u64,
@@ -5842,6 +5854,8 @@ impl AgentKernelImpl {
         true
     }
 
+    /// Exact equality includes the verified admission caller when present.
+    /// A legacy fence cannot cancel a signed request or a later reused ID.
     pub(crate) fn cancel_request_fenced(
         &self,
         agent_id: AgentId,
@@ -6242,6 +6256,60 @@ pub fn boot_in_memory() -> Result<Arc<AgentKernelImpl>, KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_destination_cancel_requires_exact_admitted_caller_and_retained_request() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent_id = uuid::Uuid::new_v4();
+        let request_id = "signed-cancel-fixture";
+        let caller = ActiveRequestCaller {
+            principal_id: uuid::Uuid::new_v4().to_string(),
+            principal_generation: 1,
+            tenant_id: uuid::Uuid::new_v4().to_string(),
+            user_id: Some(uuid::Uuid::new_v4().to_string()),
+            credential_kind: Some("api_key".into()),
+            credential_id: Some("public-key-identifier".into()),
+        };
+        let fence = ActiveRequestFence {
+            caller: Some(caller),
+            cluster_id: uuid::Uuid::new_v4().to_string(),
+            owner_node_id: uuid::Uuid::new_v4().to_string(),
+            authority_term: 2,
+            authority_generation: 3,
+            fencing_token: 5,
+            proof_expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        kernel.active_requests.insert((agent_id, request_id.to_owned()), ActiveRequestHandle {
+            cancellation: cancellation.clone(), fence: Some(fence.clone()),
+        });
+        let mut foreign = fence.clone();
+        foreign.caller.as_mut().unwrap().principal_id = uuid::Uuid::new_v4().to_string();
+        assert!(!kernel.cancel_request_fenced(agent_id, request_id, &foreign));
+        foreign = fence.clone();
+        foreign.caller.as_mut().unwrap().user_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(!kernel.cancel_request_fenced(agent_id, request_id, &foreign));
+        foreign = fence.clone();
+        foreign.caller.as_mut().unwrap().credential_kind = Some("session".into());
+        assert!(!kernel.cancel_request_fenced(agent_id, request_id, &foreign));
+        foreign = fence.clone();
+        foreign.caller = None;
+        assert!(!kernel.cancel_request_fenced(agent_id, request_id, &foreign));
+        assert!(!kernel.cancel_request(agent_id, request_id));
+        assert!(!cancellation.is_cancelled());
+        assert!(kernel.cancel_request_fenced(agent_id, request_id, &fence));
+        assert!(cancellation.is_cancelled());
+        let replacement = tokio_util::sync::CancellationToken::new();
+        let mut newer = fence.clone();
+        newer.authority_term += 1;
+        newer.fencing_token += 1;
+        kernel.active_requests.insert((agent_id, request_id.to_owned()), ActiveRequestHandle {
+            cancellation: replacement.clone(), fence: Some(newer.clone()),
+        });
+        assert!(!kernel.cancel_request_fenced(agent_id, request_id, &fence));
+        assert!(!replacement.is_cancelled());
+        assert!(kernel.cancel_request_fenced(agent_id, request_id, &newer));
+    }
 
     fn lifecycle_test_config(name: &str) -> AgentConfig {
         AgentConfig {

@@ -18,6 +18,9 @@ use kernel::syscall_server::SyscallServer;
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use tokio::task::JoinHandle;
 
+#[path = "support/capacity_quorum.rs"]
+mod capacity_quorum;
+
 struct TempDb(PathBuf, tempfile::TempDir);
 
 impl TempDb {
@@ -227,67 +230,48 @@ struct ManagedCluster {
     member_kernel: Arc<AgentKernelImpl>,
     authority: KernelClient,
     member: KernelClient,
-    authority_task: JoinHandle<std::io::Result<()>>,
-    member_task: JoinHandle<std::io::Result<()>>,
+    signer: agent_sdk::AuthoritySigner,
+    quorum: capacity_quorum::CapacityQuorum,
 }
 
-impl Drop for ManagedCluster {
-    fn drop(&mut self) {
-        self.authority_task.abort();
-        self.member_task.abort();
+impl ManagedCluster {
+    async fn close(mut self) {
+        self.authority.close().await.unwrap(); self.member.close().await.unwrap();
+        drop(self.authority); drop(self.member); drop(self.member_kernel);
+        self.quorum.close().await;
     }
 }
 
 async fn spawn_managed_cluster(token: &str) -> ManagedCluster {
-    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
-    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
-        .await
-        .expect("bind authority")
-        .with_auth_token(token);
-    let authority_address = authority_server.local_addr().unwrap().to_string();
-    let authority_task = tokio::spawn(authority_server.serve());
-
-    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
-    let member_server = SyscallServer::bind(member_kernel.clone(), "127.0.0.1:0")
-        .await
-        .expect("bind member")
-        .with_auth_token(token);
-    let member_address = member_server.local_addr().unwrap().to_string();
-    let member_task = tokio::spawn(member_server.serve());
-
+    let quorum = capacity_quorum::CapacityQuorum::start(2, token, true).await;
+    let authority_address = quorum.addresses[0].clone();
+    let member_address = quorum.addresses[1].clone();
+    let member_kernel = quorum.kernels[1].clone();
+    let signer = quorum.signer.clone();
     let mut authority = KernelClient::connect(&authority_address)
         .await
         .expect("connect authority");
     authority.authenticate(token).await.expect("auth authority");
+    authority.set_authority_signer(signer.clone());
     let mut member = KernelClient::connect(&member_address)
         .await
         .expect("connect member");
     member.authenticate(token).await.expect("auth member");
-    let joined = ClusterClient::admit_node(
-        &mut authority,
-        &mut member,
-        &member_address,
-        None,
-        "managed test member",
-    )
-    .await
-    .expect("admit member");
-
     ManagedCluster {
         authority_address,
-        member_id: joined.node_id,
+        member_id: member_kernel.cluster_control.identity().node_id.clone(),
         member_kernel,
         authority,
         member,
-        authority_task,
-        member_task,
+        signer,
+        quorum,
     }
 }
 
 #[tokio::test]
 async fn least_loaded_placement_spreads_agents() {
-    let addrs = spawn_cluster(3).await;
-    let mut cluster = ClusterClient::connect(&addrs).await.expect("connect");
+    let quorum = capacity_quorum::CapacityQuorum::start(3, "capacity-spread", false).await;
+    let mut cluster = ClusterClient::connect_authenticated(&quorum.addresses, "capacity-spread").await.expect("connect");
     assert_eq!(cluster.node_count(), 3);
     assert!(!cluster.is_authority_managed());
 
@@ -306,6 +290,7 @@ async fn least_loaded_placement_spreads_agents() {
             .await
             .expect("create");
         placed.push(p);
+        quorum.refresh().await;
     }
 
     // Every node ended up with exactly one agent.
@@ -320,6 +305,7 @@ async fn least_loaded_placement_spreads_agents() {
     nodes.sort();
     nodes.dedup();
     assert_eq!(nodes.len(), 3, "agents spread across distinct nodes");
+    drop(cluster); quorum.close().await;
 }
 
 #[tokio::test]
@@ -327,14 +313,17 @@ async fn list_agents_aggregates_and_attributes_by_node() {
     let addrs = spawn_cluster(2).await;
     let mut cluster = ClusterClient::connect(&addrs).await.expect("connect");
 
-    let a = cluster
-        .create_agent("alpha", "t", None, None, None, Placement::RoundRobin)
+    let a_node = cluster.node_ids()[0].clone();
+    let a_id = cluster.node(&a_node).unwrap().client().create_agent("alpha", "t", None, None, None)
         .await
         .expect("create a");
-    let b = cluster
-        .create_agent("beta", "t", None, None, None, Placement::RoundRobin)
+    let b_node = cluster.node_ids()[1].clone();
+    let b_id = cluster.node(&b_node).unwrap().client().create_agent("beta", "t", None, None, None)
         .await
         .expect("create b");
+    cluster.rebuild_owners().await.unwrap();
+    let a = agent_sdk::PlacedAgent { agent_id: a_id, node_id: a_node };
+    let b = agent_sdk::PlacedAgent { agent_id: b_id, node_id: b_node };
     // Round-robin over two nodes → different nodes.
     assert_ne!(a.node_id, b.node_id);
 
@@ -358,18 +347,20 @@ async fn routing_reaches_owning_node_and_unknown_agent_errors() {
     let addrs = spawn_cluster(2).await;
     let mut cluster = ClusterClient::connect(&addrs).await.expect("connect");
 
-    // A read-only agent placed somewhere in the cluster.
-    let placed = cluster
+    // Direct provisioning keeps routing evidence independent of placement trust.
+    let node_id = cluster.node_ids()[0].clone();
+    let agent_id = cluster.node(&node_id).unwrap().client()
         .create_agent(
             "ro",
             "t",
             None,
             Some("read-only".into()),
             None,
-            Placement::LeastLoaded,
         )
         .await
         .expect("create");
+    cluster.rebuild_owners().await.unwrap();
+    let placed = agent_sdk::PlacedAgent { agent_id, node_id };
 
     // call_tool routes to the owning node; write is gate-denied *there* — proving
     // the call reached the right node and enforcement held across the cluster.
@@ -427,17 +418,18 @@ async fn durable_identity_and_agent_ownership_survive_node_and_client_restart() 
         .await
         .expect("connect first cluster client");
     let node_id = first_cluster.node_ids().remove(0);
-    let placed = first_cluster
+    let agent_id = first_cluster.node(&node_id).unwrap().client()
         .create_agent(
             "durable",
             "survive restart",
             None,
             None,
             None,
-            Placement::LeastLoaded,
         )
         .await
         .expect("create durable agent");
+    first_cluster.rebuild_owners().await.unwrap();
+    let placed = agent_sdk::PlacedAgent { agent_id, node_id: node_id.clone() };
     assert_eq!(placed.node_id, node_id);
     drop(first_cluster);
     first_server.abort();
@@ -512,8 +504,8 @@ async fn duplicate_durable_node_identity_fails_closed() {
 
 #[tokio::test]
 async fn draining_and_placement_constraints_fail_closed() {
-    let addrs = spawn_cluster(2).await;
-    let mut cluster = ClusterClient::connect(&addrs).await.expect("connect");
+    let quorum = capacity_quorum::CapacityQuorum::start(2, "capacity-constraints", false).await;
+    let mut cluster = ClusterClient::connect_authenticated(&quorum.addresses, "capacity-constraints").await.expect("connect");
     let node_ids = cluster.node_ids();
 
     let first_profile = NodeProfile {
@@ -560,6 +552,7 @@ async fn draining_and_placement_constraints_fail_closed() {
         .set_node_profile(second_profile, 0, "configure US node")
         .await
         .expect("set second profile");
+    quorum.refresh().await;
 
     let unavailable = cluster
         .create_agent(
@@ -611,6 +604,7 @@ async fn draining_and_placement_constraints_fail_closed() {
         .await
         .expect("round robin should skip draining nodes");
     assert_eq!(round_robin.node_id, node_ids[1]);
+    drop(cluster); quorum.close().await;
 }
 
 #[tokio::test]
@@ -971,46 +965,15 @@ async fn authorized_membership_drives_discovery_leave_and_revocation() {
 #[tokio::test]
 async fn discovered_cluster_publishes_renews_rebuilds_and_enforces_fenced_routes() {
     let token = "managed-routing-system-secret";
-    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
-    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
-        .await
-        .expect("bind authority")
-        .with_auth_token(token);
-    let authority_address = authority_server.local_addr().unwrap().to_string();
-    let authority_task = tokio::spawn(authority_server.serve());
-
-    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
-    let member_server = SyscallServer::bind(member_kernel, "127.0.0.1:0")
-        .await
-        .expect("bind member")
-        .with_auth_token(token);
-    let member_address = member_server.local_addr().unwrap().to_string();
-    let member_task = tokio::spawn(member_server.serve());
-
-    let mut authority = KernelClient::connect(&authority_address)
-        .await
-        .expect("connect authority");
-    authority.authenticate(token).await.expect("auth authority");
-    let mut member = KernelClient::connect(&member_address)
-        .await
-        .expect("connect member");
-    member.authenticate(token).await.expect("auth member");
-    let joined = ClusterClient::admit_node(
-        &mut authority,
-        &mut member,
-        &member_address,
-        None,
-        "managed routing member",
-    )
-    .await
-    .expect("admit member");
+    let ManagedCluster { authority_address, member_id, member_kernel, mut authority, mut member, signer, quorum } = spawn_managed_cluster(token).await;
+    let joined = authority.cluster_membership().await.unwrap().members.into_iter().find(|member| member.node_id == member_id).unwrap();
     let cluster_id = authority
         .cluster_membership()
         .await
         .expect("membership")
         .cluster_id;
 
-    let mut cluster = ClusterClient::connect_discovered_authenticated(&authority_address, token)
+    let mut cluster = ClusterClient::connect_discovered_with_signer(&authority_address, token, signer.clone())
         .await
         .expect("discover managed cluster");
     assert!(cluster.is_authority_managed());
@@ -1127,7 +1090,7 @@ async fn discovered_cluster_publishes_renews_rebuilds_and_enforces_fenced_routes
     assert_eq!(renewed_fence.authority_generation, renewed.generation);
 
     drop(cluster);
-    let mut rebuilt = ClusterClient::connect_discovered_authenticated(&authority_address, token)
+    let mut rebuilt = ClusterClient::connect_discovered_with_signer(&authority_address, token, signer)
         .await
         .expect("rebuild exact managed route");
     assert_eq!(
@@ -1171,10 +1134,8 @@ async fn discovered_cluster_publishes_renews_rebuilds_and_enforces_fenced_routes
     );
     assert_eq!(rebuilt.owner_of(&placed.agent_id), None);
 
-    authority_task.abort();
-    let _ = authority_task.await;
-    member_task.abort();
-    let _ = member_task.await;
+    drop(rebuilt); authority.close().await.unwrap(); member.close().await.unwrap();
+    drop(authority); drop(member); drop(member_kernel); quorum.close().await;
 }
 
 #[tokio::test]
@@ -1182,7 +1143,7 @@ async fn failed_managed_destination_creation_retains_a_reconcilable_reservation(
     let token = "managed-publication-failure-secret";
     let mut managed = spawn_managed_cluster(token).await;
     let mut cluster =
-        ClusterClient::connect_discovered_authenticated(&managed.authority_address, token)
+        ClusterClient::connect_discovered_with_signer(&managed.authority_address, token, managed.signer.clone())
             .await
             .expect("discover managed cluster");
     cluster
@@ -1263,6 +1224,7 @@ async fn failed_managed_destination_creation_retains_a_reconcilable_reservation(
         .expect("unexpired reservation remains pending");
     assert_eq!(report.pending_reservations, 1);
     assert_eq!(cluster.owner_of(&agent_id), None);
+    drop(cluster); managed.close().await;
 }
 
 #[tokio::test]
@@ -1325,7 +1287,7 @@ async fn reconciliation_recovers_an_expired_lease_and_missing_destination_fence(
     }
 
     let cluster =
-        ClusterClient::connect_discovered_authenticated(&managed.authority_address, token)
+        ClusterClient::connect_discovered_with_signer(&managed.authority_address, token, managed.signer.clone())
             .await
             .expect("reconcile durable route after publisher crash");
     assert_eq!(
@@ -1376,6 +1338,7 @@ async fn reconciliation_recovers_an_expired_lease_and_missing_destination_fence(
     assert!(duplicate
         .kernel_message()
         .is_some_and(|message| message.contains("already exists")));
+    drop(cluster); managed.close().await;
 }
 
 #[tokio::test]
@@ -1426,7 +1389,7 @@ async fn reconciliation_releases_an_expired_reservation_without_a_local_agent() 
     }
 
     let mut cluster =
-        ClusterClient::connect_discovered_authenticated(&managed.authority_address, token)
+        ClusterClient::connect_discovered_with_signer(&managed.authority_address, token, managed.signer.clone())
             .await
             .expect("expired incomplete reservation is reconciled");
     assert_eq!(cluster.owner_of(&agent_id), None);
@@ -1485,15 +1448,17 @@ async fn reconciliation_releases_an_expired_reservation_without_a_local_agent() 
         .await
         .expect("released tombstone is stable on repeated reconciliation");
     assert_eq!(report, Default::default());
+    drop(cluster); managed.close().await;
 }
 
 #[tokio::test]
 async fn explicit_automatic_maintenance_renews_idle_routes_and_stops_on_drop() {
     let token = "managed-automatic-maintenance-secret";
     let mut managed = spawn_managed_cluster(token).await;
-    let mut cluster = ClusterClient::connect_discovered_authenticated_with_maintenance(
+    let mut cluster = ClusterClient::connect_discovered_with_signer_and_maintenance(
         &managed.authority_address,
         token,
+        managed.signer.clone(),
         ClusterMaintenanceConfig {
             lease_ttl_seconds: 5,
             renew_interval: Duration::from_secs(1),
@@ -1568,6 +1533,7 @@ async fn explicit_automatic_maintenance_renews_idle_routes_and_stops_on_drop() {
             Err(error) => panic!("unexpected ownership read failure: {error}"),
         }
     }
+    managed.close().await;
 }
 
 #[tokio::test]

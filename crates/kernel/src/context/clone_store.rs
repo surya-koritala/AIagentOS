@@ -43,8 +43,12 @@ impl SqliteContextManager {
             .map_err(|error| failed(error.to_string()))?;
         crate::schema::require_current_writer(&tx)?;
         let creation_digest = crate::cluster_agent_identity::clone_creation_sha256(
-            &parent.to_string(), &record.id.to_string(), &record.name, dropped,
-        ).map_err(|error| failed(error.to_string()))?;
+            &parent.to_string(),
+            &record.id.to_string(),
+            &record.name,
+            dropped,
+        )
+        .map_err(|error| failed(error.to_string()))?;
         crate::cluster_agent_identity::validate_creation_write(&tx, record, &creation_digest)?;
         let count: u64 = tx
             .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))

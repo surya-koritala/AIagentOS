@@ -260,8 +260,12 @@ impl AgentIdentityRecord {
             AgentIdentityState::Aborted | AgentIdentityState::Deleted
         );
         if !legal
-            || matches!(self.state, AgentIdentityState::Prepared | AgentIdentityState::Created | AgentIdentityState::Published)
-                && self.changed_by_principal_id != self.reservation.creator_principal_id
+            || matches!(
+                self.state,
+                AgentIdentityState::Prepared
+                    | AgentIdentityState::Created
+                    | AgentIdentityState::Published
+            ) && self.changed_by_principal_id != self.reservation.creator_principal_id
             || self.state == AgentIdentityState::Prepared
                 && self.last_operation_id != self.reservation.creation_operation_id
             || tombstone != self.tombstone_reason.is_some()
@@ -404,7 +408,7 @@ pub fn creation_command_sha256(
         {
             let drops = crate::cloning::clone_attenuation(drop_capabilities)
                 .map_err(|_| AgentIdentityError::InvalidIdentity)?;
-                return clone_creation_sha256(agent_id, child_agent_id, name, &drops);
+            return clone_creation_sha256(agent_id, child_agent_id, name, &drops);
         }
         _ => return Err(AgentIdentityError::InvalidIdentity),
     };
@@ -421,7 +425,8 @@ pub(crate) fn clone_creation_sha256(
 ) -> Result<String, AgentIdentityError> {
     let value = serde_json::json!({ "clone": { "agent_id": parent,
         "child_agent_id": child, "name": name, "drop_capabilities": drops } });
-    serde_json::to_vec(&value).map(|bytes| sha256_hex(&bytes))
+    serde_json::to_vec(&value)
+        .map(|bytes| sha256_hex(&bytes))
         .map_err(|_| AgentIdentityError::InvalidIdentity)
 }
 
@@ -433,6 +438,6 @@ pub use destination_store::{
     publish_destination_identity, DestinationCreationAdmission,
 };
 pub(crate) use destination_store::{
-    commit_agent_creation_evidence, retain_identity_tombstones, validate_creation_write,
-    validate_destination_identity_store, crash_identity_after_step_for_test,
+    commit_agent_creation_evidence, crash_identity_after_step_for_test, retain_identity_tombstones,
+    validate_creation_write, validate_destination_identity_store,
 };

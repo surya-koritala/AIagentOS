@@ -2823,7 +2823,10 @@ impl AgentKernelImpl {
             .map_err(KernelError::Sandbox)?;
         let mut restored = Vec::new();
         for p in persisted {
-            if !crate::cluster_agent_identity::destination_agent_is_published(&self.context_manager, p.id)? {
+            if !crate::cluster_agent_identity::destination_agent_is_published(
+                &self.context_manager,
+                p.id,
+            )? {
                 tracing::warn!(agent_id = %p.id, "Immutable agent creation remains unpublished; durable evidence is preserved without runtime admission");
                 continue;
             }
@@ -5522,8 +5525,13 @@ impl AgentKernelImpl {
         &self,
         agent_id: AgentId,
     ) -> Result<Arc<tokio::sync::Mutex<AgentExecutor>>, KernelError> {
-        if !crate::cluster_agent_identity::destination_agent_is_published(&self.context_manager, agent_id)? {
-            return Err(KernelError::Policy("immutable agent identity is not published".into()));
+        if !crate::cluster_agent_identity::destination_agent_is_published(
+            &self.context_manager,
+            agent_id,
+        )? {
+            return Err(KernelError::Policy(
+                "immutable agent identity is not published".into(),
+            ));
         }
         if let Some(executor) = self.executors.get(&agent_id) {
             return Ok(Arc::clone(executor.value()));
@@ -6099,7 +6107,12 @@ impl AgentKernelImpl {
         for entry in self.executors.iter() {
             let kid = *entry.key();
             if self.syscall_gate.pid_of(kid) == Some(pid)
-                && crate::cluster_agent_identity::destination_agent_is_published(&self.context_manager, kid).unwrap_or(false) {
+                && crate::cluster_agent_identity::destination_agent_is_published(
+                    &self.context_manager,
+                    kid,
+                )
+                .unwrap_or(false)
+            {
                 return Some(kid);
             }
         }
@@ -6107,7 +6120,12 @@ impl AgentKernelImpl {
         // message); fall back to scanning the agent manager.
         for info in self.agent_manager.list_agents(None) {
             if self.syscall_gate.pid_of(info.id) == Some(pid)
-                && crate::cluster_agent_identity::destination_agent_is_published(&self.context_manager, info.id).unwrap_or(false) {
+                && crate::cluster_agent_identity::destination_agent_is_published(
+                    &self.context_manager,
+                    info.id,
+                )
+                .unwrap_or(false)
+            {
                 return Some(info.id);
             }
         }

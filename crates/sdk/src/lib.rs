@@ -2527,8 +2527,15 @@ impl KernelClient {
         &mut self,
         agent_id: impl Into<String>,
     ) -> Result<Option<AgentIdentityRecord>, SdkError> {
-        match self.call(Syscall::GetClusterAgentIdentity { agent_id: agent_id.into() }).await? {
-            SyscallReply::ClusterAgentIdentity { identity } => Ok(identity.map(|identity| *identity)),
+        match self
+            .call(Syscall::GetClusterAgentIdentity {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentIdentity { identity } => {
+                Ok(identity.map(|identity| *identity))
+            }
             other => Err(unexpected("ClusterAgentIdentity", &other)),
         }
     }
@@ -2538,7 +2545,13 @@ impl KernelClient {
         after_agent_id: Option<String>,
         limit: usize,
     ) -> Result<Vec<AgentIdentityRecord>, SdkError> {
-        match self.call(Syscall::ListClusterAgentIdentities { after_agent_id, limit }).await? {
+        match self
+            .call(Syscall::ListClusterAgentIdentities {
+                after_agent_id,
+                limit,
+            })
+            .await?
+        {
             SyscallReply::ClusterAgentIdentities { identities } => Ok(identities),
             other => Err(unexpected("ClusterAgentIdentities", &other)),
         }
@@ -2560,17 +2573,38 @@ impl KernelClient {
             | AuthorityCommand::PublishAgentIdentity { agent_id, .. }
             | AuthorityCommand::AbortAgentIdentity { agent_id, .. }
             | AuthorityCommand::DeleteAgentIdentity { agent_id, .. } => agent_id.clone(),
-            _ => return Err(SdkError::Configuration("a closed immutable identity transition is required".into())),
+            _ => {
+                return Err(SdkError::Configuration(
+                    "a closed immutable identity transition is required".into(),
+                ))
+            }
         };
-        match self.submit_authority_command_with_signer(command, cluster_id, principal_id, principal_generation, sign).await? {
+        match self
+            .submit_authority_command_with_signer(
+                command,
+                cluster_id,
+                principal_id,
+                principal_generation,
+                sign,
+            )
+            .await?
+        {
             AuthorityResponse::AgentIdentityUpdated { identity, .. } => {
-                identity.validate().map_err(|error| SdkError::Configuration(error.to_string()))?;
-                if identity.reservation.agent_id != expected_agent || identity.reservation.cluster_id != cluster_id {
-                    return Err(SdkError::Configuration("authority returned a foreign immutable identity".into()));
+                identity
+                    .validate()
+                    .map_err(|error| SdkError::Configuration(error.to_string()))?;
+                if identity.reservation.agent_id != expected_agent
+                    || identity.reservation.cluster_id != cluster_id
+                {
+                    return Err(SdkError::Configuration(
+                        "authority returned a foreign immutable identity".into(),
+                    ));
                 }
                 Ok(identity)
             }
-            other => Err(SdkError::Configuration(format!("immutable identity transition rejected: {other:?}"))),
+            other => Err(SdkError::Configuration(format!(
+                "immutable identity transition rejected: {other:?}"
+            ))),
         }
     }
 

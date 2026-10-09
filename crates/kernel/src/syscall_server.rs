@@ -2659,7 +2659,9 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
 
 fn enforce_unfenced_agent_mutation(kernel: &AgentKernelImpl, agent_id: &str) -> Result<(), String> {
     let id = uuid::Uuid::parse_str(agent_id).map_err(|_| "invalid agent identity".to_owned())?;
-    if !crate::cluster_agent_identity::destination_agent_is_published(&kernel.context_manager, id).map_err(|error| error.to_string())? {
+    if !crate::cluster_agent_identity::destination_agent_is_published(&kernel.context_manager, id)
+        .map_err(|error| error.to_string())?
+    {
         return Err("immutable agent identity is not published".into());
     }
     match kernel.cluster_control.agent_mutation_fence(agent_id) {
@@ -11580,8 +11582,19 @@ memory = ["remember this"]
         let unscoped_calls = unscoped_calls
             .into_iter()
             .chain([
-                (Syscall::GetClusterAgentIdentity { agent_id: uuid::Uuid::new_v4().to_string() }, AccessLevel::ReadOnly),
-                (Syscall::ListClusterAgentIdentities { after_agent_id: None, limit: 10 }, AccessLevel::ReadOnly),
+                (
+                    Syscall::GetClusterAgentIdentity {
+                        agent_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    AccessLevel::ReadOnly,
+                ),
+                (
+                    Syscall::ListClusterAgentIdentities {
+                        after_agent_id: None,
+                        limit: 10,
+                    },
+                    AccessLevel::ReadOnly,
+                ),
                 (Syscall::GetAuthorityPrincipalRegistry, AccessLevel::System),
                 (
                     Syscall::SubmitSignedAuthorityCommand {

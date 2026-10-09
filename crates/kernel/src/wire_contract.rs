@@ -834,7 +834,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "list_cluster_agent_identities",
-        fields: &[Field::optional("after_agent_id", N), Field::optional("limit", I)],
+        fields: &[
+            Field::optional("after_agent_id", N),
+            Field::optional("limit", I),
+        ],
     },
     Variant {
         tag: "install_agent_mutation_fence",

@@ -412,7 +412,15 @@ mod tests {
             };
             kernel
                 .context_manager
-                .reserve_clone(&record, parent, "unfinished fixture", None, &security, 0, &std::collections::BTreeSet::new())
+                .reserve_clone(
+                    &record,
+                    parent,
+                    "unfinished fixture",
+                    None,
+                    &security,
+                    0,
+                    &std::collections::BTreeSet::new(),
+                )
                 .unwrap();
             (parent, child)
         };

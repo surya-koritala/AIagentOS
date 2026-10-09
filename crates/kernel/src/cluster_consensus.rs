@@ -2600,6 +2600,9 @@ fn commands_are_same_retry(previous: &AuthorityCommand, current: &AuthorityComma
         let variant = value.as_object_mut()?.values_mut().next()?;
         if let Some(fields) = variant.as_object_mut() {
             fields.remove("proposed_at");
+            if crate::cluster_agent_identity::identity_command_agent(inner).is_some() {
+                fields.remove("actor");
+            }
         }
         Some(value)
     }

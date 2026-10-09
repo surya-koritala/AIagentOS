@@ -833,6 +833,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::required("agent_id", S)],
     },
     Variant {
+        tag: "get_destination_creation_receipt",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
         tag: "list_cluster_agent_identities",
         fields: &[
             Field::optional("after_agent_id", N),
@@ -1021,6 +1025,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "list_cluster_agent_ownerships"
                         | "list_cluster_agent_ownership_audit"
                         | "get_cluster_agent_identity"
+                        | "get_destination_creation_receipt"
                         | "list_cluster_agent_identities"
                         | "install_agent_mutation_fence"
                         | "retire_agent_mutation_fence"
@@ -1199,6 +1204,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "cluster_agent_identity",
         fields: &[Field::required("identity", JsonKind::ObjectOrNull)],
+    },
+    Variant {
+        tag: "destination_creation_receipt",
+        fields: &[Field::required("receipt", JsonKind::ObjectOrNull)],
     },
     Variant {
         tag: "cluster_agent_identities",
@@ -1967,7 +1976,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 135);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 136);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

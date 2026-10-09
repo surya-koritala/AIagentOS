@@ -426,6 +426,33 @@ pub fn destination_creation_receipt(
     Ok(receipt)
 }
 
+/// Receipt inspection follows independent creator/credential admission in the
+/// signed dispatcher. Absence is returned only when no local row exists; a
+/// foreign or partial row is explicit conflicting reconciliation evidence.
+pub fn inspect_destination_creation_receipt(
+    kernel: &crate::AgentKernelImpl,
+    identity: &AgentIdentityRecord,
+) -> Result<Option<DestinationCreationReceipt>, ContextError> {
+    identity.validate().map_err(evidence_error)?;
+    if matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted) {
+        return Err(failure("terminal immutable identity refuses destination receipt inspection"));
+    }
+    let has_receipt = {
+        let connection = kernel.context_manager.locked_conn();
+        let local = load_local(&connection, &identity.reservation.agent_id)?;
+        let row = row_sha256(&connection, &identity.reservation.agent_id)?;
+        match local {
+            None if row.is_none() && identity.state == AgentIdentityState::Prepared => false,
+            Some(local) if local.reservation == identity.reservation && local.state == "preparing" && row.is_none() => false,
+            Some(local) if local.reservation == identity.reservation
+                && matches!(local.state.as_str(), "created" | "published")
+                && row == local.row_sha256 && local.receipt.is_some() => true,
+            _ => return Err(failure("destination receipt inspection retains conflicting or incomplete local row evidence")),
+        }
+    };
+    if has_receipt { destination_creation_receipt(kernel, identity).map(Some) } else { Ok(None) }
+}
+
 /// The caller has just verified this Published record through an online quorum
 /// barrier. Marking the exact matching local receipt makes the row visible.
 pub fn publish_destination_identity(
@@ -513,6 +540,18 @@ pub(crate) fn retain_identity_tombstones(
                     "quorum tombstone conflicts with retained destination identity",
                 ));
             }
+            if identity.state == AgentIdentityState::Deleted && local.receipt.is_none() {
+                let receipt = identity.creation_receipt.as_ref().ok_or_else(|| failure("deletion tombstone has no exact committed receipt"))?;
+                if receipt.destination_installation_id != local.installation_id || receipt.local_receipt_id != local.local_receipt_id {
+                    return Err(failure("restored deletion tombstone retains ambiguous destination receipt identity"));
+                }
+                // A restored Prepared image may lack the later local row.
+                // Retain the exact majority-attested receipt as tombstone
+                // evidence without adopting, recreating or exposing any row.
+                connection.execute("UPDATE cluster_agent_creation_journal SET state='deleted', created_row_sha256=?1, receipt_json=?2 WHERE agent_id=?3",
+                    params![receipt.created_row_sha256, serde_json::to_vec(receipt).map_err(|_| failure("restored tombstone receipt cannot be retained"))?, receipt.agent_id],
+                ).map_err(|_| failure("restored deletion receipt cannot be retained"))?;
+            }
             connection.execute("UPDATE cluster_agent_creation_journal SET state=?1, updated_at=?2 WHERE agent_id=?3",
                 params![if identity.state == AgentIdentityState::Deleted { "deleted" } else { "aborted" },
                     identity.changed_at.to_rfc3339(), identity.reservation.agent_id],
@@ -520,6 +559,60 @@ pub(crate) fn retain_identity_tombstones(
         }
     }
     Ok(())
+}
+
+/// A quorum tombstone permits cleanup only of the exact attested local row.
+/// Foreign, partial or mismatched data remains explicit reconciliation evidence.
+pub fn verify_destination_identity_erasure(
+    store: &SqliteContextManager,
+    identity: &AgentIdentityRecord,
+) -> Result<(), ContextError> {
+    identity.validate().map_err(evidence_error)?;
+    if !matches!(identity.state, AgentIdentityState::Aborted | AgentIdentityState::Deleted) {
+        return Err(failure("destination erasure requires a committed immutable identity tombstone"));
+    }
+    let connection = store.locked_conn();
+    let row = row_sha256(&connection, &identity.reservation.agent_id)?;
+    let local = load_local(&connection, &identity.reservation.agent_id)?;
+    let Some(local) = local else {
+        return if row.is_none() { Ok(()) } else { Err(failure("destination erasure cannot adopt a foreign local row")) };
+    };
+    if local.reservation != identity.reservation || !matches!(local.state.as_str(), "aborted" | "deleted") {
+        return Err(failure("destination erasure differs from its exact retained tombstone"));
+    }
+    if row.is_some() && (local.receipt.is_none() || row != local.row_sha256) {
+        return Err(failure("destination erasure refuses partial or mismatched local row evidence"));
+    }
+    if local.receipt.as_ref().is_some_and(|receipt| identity.creation_receipt.as_ref() != Some(receipt)) {
+        return Err(failure("destination erasure receipt differs from its committed tombstone"));
+    }
+    Ok(())
+}
+
+pub(crate) fn guard_local_identity_erasure(
+    connection: &Connection,
+    agent_id: uuid::Uuid,
+    allow_preparation_rollback: bool,
+) -> Result<(), ContextError> {
+    let Some(local) = load_local(connection, &agent_id.to_string())? else { return Ok(()); };
+    if allow_preparation_rollback && local.state == "preparing" && local.receipt.is_none() {
+        return Ok(());
+    }
+    if !matches!(local.state.as_str(), "aborted" | "deleted") {
+        return Err(failure("managed agent erasure requires a committed immutable identity tombstone"));
+    }
+    let row = row_sha256(connection, &agent_id.to_string())?;
+    if row.is_some() && (local.receipt.is_none() || row != local.row_sha256) {
+        return Err(failure("managed agent erasure refuses partial or foreign local row evidence"));
+    }
+    Ok(())
+}
+
+pub fn require_local_identity_tombstone(
+    store: &SqliteContextManager,
+    agent_id: uuid::Uuid,
+) -> Result<(), ContextError> {
+    guard_local_identity_erasure(&store.locked_conn(), agent_id, false)
 }
 
 pub(crate) fn validate_destination_identity_store(

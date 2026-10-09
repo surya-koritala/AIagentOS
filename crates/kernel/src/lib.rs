@@ -3421,6 +3421,7 @@ impl AgentKernelImpl {
         if agent_id.is_nil() {
             return Err(Self::invalid_erasure_subject("agent"));
         }
+        crate::cluster_agent_identity::require_local_identity_tombstone(&self.context_manager, agent_id)?;
         let _service_operation = self.service_operation_lock.lock().await;
         let _auth_mutation = self.auth_mutation_lock.lock().await;
         let tenant_id = self.context_manager.agent_tenant(agent_id)?;
@@ -3529,6 +3530,9 @@ impl AgentKernelImpl {
     ) -> Result<Option<crate::context::DeletionReceipt>, KernelError> {
         if tenant_id.trim().is_empty() {
             return Err(Self::invalid_erasure_subject("tenant"));
+        }
+        for agent in self.context_manager.list_agents_for_tenant(tenant_id)? {
+            crate::cluster_agent_identity::require_local_identity_tombstone(&self.context_manager, agent)?;
         }
         let _service_operation = self.service_operation_lock.lock().await;
         let _auth_mutation = self.auth_mutation_lock.lock().await;

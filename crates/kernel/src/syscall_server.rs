@@ -876,6 +876,9 @@ pub enum Syscall {
     GetClusterAgentIdentity {
         agent_id: String,
     },
+    GetDestinationCreationReceipt {
+        agent_id: String,
+    },
     ListClusterAgentIdentities {
         #[serde(default)]
         after_agent_id: Option<String>,
@@ -1669,6 +1672,9 @@ pub enum SyscallReply {
     ClusterAgentIdentity {
         identity: Option<Box<crate::cluster_agent_identity::AgentIdentityRecord>>,
     },
+    DestinationCreationReceipt {
+        receipt: Option<Box<crate::cluster_agent_identity::DestinationCreationReceipt>>,
+    },
     ClusterAgentIdentities {
         identities: Vec<crate::cluster_agent_identity::AgentIdentityRecord>,
     },
@@ -2076,7 +2082,8 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListClusterAgentOwnershipAudit { .. } => {
             (AccessLevel::System, "cluster.ownership.audit", None)
         }
-        Syscall::GetClusterAgentIdentity { .. } | Syscall::ListClusterAgentIdentities { .. } => {
+        Syscall::GetClusterAgentIdentity { .. } | Syscall::ListClusterAgentIdentities { .. }
+        | Syscall::GetDestinationCreationReceipt { .. } => {
             (AccessLevel::ReadOnly, "cluster.agent_identity.read", None)
         }
         Syscall::InstallAgentMutationFence { .. } => (
@@ -2715,6 +2722,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::ListClusterAgentOwnerships { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }
             | Syscall::GetClusterAgentIdentity { .. }
+            | Syscall::GetDestinationCreationReceipt { .. }
             | Syscall::ListClusterAgentIdentities { .. }
             | Syscall::InstallAgentMutationFence { .. }
             | Syscall::RetireAgentMutationFence { .. }
@@ -5525,6 +5533,12 @@ async fn dispatch_scoped_inner_with_fence(
                 }
             }
         }
+        // The signed online destination dispatcher handles this read purpose
+        // after current creator, scope, credential and quorum admission. A
+        // direct legacy command never gains receipt or orphan-row access.
+        Syscall::GetDestinationCreationReceipt { .. } => {
+            principal_proof_error(crate::cluster_principal::PrincipalProofError::Missing)
+        }
         Syscall::GetClusterAgentIdentity { agent_id } => {
             if !crate::cluster_agent_identity::canonical_uuid(&agent_id) {
                 return SyscallReply::TypedError { code: WireErrorCode::InvalidArgument,
@@ -7530,6 +7544,7 @@ impl SyscallServer {
                                 | Syscall::ListClusterAgentOwnerships { .. }
                                 | Syscall::ListClusterAgentOwnershipAudit { .. }
                                 | Syscall::GetClusterAgentIdentity { .. }
+                                | Syscall::GetDestinationCreationReceipt { .. }
                                 | Syscall::ListClusterAgentIdentities { .. }
                         ) =>
                 {
@@ -11598,6 +11613,7 @@ memory = ["remember this"]
         let unscoped_calls = unscoped_calls
             .into_iter()
             .chain([
+                (Syscall::GetDestinationCreationReceipt { agent_id: uuid::Uuid::new_v4().to_string() }, AccessLevel::ReadOnly),
                 (
                     Syscall::GetClusterAgentIdentity {
                         agent_id: uuid::Uuid::new_v4().to_string(),
@@ -11681,7 +11697,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 135);
+        assert_eq!(calls.len(), 136);
         assert_eq!(fixture_tags, schema_tags);
     }
 

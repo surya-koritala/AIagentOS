@@ -1225,6 +1225,9 @@ impl SqliteContextManager {
             crate::accounting_integrity::register_functions(&conn)?;
             crate::accounting_integrity::secure_existing_schema(&conn)?;
         }
+        if schema_version >= crate::cluster_agent_identity::IDENTITY_SCHEMA_VERSION {
+            crate::cluster_agent_identity::validate_destination_identity_store(&conn)?;
+        }
         // Generation checkpoints contain prompts and tool results. Protect the
         // SQLite file with owner-only permissions on Unix before writing them.
         #[cfg(unix)]
@@ -6139,6 +6142,7 @@ impl SqliteContextManager {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let id = agent_id.to_string();
+        crate::cluster_agent_identity::guard_local_identity_erasure(&tx, agent_id, !record_receipt)?;
         let mut deleted_rows = BTreeMap::new();
         let shared_rows_before = shared_spills::row_counts(&tx)?;
 
@@ -7551,6 +7555,17 @@ impl SqliteContextManager {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         let agent_selector = "SELECT id FROM agents WHERE tenant_id = ?1";
+        let identity_agents = {
+            let mut statement = transaction.prepare(agent_selector).map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let ids = statement.query_map([tenant_id], |row| row.get::<_, String>(0))
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>().map_err(|error| ContextError::StorageError(error.to_string()))?;
+            ids
+        };
+        for agent in identity_agents {
+            let id = uuid::Uuid::parse_str(&agent).map_err(|_| ContextError::StorageError("tenant erasure found an invalid immutable agent identity".into()))?;
+            crate::cluster_agent_identity::guard_local_identity_erasure(&transaction, id, false)?;
+        }
         let mut deleted_rows = BTreeMap::new();
         let shared_rows_before = shared_spills::row_counts(&transaction)?;
         let deleted = transaction

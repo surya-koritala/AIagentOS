@@ -23,6 +23,7 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 SUPPORTED_VERSIONS = (1, 2)
 V2_ONLY_OPERATIONS = {
     "get_cluster_agent_identity",
+    "get_destination_creation_receipt",
     "list_cluster_agent_identities",
     "submit_signed_authority_command",
     "get_authority_principal_registry",

@@ -211,6 +211,12 @@ pub fn authority_command_semantic_sha256(
         .and_then(serde_json::Value::as_object_mut)
         .ok_or(PrincipalProofError::InvalidProof)?;
     fields.remove("proposed_at");
+    // Identity retries may enter through a different currently admitted node.
+    // Its actor is authenticated separately by the node delegation; immutable
+    // identity, creator, scope, digest and destination remain caller-signed.
+    if crate::cluster_agent_identity::identity_command_agent(unsigned_authority_command(command)?).is_some() {
+        fields.remove("actor");
+    }
     let mut canonical = Vec::new();
     encode_canonical_json(&value, &mut canonical)?;
     Ok(crate::cluster_control::sha256_hex(&canonical))

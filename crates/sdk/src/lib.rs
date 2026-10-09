@@ -2557,6 +2557,18 @@ impl KernelClient {
         }
     }
 
+    /// Inspect the exact destination journal through the configured signed
+    /// destination adapter. A legacy unsigned transport rejects this operation.
+    pub async fn destination_creation_receipt(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Option<DestinationCreationReceipt>, SdkError> {
+        match self.call(Syscall::GetDestinationCreationReceipt { agent_id: agent_id.into() }).await? {
+            SyscallReply::DestinationCreationReceipt { receipt } => Ok(receipt.map(|receipt| *receipt)),
+            other => Err(unexpected("DestinationCreationReceipt", &other)),
+        }
+    }
+
     /// Commit one independently signed identity transition. The caller keeps
     /// stable operation IDs and retains indeterminate outcomes for reconciliation.
     pub async fn submit_agent_identity_transition_with_signer(
@@ -4073,6 +4085,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::ListClusterAgentOwnerships { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }
             | Syscall::GetClusterAgentIdentity { .. }
+            | Syscall::GetDestinationCreationReceipt { .. }
             | Syscall::ListClusterAgentIdentities { .. }
             | Syscall::GetAgentMutationFence { .. }
             | Syscall::ListAgentMutationFenceAudit { .. }

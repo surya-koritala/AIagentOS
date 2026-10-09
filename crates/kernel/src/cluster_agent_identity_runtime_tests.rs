@@ -72,9 +72,13 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
         .collect::<Vec<_>>();
     let directory = TempDir::new().unwrap();
     let contexts = (1..=3)
-        .map(|node| if node == 1 {
-            Arc::new(SqliteContextManager::new(&directory.path().join("node-1.db")).unwrap())
-        } else { context(&directory, node) })
+        .map(|node| {
+            if node == 1 {
+                Arc::new(SqliteContextManager::new(&directory.path().join("node-1.db")).unwrap())
+            } else {
+                context(&directory, node)
+            }
+        })
         .collect::<Vec<_>>();
     {
         let connection = contexts[0].locked_conn();
@@ -207,10 +211,15 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
         proposed_at: chrono::Utc::now(),
     };
     let first_signed = tenant_identity_command(prepare.clone(), &principal, &key);
-    let second_signed = tenant_identity_command(prepare.clone(), &principal, &key);
+    let other_source = (source + 1) % 3;
+    let mut other_prepare = prepare.clone();
+    if let AuthorityCommand::PrepareAgentIdentity { actor, .. } = &mut other_prepare {
+        *actor = authority_system_actor(&peers[other_source].application_node_id);
+    }
+    let second_signed = tenant_identity_command(other_prepare, &principal, &key);
     let (first, second) = tokio::join!(
         identity_commit(&runtimes, &peers, source, first_signed),
-        identity_commit(&runtimes, &peers, source, second_signed)
+        identity_commit(&runtimes, &peers, other_source, second_signed)
     );
     let (identity, allocation_log, first_replay) = updated_identity(first.unwrap());
     let (duplicate, _, second_replay) = updated_identity(second.unwrap());
@@ -270,6 +279,8 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
         .unwrap(),
         DestinationCreationAdmission::Create
     );
+    let backup_root = directory.path().join("identity-backups");
+    contexts[0].create_backup(&backup_root, "prepared").unwrap();
     kernel
         .create_agent_for_tenant_with_id(
             &tenant,
@@ -397,7 +408,6 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
     );
     assert!(replayed);
 
-    let backup_root = directory.path().join("identity-backups");
     contexts[0]
         .create_backup(&backup_root, "published")
         .unwrap();
@@ -533,6 +543,17 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
         deleted
     );
     assert!(!crate::cluster_agent_identity::destination_agent_is_published(&stale, agent).unwrap());
+    let prepared_path = directory.path().join("prepared-restore.sqlite");
+    crate::storage::restore_backup(&backup_root.join("prepared"), &prepared_path).unwrap();
+    let prepared_restore = Arc::new(SqliteContextManager::new(&prepared_path).unwrap());
+    let (_, mut prepared_state) = open_cluster_raft_storage(prepared_restore.clone()).unwrap();
+    let mut latest_builder = current.get_snapshot_builder().await;
+    let latest_snapshot = latest_builder.build_snapshot().await.unwrap();
+    prepared_state.install_snapshot(&latest_snapshot.meta, latest_snapshot.snapshot).await.unwrap();
+    assert_eq!(read_initialized_authority_view(&prepared_restore).unwrap().agent_identities[&agent.to_string()], deleted);
+    assert!(prepared_restore.agent_tenant(agent).unwrap().is_none());
+    assert!(!crate::cluster_agent_identity::destination_agent_is_published(&prepared_restore, agent).unwrap());
+    crate::cluster_agent_identity::verify_destination_identity_erasure(&prepared_restore, &deleted).unwrap();
 
     // A minority cannot make a newly allocated identity visible or return a
     // successful publication. The interrupted operation remains indeterminate.
@@ -560,6 +581,9 @@ async fn immutable_identity_real_majority_duplicate_failover_receipt_migration_a
     for runtime in runtimes.into_iter().flatten() {
         runtime.shutdown().await.unwrap();
     }
+    drop(latest_builder);
+    drop(prepared_state);
+    drop(prepared_restore);
     drop(builder);
     drop(incoming);
     drop(current);

@@ -166,6 +166,9 @@ impl SignedNodeCapacity {
         if member.updated_at > self.observed_at || self.control.updated_at > self.observed_at {
             return Err(CapacityRejection::Generation);
         }
+        if self.control.identity.created_at > self.observed_at {
+            return Err(CapacityRejection::Generation);
+        }
         if self.observed_at > at {
             return Err(CapacityRejection::Future);
         }

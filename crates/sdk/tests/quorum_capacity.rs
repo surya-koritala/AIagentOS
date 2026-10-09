@@ -185,6 +185,8 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         let mut placement = ClusterClient::connect_authenticated(&addresses.iter().map(ToString::to_string).collect::<Vec<_>>(), TOKEN).await.unwrap();
         let fresh = placement.create_agent("fresh signed placement", "capacity fixture", None, None, None, Placement::LeastLoaded).await.unwrap();
         assert!(kernels.iter().any(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id));
+        let owner = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == fresh.node_id).unwrap();
+        clients[owner].pause_agent(&fresh.agent_id).await.unwrap();
         // No reporters run here. A new any-member quorum barrier must advance time
         // independently; the client's clock is never consulted for eligibility.
         tokio::time::sleep(Duration::from_secs(16)).await;
@@ -208,6 +210,23 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
         let active = placement.create_agent("automatic capacity", "capacity fixture", None, None, None, Placement::LeastLoaded).await.unwrap();
         assert!(kernels.iter().any(|kernel| kernel.cluster_control.identity().node_id == active.node_id));
         for publisher in publishers { publisher.shutdown().await; }
+        // A later exact sample includes actual lifecycle changes and every
+        // production counter, rather than accepting only the zero-load shape.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for (kernel, runtime) in kernels.iter().zip(&runtimes) { assert!(matches!(runtime.authority_handle().publish_kernel_capacity(kernel).await.unwrap(), kernel::cluster_consensus::AuthorityResponse::NodeCapacityReported { .. })); }
+        let loaded = clients[2].cluster_capacity().await.unwrap();
+        for capacity in &loaded.reports {
+            let kernel = kernels.iter().find(|kernel| kernel.cluster_control.identity().node_id == capacity.report.node_id).unwrap();
+            let actual = kernel::metrics::MetricsSnapshot::collect(kernel);
+            let c = &capacity.report.counters;
+            assert_eq!(c.agent_count, actual.agent_count); assert_eq!(c.running_agents, actual.running_agents);
+            assert_eq!(c.live_agents, actual.live_agents); assert_eq!(c.queued_agents, actual.queued_agents);
+            assert_eq!(c.paused_agents, actual.paused_agents); assert_eq!(c.stopped_agents, actual.stopped_agents);
+            assert_eq!(c.active_turns, actual.active_turns); assert_eq!(c.waiting_turns, actual.waiting_turns);
+            assert_eq!(c.turn_capacity, actual.turn_capacity); assert_eq!(c.llm_requests_in_flight, actual.llm_requests_in_flight);
+            assert_eq!(c.llm_requests_waiting, actual.llm_requests_waiting); assert_eq!(c.llm_core_capacity, actual.llm_core_capacity);
+        }
+        assert!(loaded.reports.iter().any(|capacity| capacity.report.counters.paused_agents > 0));
         for agent in [&fresh, &active] {
             let owner = kernels.iter().position(|kernel| kernel.cluster_control.identity().node_id == agent.node_id).unwrap();
             clients[owner].stop_agent(&agent.agent_id).await.unwrap();

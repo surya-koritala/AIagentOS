@@ -58,6 +58,7 @@ jobs:
         run: |
           cargo test -p kernel --lib --locked cluster_capacity::tests -- --nocapture
           cargo test -p kernel --lib --locked signed_capacity_projection_is_bounded -- --nocapture
+          cargo test -p kernel --lib --locked capacity_churn_reclaims_only_retired_epochs -- --nocapture
       - name: Exercise actual SDK compatibility and quorum placement
         run: |
           cargo test -p agent-sdk --test cluster_capacity --locked -- --nocapture

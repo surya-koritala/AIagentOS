@@ -2103,6 +2103,7 @@ impl KernelClient {
     ) -> Result<NodeControlStatus, SdkError> {
         match self
             .call(Syscall::SetNodeAvailability {
+                operation_id: None,
                 availability,
                 expected_generation,
                 reason: reason.into(),
@@ -2122,6 +2123,7 @@ impl KernelClient {
     ) -> Result<NodeControlStatus, SdkError> {
         match self
             .call(Syscall::SetNodeProfile {
+                operation_id: None,
                 profile,
                 expected_generation,
                 reason: reason.into(),

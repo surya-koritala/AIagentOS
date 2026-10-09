@@ -36,6 +36,10 @@ jobs:
             cargo fmt --all
             git diff --binary > target/qualification/format/rustfmt.patch
           fi
+          if test -f crates/kernel/src/cluster_principal_tests.rs && ! rustfmt --edition 2021 --check crates/kernel/src/cluster_principal_tests.rs; then
+            rustfmt --edition 2021 crates/kernel/src/cluster_principal_tests.rs
+            git diff --binary > target/qualification/format/rustfmt.patch
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

@@ -302,7 +302,11 @@ impl SandboxManagerImpl {
             if namespace.legacy_retained(&config.workspace_dir, agent)? {
                 return Ok(false);
             }
-            return Err(SandboxError::BoundaryViolation("legacy or restored workspace ownership is unresolved; preserve the bytes and explicitly retain it as an operator workspace before admission".into()));
+            return Err(SandboxError::OwnershipResolutionRequired(if legacy {
+                crate::WorkspaceOwnershipKind::LegacyNamespace
+            } else {
+                crate::WorkspaceOwnershipKind::ForeignDatastore
+            }));
         }
         Ok(false)
     }

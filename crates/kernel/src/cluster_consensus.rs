@@ -1756,6 +1756,7 @@ fn validate_store(context: &SqliteContextManager) -> ClusterStorageResult<()> {
         .conn
         .lock()
         .map_err(|error| StorageIOError::read(read_io(format!("lock Raft store: {error}"))))?;
+    crate::schema::verify(&connection).map_err(|error| StorageIOError::read_state_machine(read_io(error.to_string())))?;
     let state = load_persistent_state(&connection).map_err(StorageIOError::read_state_machine)?;
     let _: Option<Vote<ClusterRaftNodeId>> =
         read_meta(&connection, "vote").map_err(StorageIOError::read_vote)?;
@@ -4249,6 +4250,7 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
             .map_err(|error| StorageIOError::write_state_machine(read_io(error.to_string())))?;
         let mut state =
             load_persistent_state(&transaction).map_err(StorageIOError::read_state_machine)?;
+        crate::schema::verify(&transaction).map_err(|error| StorageIOError::write_state_machine(read_io(error.to_string())))?;
         if let (Some(previous), Some(first)) = (state.last_applied, entries.first()) {
             if first.log_id.index <= previous.index {
                 return Err(StorageIOError::write_state_machine(read_io(format!(
@@ -4335,6 +4337,7 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
         let transaction = connection.transaction().map_err(|error| {
             StorageIOError::write_snapshot(Some(meta.signature()), read_io(error.to_string()))
         })?;
+        crate::schema::verify(&transaction).map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), read_io(error.to_string())))?;
         let current =
             load_persistent_state(&transaction).map_err(StorageIOError::read_state_machine)?;
         let continuity = (|| {

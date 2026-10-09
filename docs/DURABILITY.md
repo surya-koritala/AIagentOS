@@ -642,11 +642,40 @@ The recovery command requires an existing configuration with an absolute
 `data_dir`, derives `agent_os.db` and its independently retained storage key
 from that configuration, and always requires the external public trust file
 and exact recovery anchor.
-After authenticated restore, it boots the complete configured kernel, including
-budget reconstruction and service recovery, and verifies every persisted agent
-is present in the live enforcing registry. The previous database remains the
-rollback target until that qualification succeeds. A failed qualification
-removes a fresh-host destination or atomically restores the previous database.
+After authenticated restore, qualification reconstructs configured budgets,
+authentication and agent enforcement under the exclusive database lease. It
+validates the configured service directory without retiring stored service peers
+omitted from the current configuration. Malformed lifecycle/configuration,
+invalid current-store ownership manifests, unsafe paths/owners and other
+enforcement failures remove a fresh-host destination or atomically roll back the
+previous database.
+
+Only a recognized legacy or foreign-store workspace ambiguity may remain pending.
+The verified database and original recorded agent identities, states and paths
+are preserved; no workspace is adopted, deleted or replaced with an empty one.
+The version-1 report then returns `qualification = "workspace_resolution_required"`,
+`enforcement_rearmed = false` and a bounded `workspace_resolution` inventory with
+typed reasons. Exit code zero confirms database restoration, not completed agent
+enforcement. New report readers reject missing qualification fields or unsupported
+qualification versions rather than defaulting them to ready.
+
+Restore any separately retained workspace files at the recorded path, inspect
+the unresolved UUIDs locally, and explicitly retain each verified association:
+
+```sh
+agentctl workspace-ownership /etc/agentos/config.toml list
+agentctl workspace-ownership /etc/agentos/config.toml retain AGENT_UUID --confirm-offline
+agentctl workspace-ownership /etc/agentos/config.toml list
+agentctl backup-recovery-qualify /etc/agentos/config.toml --confirm-offline
+```
+
+The last command starts a new leased qualification and re-arms every admitted
+active agent's actual sandbox and syscall gate. Only
+`qualification = "enforcement_rearmed"` with `enforcement_rearmed = true` and an
+empty pending inventory confirms completion. Stored service ownership/history
+and source workspace/control bytes remain intact throughout resolution.
+Corruption recovery keeps its original database and SQLite sidecars in the
+reported private quarantine even when workspace resolution remains pending.
 
 The confirmation flag makes the destructive intent explicit; it does not
 bypass the storage lease. If any kernel still owns the destination, recovery

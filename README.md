@@ -316,8 +316,16 @@ the destination. Keep each anchor outside its backup directory and failure
 domain. The CLI rejects direct co-location, but filesystem paths alone cannot
 prove independent or immutable custody.
 
-The command keeps the old database as rollback until the restored configuration
-boots the full kernel and every persisted agent is re-admitted to enforcement.
+The command verifies the authenticated database and separately reports enforcement
+readiness. A copied database may require explicit resolution of its recorded
+workspace ownership. `qualification = "workspace_resolution_required"` means the
+database is restored with `enforcement_rearmed = false`; exit code zero does not
+mean that every agent is ready. Inspect `workspace-ownership CONFIG_FILE list`,
+retain each verified recorded UUID with `--confirm-offline`, restart the local
+maintenance flow, and run `backup-recovery-qualify CONFIG_FILE --confirm-offline`.
+Other configuration, key, ownership-integrity or enforcement failures still roll
+back. See [workspace ownership](docs/WORKSPACE_OWNERSHIP.md) for the resolution
+boundary.
 
 For off-host retention, publish that signed, anchor-bound backup to a versioned
 S3-compatible Object Lock bucket and later fetch the exact locked versions using

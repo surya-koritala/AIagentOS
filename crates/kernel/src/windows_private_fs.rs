@@ -445,6 +445,85 @@ pub(crate) fn check_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Read-only eligibility check for a recorded workspace. Does not narrow its
+/// ACL or take ownership; exact TokenUser/TokenOwner eligibility is unchanged.
+pub(crate) fn check_directory_owner(path: &Path) -> io::Result<()> {
+    let directory = open(path, true, READ_CONTROL)?;
+    owner_and_acl(&directory, &UserSid::current()?, false)
+}
+
+#[cfg(test)]
+pub(crate) fn set_system_directory_owner_for_recovery_test(path: &Path) -> io::Result<()> {
+    assert_eq!(
+        std::env::var("AIAGENTOS_RECOVERY_FOREIGN_OWNER_CHILD")
+            .ok()
+            .as_deref(),
+        Some("1")
+    );
+    use windows_sys::Win32::Foundation::{GetLastError, LUID};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, CreateWellKnownSid, LookupPrivilegeValueW, WinLocalSystemSid,
+        LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    };
+    use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+    let mut token = null_mut();
+    let mut luid = unsafe { zeroed::<LUID>() };
+    let privilege: Vec<u16> = "SeRestorePrivilege\0".encode_utf16().collect();
+    unsafe {
+        bool_result(OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+            &mut token,
+        ))?;
+        bool_result(LookupPrivilegeValueW(null(), privilege.as_ptr(), &mut luid))?;
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    unsafe {
+        bool_result(AdjustTokenPrivileges(
+            token.as_raw_handle(),
+            0,
+            &privileges,
+            0,
+            null_mut(),
+            null_mut(),
+        ))?;
+        if GetLastError() == 1300 {
+            return Err(io::Error::from_raw_os_error(1300));
+        }
+    }
+    let directory = open(path, true, READ_CONTROL | WRITE_OWNER)?;
+    let mut system = [0_usize; 16];
+    let mut bytes = std::mem::size_of_val(&system) as u32;
+    unsafe {
+        bool_result(CreateWellKnownSid(
+            WinLocalSystemSid,
+            null_mut(),
+            system.as_mut_ptr().cast(),
+            &mut bytes,
+        ))?;
+        let result = SetSecurityInfo(
+            directory.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            system.as_mut_ptr().cast(),
+            null_mut(),
+            null(),
+            null(),
+        );
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn protect_path(path: &Path, directory: bool) -> io::Result<()> {
     #[cfg(test)]
     if directory {

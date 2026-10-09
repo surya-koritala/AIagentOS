@@ -757,6 +757,16 @@ pub enum Syscall {
     SubmitSignedAuthorityCommand {
         command: Box<crate::cluster_consensus::AuthorityCommand>,
     },
+    /// Independently signed TransportAdmin proposal; the inner command must
+    /// be ProposeClusterVoterChange and binds the exact prior membership.
+    ProposeClusterVoterChange {
+        command: Box<crate::cluster_consensus::AuthorityCommand>,
+    },
+    /// Independently signed TransportAdmin complete-catalog proposal.
+    ProposeClusterTrustChange {
+        command: Box<crate::cluster_consensus::AuthorityCommand>,
+    },
+    GetClusterReconfigurationStatus,
     /// Public-key registry is global operator metadata, never tenant discovery.
     GetAuthorityPrincipalRegistry,
     IssueClusterJoinChallenge {
@@ -1615,6 +1625,9 @@ pub enum SyscallReply {
     AuthorityCommandCommitted {
         response: crate::cluster_consensus::AuthorityResponse,
     },
+    ClusterReconfigurationStatus {
+        status: crate::cluster_reconfiguration::ClusterReconfigurationStatus,
+    },
     AuthorityPrincipalRegistry {
         principals: Vec<crate::cluster_principal::AuthorityPrincipal>,
     },
@@ -1766,7 +1779,9 @@ impl std::fmt::Debug for Syscall {
             Self::LoadPackage { .. } => &["manifest_toml"],
             Self::PublishPackage { .. } => &["archive_hex"],
             Self::FencedAgentMutation { .. } => &["mutation"],
-            Self::SubmitSignedAuthorityCommand { .. } => &["command"],
+            Self::SubmitSignedAuthorityCommand { .. }
+            | Self::ProposeClusterVoterChange { .. }
+            | Self::ProposeClusterTrustChange { .. } => &["command"],
             _ => &[],
         };
         redact_debug_fields(&mut value, fields);
@@ -1835,6 +1850,10 @@ fn role_allows(role: Role, required: AccessLevel) -> bool {
 
 fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
     match call {
+        Syscall::ProposeClusterVoterChange { .. } => (AccessLevel::System, "cluster.voters.change", None),
+        Syscall::ProposeClusterTrustChange { .. } => (AccessLevel::System, "cluster.trust.change", None),
+        Syscall::GetClusterReconfigurationStatus => (AccessLevel::System, "cluster.reconfiguration.status", None),
+        Syscall::SubmitSignedAuthorityCommand { command } if crate::cluster_principal::authority_command_class(command) == Ok(crate::cluster_principal::AuthorityCommandClass::TransportAdmin) => (AccessLevel::System, "cluster.transport.change", None),
         Syscall::SubmitSignedAuthorityCommand { .. } => {
             (AccessLevel::User, "cluster.principal.submit", None)
         }
@@ -2344,7 +2363,15 @@ async fn authorize(
 ) -> Result<(), SyscallReply> {
     // This precedes trusted-system shortcuts and local operation-receipt
     // lookup. A cached response never substitutes for current key authority.
-    if let Syscall::SubmitSignedAuthorityCommand { command } = call {
+    if let Syscall::SubmitSignedAuthorityCommand { command }
+        | Syscall::ProposeClusterVoterChange { command }
+        | Syscall::ProposeClusterTrustChange { command } = call {
+        let inner = crate::cluster_principal::unsigned_authority_command(command).map_err(principal_proof_error)?;
+        if (matches!(call, Syscall::ProposeClusterVoterChange { .. }) && !matches!(inner, AuthorityCommand::ProposeClusterVoterChange { .. }))
+            || (matches!(call, Syscall::ProposeClusterTrustChange { .. }) && !matches!(inner, AuthorityCommand::ProposeClusterTrustChange { .. }))
+        {
+            return Err(principal_proof_error(crate::cluster_principal::PrincipalProofError::WrongCommandClass));
+        }
         let authority = configured_cluster_authority(kernel)
             .map_err(authority_io_error)?
             .ok_or_else(|| {
@@ -2671,6 +2698,9 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::ListNodeControlAudit { .. }
             | Syscall::SubmitSignedAuthorityCommand { .. }
             | Syscall::GetAuthorityPrincipalRegistry
+            | Syscall::ProposeClusterVoterChange { .. }
+            | Syscall::ProposeClusterTrustChange { .. }
+            | Syscall::GetClusterReconfigurationStatus
             | Syscall::IssueClusterJoinChallenge { .. }
             | Syscall::RegisterClusterMember { .. }
             | Syscall::PrepareClusterMemberCertificateRollout { .. }
@@ -4838,7 +4868,9 @@ async fn dispatch_scoped_inner_with_fence(
                 message: error.to_string(),
             },
         },
-        Syscall::SubmitSignedAuthorityCommand { command } => {
+        Syscall::SubmitSignedAuthorityCommand { command }
+        | Syscall::ProposeClusterVoterChange { command }
+        | Syscall::ProposeClusterTrustChange { command } => {
             let authority = match configured_cluster_authority(kernel) {
                 Ok(Some(authority)) => authority,
                 Ok(None) => {
@@ -4870,6 +4902,17 @@ async fn dispatch_scoped_inner_with_fence(
                 Ok(view) => SyscallReply::AuthorityPrincipalRegistry {
                     principals: view.principals.into_values().collect(),
                 },
+                Err(error) => authority_io_error(error),
+            }
+        }
+        Syscall::GetClusterReconfigurationStatus => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(Some(authority)) => authority,
+                Ok(None) => return SyscallReply::TypedError { code: WireErrorCode::Unsupported, message: "live cluster runtime is unavailable".into(), retryable: false },
+                Err(error) => return authority_io_error(error),
+            };
+            match authority.reconfiguration_status().await {
+                Ok(status) => SyscallReply::ClusterReconfigurationStatus { status },
                 Err(error) => authority_io_error(error),
             }
         }
@@ -7420,6 +7463,12 @@ impl SyscallServer {
                             Syscall::SendMessageStream { .. }
                                 | Syscall::SubmitSignedAuthorityCommand { .. }
                                 | Syscall::GetAuthorityPrincipalRegistry
+                                | Syscall::ProposeClusterVoterChange { .. }
+                                | Syscall::ProposeClusterTrustChange { .. }
+                                | Syscall::GetClusterReconfigurationStatus
+            | Syscall::ProposeClusterVoterChange { .. }
+            | Syscall::ProposeClusterTrustChange { .. }
+            | Syscall::GetClusterReconfigurationStatus
                                 | Syscall::ListProviderModels { .. }
                                 | Syscall::SendMessageContent { .. }
                                 | Syscall::SendMessageContentStream { .. }
@@ -7801,6 +7850,7 @@ mod tests {
             ownerships: vec![ownership],
             ownership_audit: Vec::new(),
             logical_time: now,
+            reconfiguration_plan: None,
         };
         verify_quorum_destination_authority_view(
             &view,

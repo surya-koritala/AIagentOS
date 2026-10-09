@@ -6,6 +6,11 @@ on:
     paths:
       - 'crates/kernel/src/cluster*.rs'
       - 'crates/kernel/src/lib.rs'
+      - 'crates/kernel/src/schema.rs'
+      - 'crates/kernel/src/syscall_server.rs'
+      - 'crates/kernel/src/wire_contract.rs'
+      - 'crates/sdk/src/**'
+      - 'protocol/**'
       - '.github/workflows/live-cluster-reconfiguration.yml'
   workflow_dispatch:
 
@@ -58,7 +63,7 @@ jobs:
           save-if: false
       - name: Compile all kernel targets before native qualification
         timeout-minutes: 15
-        run: cargo check -p kernel --all-targets --locked
+        run: cargo check -p kernel -p agent-sdk --all-targets --locked
       - name: Check exact generation and provisioned-root validation
         timeout-minutes: 5
         run: cargo test -p kernel --lib --locked cluster_reconfiguration::tests -- --nocapture

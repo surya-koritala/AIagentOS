@@ -22,6 +22,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "agent_gate_statistics",
     "authorized_cluster_membership",
     "cluster_principal_auth",
+    "live_cluster_reconfiguration",
     crate::cluster_operation_receipts::FEATURE,
     "bounded_certificate_rollout",
     "cluster_ownership_leases",
@@ -713,6 +714,9 @@ const REQUEST_VARIANTS: &[Variant] = &[
         tag: "get_authority_principal_registry",
         fields: &[],
     },
+    Variant { tag: "propose_cluster_voter_change", fields: &[Field::required("command", O)] },
+    Variant { tag: "propose_cluster_trust_change", fields: &[Field::required("command", O)] },
+    Variant { tag: "get_cluster_reconfiguration_status", fields: &[] },
     Variant {
         tag: "register_cluster_member",
         fields: &[
@@ -980,6 +984,9 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     "send_message_stream"
                         | "submit_signed_authority_command"
                         | "get_authority_principal_registry"
+                        | "propose_cluster_voter_change"
+                        | "propose_cluster_trust_change"
+                        | "get_cluster_reconfiguration_status"
                         | "list_provider_models"
                         | "send_message_content"
                         | "send_message_content_stream"
@@ -1941,7 +1948,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 133);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 136);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

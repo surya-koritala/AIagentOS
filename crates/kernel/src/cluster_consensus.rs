@@ -233,6 +233,27 @@ pub enum AuthorityCommand {
         reason: String,
         proposed_at: DateTime<Utc>,
     },
+    ProposeClusterVoterChange {
+        operation_id: String,
+        prior: crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+        target_voter_ids: BTreeSet<ClusterRaftNodeId>,
+        expected_generation: u64,
+        target_generation: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    ProposeClusterTrustChange {
+        operation_id: String,
+        prior: crate::cluster_reconfiguration::ClusterReconfigurationTarget,
+        target_catalog: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+        expected_generation: u64,
+        target_generation: u64,
+        overlap_not_after: Option<DateTime<Utc>>,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
     ClaimOwnership {
         operation_id: String,
         agent_id: String,
@@ -279,6 +300,8 @@ impl AuthorityCommand {
             | Self::AbortMemberCertificateRollout { operation_id, .. }
             | Self::FinalizeMemberCertificateRollout { operation_id, .. }
             | Self::SetMemberState { operation_id, .. }
+            | Self::ProposeClusterVoterChange { operation_id, .. }
+            | Self::ProposeClusterTrustChange { operation_id, .. }
             | Self::ClaimOwnership { operation_id, .. }
             | Self::RenewOwnership { operation_id, .. }
             | Self::ReleaseOwnership { operation_id, .. } => operation_id,
@@ -366,6 +389,13 @@ pub enum AuthorityResponse {
         log_id: LogId<ClusterRaftNodeId>,
         replayed: bool,
     },
+    ReconfigurationPrepared {
+        operation_id: String,
+        plan: Box<crate::cluster_reconfiguration::ClusterReconfigurationPlan>,
+        sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+        replayed: bool,
+    },
     /// The command was committed by Raft but rejected by deterministic
     /// application validation.
     Rejected {
@@ -436,6 +466,8 @@ struct ReplicatedControlPlaneState {
     ownerships: BTreeMap<String, ClusterAgentOwnership>,
     ownership_audit: Vec<ClusterAgentOwnershipAudit>,
     logical_time: DateTime<Utc>,
+    #[serde(default)]
+    reconfiguration_plans: Vec<crate::cluster_reconfiguration::ClusterReconfigurationPlan>,
 }
 
 type MembershipRevisionEvidence = (ClusterMemberState, Option<String>, DateTime<Utc>);
@@ -462,6 +494,7 @@ pub struct ReplicatedAuthorityView {
     pub ownerships: Vec<ClusterAgentOwnership>,
     pub ownership_audit: Vec<ClusterAgentOwnershipAudit>,
     pub logical_time: DateTime<Utc>,
+    pub reconfiguration_plan: Option<crate::cluster_reconfiguration::ClusterReconfigurationPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +627,15 @@ pub(crate) fn read_cluster_raft_membership(
     Ok(state.membership)
 }
 
+pub(crate) fn read_cluster_reconfiguration(
+    context: &SqliteContextManager,
+) -> io::Result<(StoredMembership<ClusterRaftNodeId, ClusterRaftNode>, Option<crate::cluster_reconfiguration::ClusterReconfigurationPlan>)> {
+    let connection = context.conn.lock().map_err(|error| io::Error::other(format!("lock live reconfiguration projection: {error}")))?;
+    let state = load_persistent_state(&connection).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let plan = state.authority.control_plane.and_then(|control| control.reconfiguration_plans.last().cloned());
+    Ok((state.membership, plan))
+}
+
 /// Read the locally applied replicated control-plane projection.
 ///
 /// Callers serving external reads must first complete
@@ -629,6 +671,7 @@ pub fn read_replicated_authority_view(
         ownerships: control.ownerships.into_values().collect(),
         ownership_audit: control.ownership_audit,
         logical_time: control.logical_time,
+        reconfiguration_plan: control.reconfiguration_plans.last().cloned(),
     }))
 }
 
@@ -805,6 +848,29 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
     }
     if let Some(control) = &state.control_plane {
         validate_control_plane_state(control)?;
+        if control.reconfiguration_plans.len() > 64 {
+            return Err(read_io("retained live reconfiguration plan capacity exceeded"));
+        }
+        let mut plan_ids = BTreeSet::new();
+        for plan in &control.reconfiguration_plans {
+            if !plan_ids.insert(&plan.operation_id) || plan.proposed_at > control.logical_time {
+                return Err(read_io("live reconfiguration audit identity or clock is invalid"));
+            }
+            let receipt = state.receipts.get(&plan.operation_id).ok_or_else(|| read_io("live reconfiguration plan has no committed receipt"))?;
+            if !matches!(&receipt.response, AuthorityResponse::ReconfigurationPrepared { plan: retained, .. } if retained.as_ref() == plan) {
+                return Err(read_io("live reconfiguration plan differs from its committed receipt"));
+            }
+            let prior = match crate::cluster_principal::unsigned_authority_command(&receipt.command).map_err(|error| read_io(error.to_string()))? {
+                AuthorityCommand::ProposeClusterVoterChange { prior, .. }
+                | AuthorityCommand::ProposeClusterTrustChange { prior, .. } => prior,
+                _ => return Err(read_io("live reconfiguration plan has the wrong committed command")),
+            };
+            if prior != &plan.prior {
+                return Err(read_io("live reconfiguration prior differs from its caller-signed baseline"));
+            }
+            plan.prior.validate(plan.proposed_at).map_err(|error| read_io(error.to_string()))?;
+            plan.target.validate(plan.proposed_at).map_err(|error| read_io(error.to_string()))?;
+        }
         for receipt in state.receipts.values() {
             let AuthorityCommand::Authorized {
                 principal_proof, ..
@@ -870,6 +936,7 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
                             && audit.actor == expected_actor
                     })
                 }
+                AuthorityResponse::ReconfigurationPrepared { plan, .. } => control.reconfiguration_plans.iter().any(|row| row == plan.as_ref() && row.actor == expected_actor),
                 AuthorityResponse::JoinChallengeIssued { .. } => true,
                 _ => false,
             };
@@ -895,7 +962,12 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
                         .ok_or_else(|| read_io("signed receipt has no committed clock evidence"))?;
                     crate::cluster_principal::set_committed_command_time(&mut command, at);
                 }
-                let actual = apply_authority_command(&mut replayed, command, log_id);
+                let historical_membership = match crate::cluster_principal::unsigned_authority_command(&command).map_err(|error| read_io(error.to_string()))? {
+                    AuthorityCommand::ProposeClusterVoterChange { prior, .. }
+                    | AuthorityCommand::ProposeClusterTrustChange { prior, .. } => Some(StoredMembership::new(Some(log_id), openraft::Membership::new(vec![prior.voter_ids.clone()], prior.catalog.clone()))),
+                    _ => None,
+                };
+                let actual = apply_authority_command_with_membership(&mut replayed, command, log_id, historical_membership.as_ref());
                 if actual != receipt.response {
                     return Err(read_io(
                         "principal history does not reproduce its committed response",
@@ -1009,6 +1081,9 @@ fn response_matches_command(command: &AuthorityCommand, response: &AuthorityResp
                 | AuthorityCommand::AbortMemberCertificateRollout { .. }
                 | AuthorityCommand::FinalizeMemberCertificateRollout { .. },
             AuthorityResponse::CertificateRolloutUpdated { .. }
+        ) | (
+            AuthorityCommand::ProposeClusterVoterChange { .. } | AuthorityCommand::ProposeClusterTrustChange { .. },
+            AuthorityResponse::ReconfigurationPrepared { .. }
         ) | (
             AuthorityCommand::ClaimOwnership { .. }
                 | AuthorityCommand::RenewOwnership { .. }
@@ -2224,6 +2299,15 @@ fn apply_authority_command(
     command: AuthorityCommand,
     log_id: LogId<ClusterRaftNodeId>,
 ) -> AuthorityResponse {
+    apply_authority_command_with_membership(state, command, log_id, None)
+}
+
+fn apply_authority_command_with_membership(
+    state: &mut AuthorityState,
+    command: AuthorityCommand,
+    log_id: LogId<ClusterRaftNodeId>,
+    membership: Option<&StoredMembership<ClusterRaftNodeId, ClusterRaftNode>>,
+) -> AuthorityResponse {
     let supplied_id = command.operation_id();
     let Some(canonical_id) = canonical_operation_id(supplied_id) else {
         return rejected(
@@ -2368,7 +2452,7 @@ fn apply_authority_command(
     if let Some(principal) = &verified {
         crate::cluster_principal::set_verified_audit_actor(&mut effective, &principal.principal_id);
     }
-    let response = match apply_new_authority_command(state, &effective, sequence, log_id) {
+    let response = match apply_new_authority_command(state, &effective, sequence, log_id, membership) {
         Ok(response) => response,
         Err((reason, message)) => {
             return rejected(canonical_id, state.sequence, log_id, reason, message)
@@ -2532,6 +2616,9 @@ fn replay_response(response: &AuthorityResponse) -> AuthorityResponse {
             log_id: *log_id,
             replayed: true,
         },
+        AuthorityResponse::ReconfigurationPrepared { operation_id, plan, sequence, log_id, .. } => AuthorityResponse::ReconfigurationPrepared {
+            operation_id: operation_id.clone(), plan: plan.clone(), sequence: *sequence, log_id: *log_id, replayed: true,
+        },
         AuthorityResponse::MetadataApplied { .. }
         | AuthorityResponse::AuthorityTimeAdvanced { .. }
         | AuthorityResponse::Rejected { .. } => {
@@ -2545,10 +2632,44 @@ fn apply_new_authority_command(
     command: &AuthorityCommand,
     sequence: u64,
     log_id: LogId<ClusterRaftNodeId>,
+    membership: Option<&StoredMembership<ClusterRaftNodeId, ClusterRaftNode>>,
 ) -> Result<AuthorityResponse, (AuthorityRejection, String)> {
     let operation_id = command.operation_id().to_owned();
     let authority_term = log_id.leader_id.term;
     match command {
+        AuthorityCommand::ProposeClusterVoterChange { prior, actor, reason, proposed_at, .. }
+        | AuthorityCommand::ProposeClusterTrustChange { prior, actor, reason, proposed_at, .. } => {
+            validate_text(actor, "transport proposal actor").map_err(invalid_command)?;
+            validate_reason(reason).map_err(invalid_command)?;
+            let membership = membership.ok_or_else(|| invalid_command("live proposal has no applied membership evidence"))?;
+            let actual = crate::cluster_reconfiguration::ClusterReconfigurationTarget::from_membership(membership).map_err(invalid_command)?;
+            if &actual != prior || !prior.is_settled(membership) {
+                return Err((AuthorityRejection::Conflict, "live proposal prior membership differs from the current settled membership".into()));
+            }
+            let control = control_plane_mut(state)?;
+            if control.reconfiguration_plans.last().is_some_and(|plan| !plan.target.is_settled(membership)) {
+                return Err((AuthorityRejection::Conflict, "another voter or trust reconfiguration is in progress".into()));
+            }
+            if control.reconfiguration_plans.len() >= 64 {
+                return Err((AuthorityRejection::CapacityReached, "retained live reconfiguration plan capacity is exhausted".into()));
+            }
+            let at = (*proposed_at).max(control.logical_time.checked_add_signed(TimeDelta::microseconds(1)).ok_or_else(|| invalid_command("authority clock is exhausted"))?);
+            prior.validate(at).map_err(invalid_command)?;
+            let target = match command {
+                AuthorityCommand::ProposeClusterVoterChange { target_voter_ids, expected_generation, target_generation, .. } => crate::cluster_reconfiguration::prepare_voter_target(prior, target_voter_ids, *expected_generation, *target_generation, at),
+                AuthorityCommand::ProposeClusterTrustChange { target_catalog, expected_generation, target_generation, overlap_not_after, .. } => crate::cluster_reconfiguration::prepare_trust_target(prior, target_catalog, *expected_generation, *target_generation, *overlap_not_after, at),
+                _ => unreachable!("matched only live proposal variants"),
+            }.map_err(invalid_command)?;
+            crate::cluster_runtime::validate_live_membership_transition(membership, &target).map_err(invalid_command)?;
+            let plan = crate::cluster_reconfiguration::ClusterReconfigurationPlan {
+                operation_id: operation_id.clone(), prior: prior.clone(), target,
+                actor: actor.clone(), reason: reason.clone(), proposed_at: at,
+            };
+            // No clock or target change occurs until all bounded validation passes.
+            control.logical_time = at;
+            control.reconfiguration_plans.push(plan.clone());
+            Ok(AuthorityResponse::ReconfigurationPrepared { operation_id, plan: Box::new(plan), sequence, log_id, replayed: false })
+        }
         AuthorityCommand::Authorized { .. } => Err((
             AuthorityRejection::InvalidCommand,
             "nested principal envelope is invalid".into(),
@@ -3186,6 +3307,7 @@ fn validate_and_build_genesis(
         ownerships: BTreeMap::new(),
         ownership_audit: Vec::new(),
         logical_time: proposed_at,
+        reconfiguration_plans: Vec::new(),
     })
 }
 
@@ -4286,7 +4408,7 @@ impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
                             "initial principal genesis differs from the configured immutable seed",
                         )
                     } else {
-                        apply_authority_command(&mut state.authority, command, entry.log_id)
+                        apply_authority_command_with_membership(&mut state.authority, command, entry.log_id, Some(&state.membership))
                     }
                 }
             };

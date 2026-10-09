@@ -82,18 +82,18 @@ fn proof_rejection(response: &AuthorityResponse, expected: PrincipalProofError) 
 }
 
 #[tokio::test]
-async fn principal_history_requires_reader15_and_retains_real_receipt14_before_any_write() {
+async fn principal_history_requires_current_reader_and_retains_real_receipt14_before_any_write() {
     let (peer, _, context, mut state) = principal_fixture().await;
     {
         let connection = context.locked_conn();
         let metadata = crate::schema::read_storage_metadata(&connection).unwrap();
-        assert_eq!(metadata.schema_version, 15);
-        assert_eq!(metadata.min_reader_schema_version, 15);
+        assert_eq!(metadata.schema_version, crate::schema::CURRENT_SCHEMA_VERSION);
+        assert_eq!(metadata.min_reader_schema_version, crate::schema::MIN_READER_SCHEMA_VERSION);
         let migration: String = connection.query_row("SELECT name FROM schema_migrations WHERE version=14", [], |row| row.get(0)).unwrap();
         assert_eq!(migration, "retain-actor-bound-cluster-operation-receipts");
         let receipt_table: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='cluster_operation_receipts'", [], |row| row.get(0)).unwrap();
         assert_eq!(receipt_table, 1);
-        assert!(matches!(crate::schema::preflight_for_reader(&connection, 14), Err(crate::ContextError::DatabaseTooNew { found: 15, supported: 14 })));
+        assert!(matches!(crate::schema::preflight_for_reader(&connection, 14), Err(crate::ContextError::DatabaseTooNew { found, supported: 14 } if found == crate::schema::CURRENT_SCHEMA_VERSION)));
         connection.pragma_update(None, "user_version", 14).unwrap();
         connection.execute("UPDATE storage_meta SET schema_version=14,min_reader_schema_version=14", []).unwrap();
     }

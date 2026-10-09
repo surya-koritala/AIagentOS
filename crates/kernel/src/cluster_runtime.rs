@@ -103,6 +103,8 @@ fn authority_command_actor(command: &AuthorityCommand) -> Option<&str> {
     match command {
         AuthorityCommand::EnrollPrincipal { actor, .. }
         | AuthorityCommand::RevokePrincipal { actor, .. }
+        | AuthorityCommand::ProposeClusterVoterChange { actor, .. }
+        | AuthorityCommand::ProposeClusterTrustChange { actor, .. }
         | AuthorityCommand::RegisterMember { actor, .. }
         | AuthorityCommand::PrepareMemberCertificateRollout { actor, .. }
         | AuthorityCommand::AbortMemberCertificateRollout { actor, .. }
@@ -1710,6 +1712,43 @@ impl RpcRequest {
 }
 
 #[derive(Clone)]
+struct LiveTransportCatalog {
+    context: Arc<SqliteContextManager>,
+    provisioned_peer_ca_sha256: Option<Vec<String>>,
+    local_node_id: ClusterRaftNodeId,
+    local_server_sha256: String,
+    local_client_sha256: String,
+}
+
+impl LiveTransportCatalog {
+    fn check_target(&self, target: &crate::cluster_reconfiguration::ClusterReconfigurationTarget) -> io::Result<()> {
+        let roots = self.provisioned_peer_ca_sha256.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "live trust requires provisioned PEM root material"))?;
+        if target.catalog.values().any(|node| &node.transport_peer_ca_sha256 != roots) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "live trust target differs from the locally provisioned CA set"));
+        }
+        if let Some(local) = target.catalog.get(&self.local_node_id) {
+            let now = chrono::Utc::now();
+            if !accepts_server_certificate(local, &self.local_server_sha256, now)
+                || !accepts_client_certificate(local, &self.local_client_sha256, now)
+            {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "live trust target does not retain the running local TLS identity"));
+            }
+        }
+        Ok(())
+    }
+
+    fn latest(&self) -> io::Result<Option<(BTreeMap<ClusterRaftNodeId, ClusterRaftNode>, BTreeMap<ClusterRaftNodeId, ClusterRaftNode>)>> {
+        let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
+        let Some(plan) = plan else { return Ok(None); };
+        if plan.target.trust_generation != plan.prior.trust_generation {
+            self.check_target(&plan.target)?;
+        }
+        let prior = if plan.target.is_settled(&membership) { BTreeMap::new() } else { plan.prior.catalog };
+        Ok(Some((plan.target.catalog, prior)))
+    }
+}
+
+#[derive(Clone)]
 struct ClusterNetworkFactory {
     source: ClusterRaftNodeId,
     cluster_name: Arc<str>,
@@ -1718,6 +1757,7 @@ struct ClusterNetworkFactory {
     client_config: Arc<rustls::ClientConfig>,
     handshake_timeout: Duration,
     max_frame_bytes: usize,
+    live_catalog: Option<Arc<LiveTransportCatalog>>,
 }
 
 struct ClusterNetwork {
@@ -1729,6 +1769,7 @@ struct ClusterNetwork {
     handshake_timeout: Duration,
     max_frame_bytes: usize,
     invalid_target: Option<String>,
+    live_catalog: Option<Arc<LiveTransportCatalog>>,
 }
 
 impl RaftNetworkFactory<ClusterRaftTypeConfig> for ClusterNetworkFactory {
@@ -1739,17 +1780,22 @@ impl RaftNetworkFactory<ClusterRaftTypeConfig> for ClusterNetworkFactory {
         target: ClusterRaftNodeId,
         node: &ClusterRaftNode,
     ) -> Self::Network {
-        let configured = self.members.get(&target);
+        let live = self.live_catalog.as_ref().map(|live| live.latest()).transpose();
+        let (members, prior_members) = match &live {
+            Ok(Some(Some((members, prior)))) => (members, prior),
+            _ => (self.members.as_ref(), self.prior_members.as_ref()),
+        };
+        let configured = members.get(&target);
         let matches_configured =
             configured.is_some_and(|trusted| same_transport_trust_entry(trusted, node));
-        let matches_exact_prior = self
-            .prior_members
+        let matches_exact_prior = prior_members
             .get(&target)
             .is_some_and(|prior| same_transport_trust_entry(prior, node));
-        let invalid_target = match configured {
-            Some(_) if matches_configured || matches_exact_prior => None,
-            Some(_) => Some("OpenRaft membership differs from trusted peer configuration".into()),
-            None => Some("OpenRaft target is absent from trusted peer configuration".into()),
+        let invalid_target = match (&live, configured) {
+            (Err(_), _) => Some("live trusted peer catalog is unavailable".into()),
+            (_, Some(_)) if matches_configured || matches_exact_prior => None,
+            (_, Some(_)) => Some("OpenRaft membership differs from trusted peer configuration".into()),
+            (_, None) => Some("OpenRaft target is absent from trusted peer configuration".into()),
         };
         ClusterNetwork {
             source: self.source,
@@ -1760,6 +1806,7 @@ impl RaftNetworkFactory<ClusterRaftTypeConfig> for ClusterNetworkFactory {
             handshake_timeout: self.handshake_timeout,
             max_frame_bytes: self.max_frame_bytes,
             invalid_target,
+            live_catalog: self.live_catalog.clone(),
         }
     }
 }
@@ -1802,15 +1849,20 @@ impl ClusterNetwork {
     }
 
     async fn call_inner(&self, body: RpcRequest) -> Result<RpcResponse, RpcCallError> {
+        let live = self.live_catalog.as_ref().map(|live| live.latest()).transpose().map_err(|_| RpcCallError::Unreachable("live trusted peer catalog is unavailable".into()))?;
+        let target_node = match &live {
+            Some(Some((members, _))) => members.get(&self.target).ok_or_else(|| RpcCallError::Unreachable("peer was removed from the live trusted catalog".into()))?,
+            _ => &self.target_node,
+        };
         let tcp = tokio::time::timeout(
             self.handshake_timeout,
-            TcpStream::connect(self.target_node.endpoint.as_str()),
+            TcpStream::connect(target_node.endpoint.as_str()),
         )
         .await
         .map_err(|_| RpcCallError::Unreachable("TCP connect timed out".into()))?
         .map_err(|error| RpcCallError::Unreachable(redacted_io("TCP connect", &error)))?;
         let server_name =
-            ServerName::try_from(self.target_node.server_name.clone()).map_err(|_| {
+            ServerName::try_from(target_node.server_name.clone()).map_err(|_| {
                 RpcCallError::Unreachable("trusted peer has an invalid TLS server name".into())
             })?;
         let connector = TlsConnector::from(self.client_config.clone());
@@ -1828,7 +1880,7 @@ impl ClusterNetwork {
                 RpcCallError::Unreachable("TLS peer did not present a certificate".into())
             })?;
         let actual_fingerprint = certificate_fingerprint(peer_certificate.as_ref());
-        if !accepts_server_certificate(&self.target_node, &actual_fingerprint, chrono::Utc::now()) {
+        if !accepts_server_certificate(target_node, &actual_fingerprint, chrono::Utc::now()) {
             return Err(RpcCallError::Unreachable(
                 "TLS server leaf does not match trusted Raft membership".into(),
             ));
@@ -1995,9 +2047,10 @@ impl ClusterAuthorityHandle {
         mut command: AuthorityCommand,
         delegation: DelegatedAuthorityProof,
     ) -> io::Result<AuthorityResponse> {
-        let source = self
-            .network
-            .members
+        self.validate_live_proposal(&command)?;
+        let live = self.network.live_catalog.as_ref().map(|live| live.latest()).transpose()?;
+        let members = match &live { Some(Some((members, _))) => members, _ => self.network.members.as_ref() };
+        let source = members
             .get(&self.network.source)
             .ok_or_else(|| {
                 io::Error::new(
@@ -2098,6 +2151,21 @@ impl ClusterAuthorityHandle {
 
     pub fn local_view(&self) -> io::Result<Option<ReplicatedAuthorityView>> {
         read_replicated_authority_view(&self.context)
+    }
+
+    pub async fn reconfiguration_status(&self) -> io::Result<crate::cluster_reconfiguration::ClusterReconfigurationStatus> {
+        self.linearizable_view().await?;
+        let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&self.context)?;
+        crate::cluster_reconfiguration::status(&membership, plan.as_ref())
+    }
+
+    fn validate_live_proposal(&self, command: &AuthorityCommand) -> io::Result<()> {
+        let inner = crate::cluster_principal::unsigned_authority_command(command).map_err(invalid_input)?;
+        if let AuthorityCommand::ProposeClusterTrustChange { prior, target_catalog, expected_generation, target_generation, overlap_not_after, .. } = inner {
+            let target = crate::cluster_reconfiguration::prepare_trust_target(prior, target_catalog, *expected_generation, *target_generation, *overlap_not_after, chrono::Utc::now())?;
+            self.network.live_catalog.as_ref().ok_or_else(|| invalid_input("live trust runtime is unavailable"))?.check_target(&target)?;
+        }
+        Ok(())
     }
 
     async fn wait_for_local_apply(
@@ -2253,6 +2321,7 @@ pub struct ClusterRaftRuntime {
     raft: Raft<ClusterRaftTypeConfig>,
     shutdown_tx: watch::Sender<bool>,
     listener_task: Option<JoinHandle<io::Result<()>>>,
+    reconfiguration_task: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl fmt::Debug for ClusterRaftRuntime {
@@ -2298,12 +2367,29 @@ impl ClusterRaftRuntime {
         listener: TcpListener,
     ) -> io::Result<Self> {
         config.validate()?;
+        let (_, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&context)?;
+        if let Some(plan) = plan {
+            let configured = crate::cluster_reconfiguration::ClusterReconfigurationTarget {
+                catalog: config.members.clone(), voter_ids: config.voter_ids.clone(),
+                voter_generation: config.voter_set_generation, voter_set_sha256: config.voter_set_sha256.clone(),
+                trust_generation: config.transport_trust_generation, catalog_sha256: config.transport_catalog_sha256.clone(),
+                overlap_not_after: config.transport_trust_overlap_not_after,
+            };
+            if configured != plan.target {
+                return Err(invalid_data("operator restart configuration differs from the durable live reconfiguration target"));
+            }
+        }
         let local_addr = listener.local_addr()?;
         let members = Arc::new(config.members.clone());
         let prior_members = Arc::new(validated_durable_transport_catalog(
             &context,
             &config.members,
         )?);
+        let live_catalog = Arc::new(LiveTransportCatalog {
+            context: context.clone(), provisioned_peer_ca_sha256: config.tls.provisioned_peer_ca_sha256.clone(),
+            local_node_id: config.node_id, local_server_sha256: config.tls.server_certificate_sha256.clone(),
+            local_client_sha256: config.tls.client_certificate_sha256.clone(),
+        });
         let network = ClusterNetworkFactory {
             source: config.node_id,
             cluster_name: Arc::from(config.raft.cluster_name.as_str()),
@@ -2312,6 +2398,7 @@ impl ClusterRaftRuntime {
             client_config: config.tls.client_config.clone(),
             handshake_timeout: config.transport.handshake_timeout,
             max_frame_bytes: config.transport.max_frame_bytes,
+            live_catalog: Some(live_catalog.clone()),
         };
         let authority_network = network.clone();
         let authority_forward_timeout = config.transport.inbound_request_timeout;
@@ -2382,8 +2469,12 @@ impl ClusterRaftRuntime {
                 raft: raft.clone(),
                 context: context.clone(),
                 limits: config.transport,
+                live_catalog: Some(live_catalog.clone()),
             },
             shutdown_rx,
+        ));
+        let reconfiguration_task = tokio::spawn(serve_reconfiguration(
+            raft.clone(), config.node_id, context.clone(), live_catalog, shutdown_tx.subscribe(),
         ));
         Ok(Self {
             node_id: config.node_id,
@@ -2404,6 +2495,7 @@ impl ClusterRaftRuntime {
             raft,
             shutdown_tx,
             listener_task: Some(listener_task),
+            reconfiguration_task: Some(reconfiguration_task),
         })
     }
 
@@ -2605,6 +2697,9 @@ impl ClusterRaftRuntime {
 
     pub async fn shutdown(mut self) -> io::Result<()> {
         let _ = self.shutdown_tx.send(true);
+        if let Some(task) = self.reconfiguration_task.take() {
+            task.await.map_err(|error| io::Error::other(format!("live reconfiguration task failed: {error}")))??;
+        }
         if let Some(task) = self.listener_task.take() {
             match task.await {
                 Ok(result) => result?,
@@ -2620,6 +2715,42 @@ impl ClusterRaftRuntime {
             .shutdown()
             .await
             .map_err(|error| io::Error::other(format!("Raft shutdown failed: {error}")))
+    }
+}
+
+async fn serve_reconfiguration(
+    raft: Raft<ClusterRaftTypeConfig>,
+    node_id: ClusterRaftNodeId,
+    context: Arc<SqliteContextManager>,
+    live: Arc<LiveTransportCatalog>,
+    mut shutdown: watch::Receiver<bool>,
+) -> io::Result<()> {
+    let mut metrics = raft.metrics();
+    loop {
+        if *shutdown.borrow() { return Ok(()); }
+        let (membership, plan) = crate::cluster_consensus::read_cluster_reconfiguration(&context)?;
+        if let Some(plan) = plan {
+            if !plan.target.is_settled(&membership) && metrics.borrow().current_leader == Some(node_id) {
+                if plan.target.trust_generation != plan.prior.trust_generation { live.check_target(&plan.target)?; }
+                // An interrupted attempt leaves the same durable target. The
+                // next leader resumes it; no new authority proposal is made.
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+                    }
+                    result = converge_membership_target(&raft, node_id, &plan.target, false) => {
+                        if let Err(error) = result {
+                            tracing::warn!(node_id, error = %error, "live prepared reconfiguration remains unresolved");
+                        }
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return Ok(()); },
+            changed = metrics.changed() => if changed.is_err() { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "live reconfiguration metrics closed")); },
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     }
 }
 
@@ -3272,6 +3403,9 @@ impl Drop for ClusterRaftRuntime {
         if let Some(task) = &self.listener_task {
             task.abort();
         }
+        if let Some(task) = &self.reconfiguration_task {
+            task.abort();
+        }
     }
 }
 
@@ -3284,6 +3418,7 @@ struct ListenerContext {
     raft: Raft<ClusterRaftTypeConfig>,
     context: Arc<SqliteContextManager>,
     limits: ClusterRaftTransportLimits,
+    live_catalog: Option<Arc<LiveTransportCatalog>>,
 }
 
 async fn serve_listener(
@@ -3349,6 +3484,7 @@ async fn handle_connection(
         raft,
         context,
         limits,
+        live_catalog,
     } = context;
     let mut tls = tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream))
         .await
@@ -3381,7 +3517,9 @@ async fn handle_connection(
             "Raft request envelope identity mismatch",
         ));
     }
-    let source = members.get(&request.source).ok_or_else(|| {
+    let live = live_catalog.as_ref().map(|live| live.latest()).transpose()?;
+    let active_members = match &live { Some(Some((members, _))) => members, _ => members.as_ref() };
+    let source = active_members.get(&request.source).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Raft source is absent from trusted membership",
@@ -3431,6 +3569,10 @@ async fn handle_connection(
             ) {
                 Err(error) => RpcResponse::AuthorityPrincipalRejected(error),
                 Ok(_) => {
+                    if let AuthorityCommand::ProposeClusterTrustChange { prior, target_catalog, expected_generation, target_generation, overlap_not_after, .. } = crate::cluster_principal::unsigned_authority_command(&command).map_err(invalid_input)? {
+                        let target = crate::cluster_reconfiguration::prepare_trust_target(prior, target_catalog, *expected_generation, *target_generation, *overlap_not_after, chrono::Utc::now())?;
+                        live_catalog.as_ref().ok_or_else(|| invalid_input("live trust runtime is unavailable"))?.check_target(&target)?;
+                    }
                     normalize_forwarded_authority_command(&mut command)?;
                     RpcResponse::AuthorityWrite(Box::new(raft.client_write(command).await))
                 }
@@ -3486,6 +3628,8 @@ fn normalize_forwarded_authority_command(command: &mut AuthorityCommand) -> io::
     let proposed_at = match command {
         AuthorityCommand::EnrollPrincipal { proposed_at, .. }
         | AuthorityCommand::RevokePrincipal { proposed_at, .. }
+        | AuthorityCommand::ProposeClusterVoterChange { proposed_at, .. }
+        | AuthorityCommand::ProposeClusterTrustChange { proposed_at, .. }
         | AuthorityCommand::IssueJoinChallenge { proposed_at, .. }
         | AuthorityCommand::RegisterMember { proposed_at, .. }
         | AuthorityCommand::PrepareMemberCertificateRollout { proposed_at, .. }
@@ -3692,6 +3836,7 @@ mod tests {
             ownerships: Vec::new(),
             ownership_audit: Vec::new(),
             logical_time: now,
+            reconfiguration_plan: None,
         };
         let source_node = ClusterRaftNode {
             identity_public_key: peer.application_identity_public_key.clone(),
@@ -3860,6 +4005,7 @@ mod tests {
             ownerships: Vec::new(),
             ownership_audit: Vec::new(),
             logical_time: now,
+            reconfiguration_plan: None,
         };
         let mut candidate_config = genesis.clone();
         candidate_config.members[0].tls_server_certificate_fingerprint = Some(next_tls.clone());
@@ -5911,6 +6057,7 @@ mod tests {
             client_config: peers[0].tls.client_config.clone(),
             handshake_timeout: Duration::from_secs(3),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            live_catalog: None,
         };
         let mut network = factory
             .new_client(2, members.get(&2).expect("node 2"))
@@ -5960,6 +6107,7 @@ mod tests {
             client_config: peers[0].tls.client_config.clone(),
             handshake_timeout: Duration::from_secs(3),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            live_catalog: None,
         };
         let mut network = factory
             .new_client(2, members.get(&2).expect("node 2"))
@@ -6011,6 +6159,7 @@ mod tests {
             client_config: peers[0].tls.client_config.clone(),
             handshake_timeout: Duration::from_secs(3),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            live_catalog: None,
         };
         let mut network = factory
             .new_client(2, tampered_members.get(&2).expect("node 2"))

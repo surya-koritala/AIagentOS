@@ -758,5 +758,60 @@
     "limit": 1,
     "name": null,
     "op": "list_service_history"
+  },
+  {
+    "command": {
+      "Authorized": {
+        "command": {
+          "IssueJoinChallenge": {
+            "challenge_hex": "00",
+            "operation_id": "00000000-0000-0000-0000-000000000006",
+            "proposed_at": "2026-01-01T00:00:00Z",
+            "ttl_seconds": 5
+          }
+        },
+        "principal_proof": {
+          "cluster_id": "00000000-0000-0000-0000-000000000005",
+          "command_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "expires_at": "2026-01-01T00:00:30Z",
+          "issued_at": "2026-01-01T00:00:00Z",
+          "operation_id": "00000000-0000-0000-0000-000000000006",
+          "principal_generation": 1,
+          "principal_id": "00000000-0000-0000-0000-000000000007",
+          "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "version": 1
+        }
+      }
+    },
+    "op": "propose_cluster_voter_change"
+  },
+  {
+    "command": {
+      "Authorized": {
+        "command": {
+          "IssueJoinChallenge": {
+            "challenge_hex": "00",
+            "operation_id": "00000000-0000-0000-0000-000000000006",
+            "proposed_at": "2026-01-01T00:00:00Z",
+            "ttl_seconds": 5
+          }
+        },
+        "principal_proof": {
+          "cluster_id": "00000000-0000-0000-0000-000000000005",
+          "command_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "expires_at": "2026-01-01T00:00:30Z",
+          "issued_at": "2026-01-01T00:00:00Z",
+          "operation_id": "00000000-0000-0000-0000-000000000006",
+          "principal_generation": 1,
+          "principal_id": "00000000-0000-0000-0000-000000000007",
+          "signature_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "version": 1
+        }
+      }
+    },
+    "op": "propose_cluster_trust_change"
+  },
+  {
+    "op": "get_cluster_reconfiguration_status"
   }
 ]

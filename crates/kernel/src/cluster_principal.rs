@@ -183,6 +183,7 @@ pub fn authority_command_class(
         AuthorityCommand::ClaimOwnership { .. }
         | AuthorityCommand::RenewOwnership { .. }
         | AuthorityCommand::ReleaseOwnership { .. } => Ok(AuthorityCommandClass::Ownership),
+        AuthorityCommand::ProposeClusterVoterChange { .. } | AuthorityCommand::ProposeClusterTrustChange { .. } => Ok(AuthorityCommandClass::TransportAdmin),
         AuthorityCommand::EnrollPrincipal { .. } | AuthorityCommand::RevokePrincipal { .. } => {
             Ok(AuthorityCommandClass::PrincipalAdmin)
         }
@@ -409,7 +410,9 @@ pub(crate) fn command_proposed_at(command: &AuthorityCommand) -> Option<DateTime
         | AuthorityCommand::RenewOwnership { proposed_at, .. }
         | AuthorityCommand::ReleaseOwnership { proposed_at, .. }
         | AuthorityCommand::EnrollPrincipal { proposed_at, .. }
-        | AuthorityCommand::RevokePrincipal { proposed_at, .. } => Some(*proposed_at),
+        | AuthorityCommand::RevokePrincipal { proposed_at, .. }
+        | AuthorityCommand::ProposeClusterVoterChange { proposed_at, .. }
+        | AuthorityCommand::ProposeClusterTrustChange { proposed_at, .. } => Some(*proposed_at),
         _ => None,
     }
 }
@@ -430,7 +433,9 @@ pub(crate) fn set_committed_command_time(command: &mut AuthorityCommand, at: Dat
         | AuthorityCommand::RenewOwnership { proposed_at, .. }
         | AuthorityCommand::ReleaseOwnership { proposed_at, .. }
         | AuthorityCommand::EnrollPrincipal { proposed_at, .. }
-        | AuthorityCommand::RevokePrincipal { proposed_at, .. } => *proposed_at = at,
+        | AuthorityCommand::RevokePrincipal { proposed_at, .. }
+        | AuthorityCommand::ProposeClusterVoterChange { proposed_at, .. }
+        | AuthorityCommand::ProposeClusterTrustChange { proposed_at, .. } => *proposed_at = at,
         _ => {}
     }
 }
@@ -446,7 +451,9 @@ pub(crate) fn set_verified_audit_actor(command: &mut AuthorityCommand, principal
         | AuthorityCommand::RenewOwnership { actor, .. }
         | AuthorityCommand::ReleaseOwnership { actor, .. }
         | AuthorityCommand::EnrollPrincipal { actor, .. }
-        | AuthorityCommand::RevokePrincipal { actor, .. } => {
+        | AuthorityCommand::RevokePrincipal { actor, .. }
+        | AuthorityCommand::ProposeClusterVoterChange { actor, .. }
+        | AuthorityCommand::ProposeClusterTrustChange { actor, .. } => {
             *actor = format!("principal:{principal_id}")
         }
         _ => {}

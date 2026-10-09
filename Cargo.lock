@@ -65,6 +65,7 @@ dependencies = [
  "kernel",
  "libc",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

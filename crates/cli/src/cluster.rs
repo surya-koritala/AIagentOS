@@ -168,8 +168,8 @@ fn join(
     } else {
         let mut material = b"AIagentOS cluster CLI challenge operation v1".to_vec();
         material.extend_from_slice(mutation.as_bytes());
-        let digest = kernel::cluster_control::sha256_hex(&material);
-        uuid(&digest[..32])?
+        let digest = ring::digest::digest(&ring::digest::SHA256, &material);
+        Uuid::from_slice(&digest.as_ref()[..16]).map_err(|_| "invalid derived challenge UUID".to_string())?
     };
     if challenge == mutation {
         return Err("challenge and mutation operation UUIDs must differ".into());
@@ -559,7 +559,7 @@ pub async fn run(
             generation,
             reason,
         } => {
-            let (member, rollout) = if abort {
+            let member = if abort {
                 client
                     .abort_cluster_member_certificate_rollout_with_operation_id(
                         id.as_deref().expect("write id"),
@@ -578,7 +578,7 @@ pub async fn run(
                     )
                     .await?
             };
-            json!({"member": member, "rollout": rollout})
+            json!({"member": member})
         }
         Action::Fence {
             agent_id,

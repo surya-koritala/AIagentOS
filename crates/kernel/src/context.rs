@@ -387,6 +387,11 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         deletion: "retain",
     },
     DurableDataClassification {
+        table: "cluster_operation_receipts",
+        owner: "system",
+        deletion: "retain completed and unresolved operation tombstones",
+    },
+    DurableDataClassification {
         table: "cluster_membership_authority",
         owner: "system",
         deletion: "retain",
@@ -1971,6 +1976,15 @@ impl SqliteContextManager {
                 profile_json TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_operation_receipts (
+                operation_id TEXT PRIMARY KEY CHECK (length(operation_id) = 36),
+                actor_digest TEXT NOT NULL CHECK (length(actor_digest) = 64),
+                command_digest TEXT NOT NULL CHECK (length(command_digest) = 64),
+                phase TEXT NOT NULL CHECK (phase IN ('pending', 'complete')),
+                reply_json TEXT CHECK (reply_json IS NULL OR length(CAST(reply_json AS BLOB)) <= 131072),
+                admitted_at TEXT NOT NULL,
+                CHECK ((phase = 'pending' AND reply_json IS NULL) OR (phase = 'complete' AND reply_json IS NOT NULL))
             );
             CREATE TABLE IF NOT EXISTS cluster_node_control_audit (
                 generation INTEGER PRIMARY KEY,
@@ -11287,7 +11301,7 @@ mod tests {
                 crate::schema::CURRENT_SCHEMA_VERSION,
                 "fresh stores record every released schema transition"
             );
-            assert_eq!(cluster_table_count, 15);
+            assert_eq!(cluster_table_count, 16);
         }
 
         let reopened = SqliteContextManager::new(&database.path).unwrap();

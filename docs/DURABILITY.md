@@ -92,6 +92,14 @@ ID and schema version, and rejects corrupt, unrelated, or newer databases before
 changing durability PRAGMAs or schema objects. A newer binary may migrate an
 older supported database. An older binary must never write a newer schema.
 
+Schema 15 requires reader 15 for independent principal authority: immutable
+operator public-key genesis, signed command envelopes, enrollment/revocation
+history and committed clock evidence cannot be ignored by an older snapshot
+or receipt reader. Migration 14 and its actor-bound pending/completed receipts
+remain intact, as do schema 13's ordered multipart history requirements.
+An older cluster-authority binary refuses the store before writes; the new
+binary never downgrades a principal proof to a system-node credential.
+
 ## Migration contract
 
 Schema versions only move forward. Startup holds an immediate SQLite

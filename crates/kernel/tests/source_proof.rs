@@ -322,19 +322,67 @@ fn exact_public_npm_directives_validate_but_auth_content_cannot_be_generated() {
     let fixture = Fixture::new();
     let npmrc = Path::new("crates/tauri-app/ui/.npmrc");
     fs::create_dir_all(fixture.repository.join(npmrc).parent().unwrap()).unwrap();
-    fs::write(fixture.repository.join(npmrc), "audit=true\nfund=false\nignore-scripts=true\n").unwrap();
-    git(&fixture.repository,&["add","crates/tauri-app/ui/.npmrc"]);
-    git(&fixture.repository,&["-c","user.name=Surya Koritala","-c","user.email=suryakoritala1324@gmail.com","commit","-s","-m","test: public npm directives fixture"]);
+    fs::write(
+        fixture.repository.join(npmrc),
+        "audit=true\nfund=false\nignore-scripts=true\n",
+    )
+    .unwrap();
+    git(&fixture.repository, &["add", "crates/tauri-app/ui/.npmrc"]);
+    git(
+        &fixture.repository,
+        &[
+            "-c",
+            "user.name=Surya Koritala",
+            "-c",
+            "user.email=suryakoritala1324@gmail.com",
+            "commit",
+            "-s",
+            "-m",
+            "test: public npm directives fixture",
+        ],
+    );
     let context = fixture._root.path().join("public-context");
-    let output = prepare(&fixture.repository,&context);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(source_proof::verify_packaged_source(&context).unwrap().commit, git(&fixture.repository,&["rev-parse","HEAD"]));
-    fs::write(context.join(npmrc), "//registry.invalid/:_authToken=fixture-only\n").unwrap();
+    let output = prepare(&fixture.repository, &context);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        source_proof::verify_packaged_source(&context)
+            .unwrap()
+            .commit,
+        git(&fixture.repository, &["rev-parse", "HEAD"])
+    );
+    fs::write(
+        context.join(npmrc),
+        "//registry.invalid/:_authToken=fixture-only\n",
+    )
+    .unwrap();
     assert!(source_proof::verify_packaged_source(&context).is_err());
-    fs::write(fixture.repository.join(npmrc), "//registry.invalid/:_authToken=fixture-only\n").unwrap();
-    git(&fixture.repository,&["add","crates/tauri-app/ui/.npmrc"]);
-    git(&fixture.repository,&["-c","user.name=Surya Koritala","-c","user.email=suryakoritala1324@gmail.com","commit","-s","-m","test: forbidden npm authentication fixture"]);
-    let rejected = prepare(&fixture.repository,&fixture._root.path().join("auth-context"));
+    fs::write(
+        fixture.repository.join(npmrc),
+        "//registry.invalid/:_authToken=fixture-only\n",
+    )
+    .unwrap();
+    git(&fixture.repository, &["add", "crates/tauri-app/ui/.npmrc"]);
+    git(
+        &fixture.repository,
+        &[
+            "-c",
+            "user.name=Surya Koritala",
+            "-c",
+            "user.email=suryakoritala1324@gmail.com",
+            "commit",
+            "-s",
+            "-m",
+            "test: forbidden npm authentication fixture",
+        ],
+    );
+    let rejected = prepare(
+        &fixture.repository,
+        &fixture._root.path().join("auth-context"),
+    );
     assert!(!rejected.status.success());
     assert!(!fixture._root.path().join("auth-context").exists());
 }

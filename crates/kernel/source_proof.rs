@@ -232,7 +232,9 @@ fn walk_tree(
             return Err("packaged source rejects symlinks");
         }
         if mode == "40000" {
-            if name.eq_ignore_ascii_case(".npmrc") { return Err("source proof refuses credential configuration directories"); }
+            if name.eq_ignore_ascii_case(".npmrc") {
+                return Err("source proof refuses credential configuration directories");
+            }
             if !metadata.is_dir() {
                 return Err("tracked source directory has wrong type");
             }
@@ -248,8 +250,13 @@ fn walk_tree(
             if name.eq_ignore_ascii_case(".npmrc")
                 && (path != root.join(PUBLIC_NPMRC_PATH)
                     || metadata.len() != PUBLIC_NPMRC.len() as u64
-                    || fs::read(&path).map_err(|_| "public npm configuration cannot be read")? != PUBLIC_NPMRC)
-            { return Err("source npm configuration contains unapproved credential-capable content"); }
+                    || fs::read(&path).map_err(|_| "public npm configuration cannot be read")?
+                        != PUBLIC_NPMRC)
+            {
+                return Err(
+                    "source npm configuration contains unapproved credential-capable content",
+                );
+            }
             inventory.total = inventory
                 .total
                 .checked_add(metadata.len())

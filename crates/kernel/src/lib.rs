@@ -1315,6 +1315,12 @@ pub struct PeripheralRevocation {
     pub active_uses_cancelled: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ConfigStartupMode {
+    Runtime,
+    WorkspaceMaintenance,
+}
+
 impl AgentKernelImpl {
     const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(not(test))]
@@ -1370,6 +1376,22 @@ impl AgentKernelImpl {
     /// Create a kernel from config (uses config.data_dir for persistence and
     /// config.budgets for cgroup/rate-limit quotas).
     pub fn from_config(config: &crate::config::Config) -> Result<Self, KernelError> {
+        Self::from_config_mode(config, ConfigStartupMode::Runtime)
+    }
+
+    /// Open leased storage for trusted local workspace maintenance without
+    /// loading or retiring service definitions. Call `rehydrate_agents` to
+    /// verify and admit recorded ownership before inspecting maintenance status.
+    pub fn from_config_for_workspace_maintenance(
+        config: &crate::config::Config,
+    ) -> Result<Self, KernelError> {
+        Self::from_config_mode(config, ConfigStartupMode::WorkspaceMaintenance)
+    }
+
+    fn from_config_mode(
+        config: &crate::config::Config,
+        mode: ConfigStartupMode,
+    ) -> Result<Self, KernelError> {
         Self::validate_storage_boot_config(config)?;
         let db_path = config.data_dir.join("agent_os.db");
         if let Some(parent) = db_path.parent() {
@@ -1377,7 +1399,7 @@ impl AgentKernelImpl {
         }
         let storage_lease =
             crate::storage::acquire_storage_lease(&db_path).map_err(KernelError::Context)?;
-        Self::from_validated_config_with_storage_lease(config, storage_lease)
+        Self::from_validated_config_with_storage_lease(config, storage_lease, mode)
     }
 
     fn validate_storage_boot_config(config: &crate::config::Config) -> Result<(), KernelError> {
@@ -1398,12 +1420,17 @@ impl AgentKernelImpl {
         storage_lease: crate::storage::StorageLease,
     ) -> Result<Self, KernelError> {
         Self::validate_storage_boot_config(config)?;
-        Self::from_validated_config_with_storage_lease(config, storage_lease)
+        Self::from_validated_config_with_storage_lease(
+            config,
+            storage_lease,
+            ConfigStartupMode::Runtime,
+        )
     }
 
     fn from_validated_config_with_storage_lease(
         config: &crate::config::Config,
         storage_lease: crate::storage::StorageLease,
+        mode: ConfigStartupMode,
     ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
@@ -1481,7 +1508,11 @@ impl AgentKernelImpl {
                 .connector
                 .set_routing_policy(provider, policy.clone());
         }
-        if let Some(service_dir) = &config.service_dir {
+        if let Some(service_dir) = config
+            .service_dir
+            .as_ref()
+            .filter(|_| matches!(mode, ConfigStartupMode::Runtime))
+        {
             *kernel
                 .service_directory
                 .write()
@@ -1497,8 +1528,10 @@ impl AgentKernelImpl {
         }
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
-        kernel.rehydrate_agents_blocking();
-        kernel.restore_service_runtime_from_store()?;
+        if matches!(mode, ConfigStartupMode::Runtime) {
+            kernel.rehydrate_agents_blocking();
+            kernel.restore_service_runtime_from_store()?;
+        }
         Ok(kernel)
     }
 

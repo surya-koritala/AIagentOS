@@ -57,11 +57,55 @@ fn agent(name: &str) -> AgentConfig {
     }
 }
 
+fn service_unchanged(
+    config: &kernel::config::Config,
+    record: &kernel::context::PersistedAgent,
+    runtime: &kernel::init_system::ServiceRuntimeInfo,
+    history: &[kernel::init_system::ServiceHistoryEntry],
+    workspace: &Path,
+) {
+    let maintenance = AgentKernelImpl::from_config_for_workspace_maintenance(config).unwrap();
+    let restored = maintenance
+        .context_manager
+        .load_all_agents()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == record.id)
+        .unwrap();
+    assert_eq!(
+        restored, *record,
+        "maintenance changed the persisted service agent"
+    );
+    let restored_runtime = maintenance
+        .context_manager
+        .load_service_runtime()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.name == runtime.name)
+        .unwrap();
+    assert_eq!(
+        restored_runtime, *runtime,
+        "maintenance retired or rewrote stored service ownership"
+    );
+    assert_eq!(
+        maintenance
+            .list_service_history(Some(&runtime.name), 256)
+            .unwrap(),
+        history
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("sentinel.txt")).unwrap(),
+        "stored service remains owned"
+    );
+}
+
 #[tokio::test]
 async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_or_valid_peers() {
     let root = Fixture::new();
     let temporary = root.0.join("process-temp");
-    let legacy_root = temporary.join("aiagentos-workspaces");
+    std::fs::create_dir(&temporary).unwrap();
+    let legacy_root = root.0.join("historical-temp").join("aiagentos-workspaces");
+    assert_ne!(legacy_root.parent().unwrap(), temporary);
     std::fs::create_dir_all(&legacy_root).unwrap();
     #[cfg(unix)]
     {
@@ -82,6 +126,11 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
     let invalid_lifecycle;
     let invalid_lifecycle_workspace;
     let workspace;
+    let service;
+    let service_workspace;
+    let service_record;
+    let service_runtime;
+    let service_history;
     {
         let kernel = AgentKernelImpl::from_config(&config).unwrap();
         legacy = kernel
@@ -94,6 +143,63 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
             .await
             .unwrap()
             .id;
+        let definition: kernel::init_system::ServiceDef = serde_json::from_value(serde_json::json!({
+            "name":"preserved-service", "description":"offline maintenance preservation proof",
+            "exec":{"provider":"stub", "system_prompt":"retain durable service ownership"}
+        }))
+        .unwrap();
+        kernel
+            .os
+            .init
+            .lock()
+            .await
+            .replace_definitions(vec![definition])
+            .unwrap();
+        service = kernel.start_service("preserved-service").await.unwrap();
+        service_record = kernel
+            .context_manager
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == service)
+            .unwrap();
+        service_workspace = serde_json::from_str::<SandboxConfig>(
+            service_record.sandbox_config_json.as_deref().unwrap(),
+        )
+        .unwrap()
+        .workspace_dir;
+        std::fs::write(
+            service_workspace.join("sentinel.txt"),
+            "stored service remains owned",
+        )
+        .unwrap();
+        service_runtime = kernel
+            .context_manager
+            .load_service_runtime()
+            .unwrap()
+            .into_iter()
+            .find(|runtime| runtime.name == "preserved-service")
+            .unwrap();
+        service_history = kernel
+            .list_service_history(Some("preserved-service"), 256)
+            .unwrap();
+        assert_eq!(service_runtime.agent_id, Some(service));
+        assert_eq!(
+            service_runtime.status,
+            kernel::init_system::ServiceStatus::Running
+        );
+        let leased = command(
+            &root.0,
+            &["workspace-ownership", config_path.to_str().unwrap(), "list"],
+        );
+        assert!(
+            !leased.status.success(),
+            "maintenance bypassed the live database lease"
+        );
+        assert_eq!(
+            std::fs::read_to_string(service_workspace.join("sentinel.txt")).unwrap(),
+            "stored service remains owned"
+        );
         malformed = kernel
             .create_agent_full(agent("malformed preserved"))
             .await
@@ -174,6 +280,8 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         &root.0,
         &["workspace-ownership", config_arg, "list"],
     ));
+    service_unchanged(&config, &service_record, &service_runtime, &service_history, &service_workspace);
+    assert!(before["admitted_agents"].as_array().unwrap().iter().any(|id| *id == service.to_string()));
     assert!(before["unresolved"]
         .as_array()
         .unwrap()
@@ -192,6 +300,11 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         .unwrap()
         .iter()
         .any(|id| *id == legacy.to_string()));
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("sentinel.txt")).unwrap(),
+        "preserved legacy bytes",
+        "a historical TEMP path was not preserved before explicit resolution"
+    );
     assert!(!before["admitted_agents"]
         .as_array()
         .unwrap()
@@ -250,6 +363,7 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         ],
     ));
     assert_eq!(retained["automatic_deletion"], false);
+    service_unchanged(&config, &service_record, &service_runtime, &service_history, &service_workspace);
     assert_eq!(
         std::fs::read_to_string(workspace.join("sentinel.txt")).unwrap(),
         "preserved legacy bytes"
@@ -258,6 +372,8 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         &root.0,
         &["workspace-ownership", config_arg, "list"],
     ));
+    service_unchanged(&config, &service_record, &service_runtime, &service_history, &service_workspace);
+    assert!(restarted["admitted_agents"].as_array().unwrap().iter().any(|id| *id == service.to_string()));
     assert_eq!(restarted["unresolved"].as_array().unwrap().len(), 2);
     assert!(restarted["unresolved"]
         .as_array()
@@ -290,7 +406,8 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         0
     );
     {
-        let reopened = AgentKernelImpl::from_config(&config).unwrap();
+        let reopened = AgentKernelImpl::from_config_for_workspace_maintenance(&config).unwrap();
+        reopened.rehydrate_agents().await.unwrap();
         let record = reopened
             .context_manager
             .load_all_agents()

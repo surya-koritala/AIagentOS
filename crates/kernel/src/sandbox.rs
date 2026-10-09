@@ -265,7 +265,10 @@ impl SandboxManagerImpl {
         }
         let legacy_root = std::fs::canonicalize(Self::managed_root()).ok();
         let legacy = config.workspace_dir.parent().is_some_and(|parent| {
-            parent == Self::managed_root()
+            parent
+                .file_name()
+                .is_some_and(|name| name == "aiagentos-workspaces")
+                || parent == Self::managed_root()
                 || legacy_root
                     .as_ref()
                     .is_some_and(|root| std::fs::canonicalize(parent).ok().as_ref() == Some(root))
@@ -322,9 +325,9 @@ impl SandboxManagerImpl {
         (entered, release, cancellation_observed)
     }
 
-    /// Secure default used by all production agent-creation paths that do not
-    /// carry an explicit operator sandbox. Network and host process access are
-    /// denied; the workspace is unique and owned by the sandbox manager.
+    /// Secure policy template for compatibility callers. Kernel-managed
+    /// creation replaces its path with the leased datastore namespace.
+    /// Network and host process access are denied.
     pub fn default_config() -> SandboxConfig {
         SandboxConfig {
             workspace_dir: Self::managed_root().join(uuid::Uuid::new_v4().to_string()),
@@ -402,9 +405,8 @@ impl SandboxManagerImpl {
         std::fs::canonicalize(root).map_err(|error| SandboxError::CreationFailed(error.to_string()))
     }
 
-    /// Remove UUID-scoped managed workspaces that have no live persisted
-    /// agent. A crash may occur before the marker is written, so ownership by
-    /// the private managed root plus a UUID leaf is the cleanup authority.
+    /// Retire only attested current-store workspaces without a live persisted
+    /// agent. UUID names and legacy markers never authorize reconciliation.
     pub fn reconcile_managed_workspaces(
         &self,
         active_workspaces: &HashSet<PathBuf>,

@@ -442,7 +442,7 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
                 "retain" => {
                     let id = args.next().unwrap_or_else(|| usage());
                     let id = id.parse::<kernel::AgentId>().unwrap_or_else(|_| {
-                        fail_operator("workspace ownership requires a recorded agent UUID")
+                        fail_operator("workspace ownership requires a recorded agent UUID".into())
                     });
                     if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some()
                     {
@@ -454,18 +454,22 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
             };
             let path = std::path::Path::new(&config_file);
             if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-                fail_operator("workspace ownership requires an existing configuration file");
+                fail_operator("workspace ownership requires an existing configuration file".into());
             }
             let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| {
                 fail_operator(format!("invalid local configuration: {error}"))
             });
             // Startup acquires the existing exclusive database lease; a live
             // runtime cannot race this purely local maintenance command.
-            let kernel = kernel::AgentKernelImpl::from_config(&config).unwrap_or_else(|error| {
+            let kernel = kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&config).unwrap_or_else(|error| {
                 fail_operator(format!(
                     "local workspace ownership maintenance failed: {error}"
                 ))
             });
+            kernel
+                .rehydrate_agents()
+                .await
+                .unwrap_or_else(|error| fail_operator(error.to_string()));
             if let Some(id) = target {
                 kernel
                     .retain_legacy_workspace_as_operator(id)

@@ -273,7 +273,7 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
             proof_expires_at: renewed.lease_expires_at,
         };
         clients[owner]
-            .pause_agent_fenced(&fresh.agent_id, &paused_proof)
+            .pause_agent_fenced(&fresh.agent_id, paused_proof)
             .await
             .unwrap();
         // No reporters run here. A new any-member quorum barrier must advance time
@@ -416,7 +416,7 @@ async fn stale_capacity_makes_a_node_ineligible_and_the_error_is_retryable() {
                 proof_expires_at: owned.lease_expires_at,
             };
             clients[owner]
-                .stop_agent_fenced(&agent.agent_id, &proof)
+                .stop_agent_fenced(&agent.agent_id, proof)
                 .await
                 .unwrap();
         }

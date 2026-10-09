@@ -100,6 +100,13 @@ remain intact, as do schema 13's ordered multipart history requirements.
 An older cluster-authority binary refuses the store before writes; the new
 binary never downgrades a principal proof to a system-node credential.
 
+The signed-capacity migration additionally requires a reader that retains the
+durable local sample cursor and latest quorum report replay fences. Capacity
+samples do not consume operator-operation receipts. Only signed inactive or
+changed membership epochs reclaim obsolete samples; identity tombstones and
+principal histories remain intact. Snapshot install refuses regression or
+omission of an active capacity sequence/observation fence.
+
 ## Migration contract
 
 Schema versions only move forward. Startup holds an immediate SQLite

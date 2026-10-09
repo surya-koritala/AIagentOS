@@ -461,11 +461,12 @@ async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
             });
             // Startup acquires the existing exclusive database lease; a live
             // runtime cannot race this purely local maintenance command.
-            let kernel = kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&config).unwrap_or_else(|error| {
-                fail_operator(format!(
-                    "local workspace ownership maintenance failed: {error}"
-                ))
-            });
+            let kernel = kernel::AgentKernelImpl::from_config_for_workspace_maintenance(&config)
+                .unwrap_or_else(|error| {
+                    fail_operator(format!(
+                        "local workspace ownership maintenance failed: {error}"
+                    ))
+                });
             kernel
                 .rehydrate_agents()
                 .await

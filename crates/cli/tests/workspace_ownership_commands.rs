@@ -143,11 +143,12 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
             .await
             .unwrap()
             .id;
-        let definition: kernel::init_system::ServiceDef = serde_json::from_value(serde_json::json!({
-            "name":"preserved-service", "description":"offline maintenance preservation proof",
-            "exec":{"provider":"stub", "system_prompt":"retain durable service ownership"}
-        }))
-        .unwrap();
+        let definition: kernel::init_system::ServiceDef =
+            serde_json::from_value(serde_json::json!({
+                "name":"preserved-service", "description":"offline maintenance preservation proof",
+                "exec":{"provider":"stub", "system_prompt":"retain durable service ownership"}
+            }))
+            .unwrap();
         kernel
             .os
             .init
@@ -280,8 +281,18 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         &root.0,
         &["workspace-ownership", config_arg, "list"],
     ));
-    service_unchanged(&config, &service_record, &service_runtime, &service_history, &service_workspace);
-    assert!(before["admitted_agents"].as_array().unwrap().iter().any(|id| *id == service.to_string()));
+    service_unchanged(
+        &config,
+        &service_record,
+        &service_runtime,
+        &service_history,
+        &service_workspace,
+    );
+    assert!(before["admitted_agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| *id == service.to_string()));
     assert!(before["unresolved"]
         .as_array()
         .unwrap()
@@ -363,7 +374,13 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         ],
     ));
     assert_eq!(retained["automatic_deletion"], false);
-    service_unchanged(&config, &service_record, &service_runtime, &service_history, &service_workspace);
+    service_unchanged(
+        &config,
+        &service_record,
+        &service_runtime,
+        &service_history,
+        &service_workspace,
+    );
     assert_eq!(
         std::fs::read_to_string(workspace.join("sentinel.txt")).unwrap(),
         "preserved legacy bytes"
@@ -372,8 +389,18 @@ async fn local_operator_lists_and_retains_one_record_without_losing_legacy_data_
         &root.0,
         &["workspace-ownership", config_arg, "list"],
     ));
-    service_unchanged(&config, &service_record, &service_runtime, &service_history, &service_workspace);
-    assert!(restarted["admitted_agents"].as_array().unwrap().iter().any(|id| *id == service.to_string()));
+    service_unchanged(
+        &config,
+        &service_record,
+        &service_runtime,
+        &service_history,
+        &service_workspace,
+    );
+    assert!(restarted["admitted_agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| *id == service.to_string()));
     assert_eq!(restarted["unresolved"].as_array().unwrap().len(), 2);
     assert!(restarted["unresolved"]
         .as_array()

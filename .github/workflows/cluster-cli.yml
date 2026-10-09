@@ -105,6 +105,13 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           save-if: false
+      - name: Compile every changed public surface and enforce existing lint gates
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > cluster-source.txt
+          cargo clippy -p kernel -p agent-sdk -p agent-cli -p integration-tests --all-targets --locked -- -D warnings
       - name: Public admission and unchanged SDK contracts
         timeout-minutes: 20
         shell: bash
@@ -112,7 +119,6 @@ jobs:
           set -euo pipefail
           git rev-parse HEAD > cluster-source.txt
           cargo test -p agent-sdk --locked -- --nocapture 2>&1 | tee cluster-sdk.log
-          cargo clippy -p agent-sdk --all-targets --locked -- -D warnings
       - name: Durable operator receipts and wire compatibility
         timeout-minutes: 20
         shell: bash
@@ -128,7 +134,6 @@ jobs:
           cargo test -p agent-cli --test cluster_commands --locked -- --nocapture 2>&1 | tee cluster-cli.log
           cargo test -p agent-cli --test help_commands --locked -- --nocapture 2>&1 | tee cluster-help.log
           cargo test -p integration-tests capability_registry --locked -- --nocapture 2>&1 | tee cluster-capabilities.log
-          cargo clippy -p kernel -p agent-cli -p integration-tests --all-targets --locked -- -D warnings
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

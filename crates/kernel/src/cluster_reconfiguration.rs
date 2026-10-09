@@ -297,6 +297,48 @@ pub(crate) fn prepare_trust_target(
     Ok(target)
 }
 
+
+fn check_generation(current: u64, expected: u64, target: u64) -> io::Result<()> {
+    if expected != current {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconfiguration expected generation does not match current generation",
+        ));
+    }
+    if target <= current {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconfiguration target generation reuses a committed generation",
+        ));
+    }
+    if current.checked_add(1) != Some(target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconfiguration target generation skips a generation",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn status(
+    membership: &StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
+    plan: Option<&ClusterReconfigurationPlan>,
+) -> io::Result<ClusterReconfigurationStatus> {
+    let current = ClusterReconfigurationTarget::from_membership(membership)?;
+    let settled =
+        current.is_settled(membership) && plan.is_none_or(|plan| !plan.is_unresolved(membership));
+    let plan = plan.filter(|plan| plan.is_unresolved(membership) || plan.target == current);
+    Ok(ClusterReconfigurationStatus {
+        current,
+        target: plan.map(|plan| plan.target.clone()),
+        operation_id: plan.map(|plan| plan.operation_id.clone()),
+        settled,
+        quorum_verified: false,
+        observation: ClusterReconfigurationObservation::LocalApplied,
+        applied_frontier: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,45 +469,4 @@ mod tests {
         assert!(prepare_trust_target(&current, &simultaneous, 1, 2, Some(expiry), at).is_err());
         assert!(prepare_trust_target(&current, &catalog, 1, 2, Some(expiry), expiry).is_err());
     }
-}
-
-fn check_generation(current: u64, expected: u64, target: u64) -> io::Result<()> {
-    if expected != current {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "reconfiguration expected generation does not match current generation",
-        ));
-    }
-    if target <= current {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "reconfiguration target generation reuses a committed generation",
-        ));
-    }
-    if current.checked_add(1) != Some(target) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "reconfiguration target generation skips a generation",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn status(
-    membership: &StoredMembership<ClusterRaftNodeId, ClusterRaftNode>,
-    plan: Option<&ClusterReconfigurationPlan>,
-) -> io::Result<ClusterReconfigurationStatus> {
-    let current = ClusterReconfigurationTarget::from_membership(membership)?;
-    let settled =
-        current.is_settled(membership) && plan.is_none_or(|plan| !plan.is_unresolved(membership));
-    let plan = plan.filter(|plan| plan.is_unresolved(membership) || plan.target == current);
-    Ok(ClusterReconfigurationStatus {
-        current,
-        target: plan.map(|plan| plan.target.clone()),
-        operation_id: plan.map(|plan| plan.operation_id.clone()),
-        settled,
-        quorum_verified: false,
-        observation: ClusterReconfigurationObservation::LocalApplied,
-        applied_frontier: None,
-    })
 }

@@ -1,0 +1,55 @@
+name: SLO observation producer contracts
+
+on:
+  push:
+    branches: [codex/slo-observation-producer]
+    paths:
+      - 'scripts/slo_observation.py'
+      - 'scripts/tests/test_slo_observation.py'
+      - 'scripts/release_slo_qualification.py'
+      - 'scripts/phase1_promotion_qualification.py'
+      - '.github/workflows/slo-observation-producer.yml'
+  pull_request:
+    paths:
+      - 'scripts/slo_observation.py'
+      - 'scripts/tests/test_slo_observation.py'
+      - 'scripts/release_slo_qualification.py'
+      - 'scripts/phase1_promotion_qualification.py'
+      - '.github/workflows/slo-observation-producer.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: slo-observation-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  producer:
+    name: Nine-SLI source/schema and negative contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Exact source and zero-filled schema round trip
+        run: |
+          mkdir -p target/qualification
+          git rev-parse HEAD > target/qualification/slo-producer-source.txt
+          python3 scripts/slo_observation.py --validate > target/qualification/slo-schema-example.json
+      - name: Counter resets, coverage, histograms, alert history and artifact binding
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/tests -p 'test_slo_observation.py' -v 2>&1 | tee target/qualification/slo-producer-tests.log
+      - name: Existing release and campaign evaluator contracts
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/tests -p 'test_release_slo_qualification.py' -v 2>&1 | tee target/qualification/slo-evaluator-tests.log
+          python3 -m unittest discover -s scripts/tests -p 'test_phase1_promotion_qualification.py' -v 2>&1 | tee target/qualification/slo-campaign-tests.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: slo-observation-producer-${{ github.run_id }}
+          path: target/qualification/slo-*
+          if-no-files-found: error
+          retention-days: 30

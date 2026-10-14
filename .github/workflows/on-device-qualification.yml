@@ -223,7 +223,7 @@ jobs:
               .on_device_proof_eligible == true and .passed == true and
               .production_claim_allowed == false
             ' "$QUALIFICATION_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: on-device-qualification-${{ inputs.release_candidate }}-${{ github.sha }}
           path: target/qualification/on-device.json

@@ -42,7 +42,7 @@ jobs:
         run: |
           cargo fmt --all
           git diff --binary > windows-storage-rustfmt.patch
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-storage-format-patch
           path: windows-storage-rustfmt.patch
@@ -91,7 +91,7 @@ jobs:
         run: >-
           cargo test -p kernel --lib --locked windows_private_fs::
           -- --test-threads=1 --nocapture > reports/native-windows.log 2>&1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: windows-storage-${{ runner.os }}
@@ -115,7 +115,7 @@ jobs:
           --unix reports/windows-storage-Linux/Linux-tests.txt
           --windows reports/windows-storage-Windows/Windows-tests.txt
           --output reports/windows-storage-parity.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-storage-parity
           path: reports/windows-storage-parity.json

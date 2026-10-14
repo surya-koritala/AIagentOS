@@ -113,7 +113,7 @@ jobs:
           syft dir:sbom-stage -o "cyclonedx-json=dist/agentos-ci-${INSTALLATION_SOURCE_SHA}-${{ matrix.target }}.cdx.json"
           cd dist
           shasum -a 256 *.zip *.cdx.json > SHA256SUMS
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-cli-${{ matrix.target }}
           path: dist/*
@@ -151,7 +151,7 @@ jobs:
             --archive "dist/agentos-ci-${source_commit}-${{ matrix.target }}.zip" \
             --target "${{ matrix.target }}" --commit "$source_commit" \
             --output "reports/${{ matrix.target }}.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-installation-${{ matrix.target }}

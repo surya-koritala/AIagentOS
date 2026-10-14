@@ -80,7 +80,7 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         if: steps.plan.outputs.run_live == 'true'
-      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5
+      - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5
         if: steps.plan.outputs.run_live == 'true'
         with:
           version: v29.6.2

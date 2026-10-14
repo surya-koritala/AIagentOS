@@ -27,7 +27,7 @@
 ############################
 # The builder supplies Rust; rust-toolchain.toml selects the workspace's pinned
 # compiler. Bookworm supplies OpenSSL 3, matching the runtime image.
-FROM rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e AS builder
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS builder
 
 # Build-time system deps:
 #   build-essential -> C toolchain (cc) for openssl-sys / wasmtime / ring etc.

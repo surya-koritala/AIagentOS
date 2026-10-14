@@ -149,7 +149,7 @@ jobs:
         run: >-
           syft dir:target/${{ matrix.target }}/release/bundle
           -o "cyclonedx-json=dist/agentos-${ARTIFACT_VERSION}-desktop-${{ matrix.platform }}.cdx.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-desktop-${{ matrix.platform }}
           path: dist/*
@@ -268,7 +268,7 @@ jobs:
         run: |
           artifact="agentos-${ARTIFACT_VERSION}-${{ matrix.target }}"
           syft dir:dist/stage -o "cyclonedx-json=dist/${artifact}.cdx.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -319,7 +319,7 @@ jobs:
       - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - name: Generate container SPDX SBOM
         run: syft agentos:${ARTIFACT_VERSION} -o spdx-json=agentos-${ARTIFACT_VERSION}-container.spdx.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-container
           path: agentos-${{ env.ARTIFACT_VERSION }}-container.spdx.json
@@ -381,7 +381,7 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qualified-release-bundle
           path: dist

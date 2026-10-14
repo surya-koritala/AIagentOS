@@ -45,7 +45,7 @@ jobs:
           cp scripts/verify_coding_install.py scripts/linux_cli_rc_qualification.py dist/
           target/release/agent-code --version | cut -d ' ' -f 2 > dist/VERSION
           git rev-parse HEAD > dist/SOURCE_COMMIT
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coding-cli-candidate-${{ github.sha }}
           path: |
@@ -88,7 +88,7 @@ jobs:
           test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
       - name: Retain install results and task receipts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coding-cli-install-${{ github.sha }}
           path: |
@@ -142,7 +142,7 @@ jobs:
           test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
       - name: Retain actual fixture outcomes
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coding-fixture-${{ github.sha }}
           path: target/coding-evidence/

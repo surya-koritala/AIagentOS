@@ -6,24 +6,12 @@ yanked = "deny"
 # parent dependency path. Keeping the exact IDs here means a newly introduced
 # maintenance advisory still fails this gate and must be reviewed explicitly.
 ignore = [
-  { id = "RUSTSEC-2024-0413", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0416", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0412", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0418", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0411", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0417", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0414", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0415", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0420", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
-  { id = "RUSTSEC-2024-0419", reason = "Transitive GTK3 dependency of Tauri 2 on Linux; no safe upgrade exists." },
   { id = "RUSTSEC-2024-0370", reason = "Transitive proc-macro-error dependency of GTK3; no safe upgrade exists." },
   { id = "RUSTSEC-2025-0081", reason = "Transitive URL parsing dependency of Tauri 2; upstream migration is required." },
   { id = "RUSTSEC-2025-0075", reason = "Transitive URL parsing dependency of Tauri 2; upstream migration is required." },
   { id = "RUSTSEC-2025-0080", reason = "Transitive URL parsing dependency of Tauri 2; upstream migration is required." },
   { id = "RUSTSEC-2025-0100", reason = "Transitive URL parsing dependency of Tauri 2; upstream migration is required." },
   { id = "RUSTSEC-2025-0098", reason = "Transitive URL parsing dependency of Tauri 2; upstream migration is required." },
-  { id = "RUSTSEC-2025-0052", reason = "Transitive async-std dependency of the optional Chromium adapter; no patched release exists." },
-  { id = "RUSTSEC-2025-0057", reason = "Transitive fxhash dependency of the optional web-scraping adapter; no patched release exists." },
   { id = "RUSTSEC-2025-0119", reason = "Transitive number_prefix dependency of the optional local-inference stack; no patched release exists." },
   { id = "RUSTSEC-2024-0436", reason = "Transitive paste dependency of the optional local-inference stack; upstream migration is required." },
 ]
